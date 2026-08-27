@@ -1,0 +1,6 @@
+{
+  "buildCommand": "NITRO_PRESET=vercel bun run build",
+  "installCommand": "bun install",
+  "outputDirectory": ".vercel/output",
+  "framework": null
+}

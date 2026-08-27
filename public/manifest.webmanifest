@@ -1,0 +1,17 @@
+{
+  "name": "IBELL MOBILE — Billing & Inventory ERP",
+  "short_name": "IBELL MOBILE",
+  "description": "Keyboard-first desktop billing, inventory, and accounting software.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#fafaf8",
+  "theme_color": "#0f172a",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

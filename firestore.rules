@@ -1,0 +1,198 @@
+rules_version = '2';
+
+// Deploy this to the NAMED database this app actually uses
+// ("kinteshmobileacce", see DATABASE_ID in src/lib/firebase.ts) — not
+// necessarily the "(default)" database, if your project has more than one.
+// Via Firebase Console: Firestore Database → select that database → Rules
+// tab → paste this in → Publish. Via CLI: `firebase deploy --only
+// firestore:rules --database=kinteshmobileacce` (adjust flag to match your
+// Firebase CLI/firebase.json setup).
+//
+// STRONGLY RECOMMENDED before publishing to production: test against the
+// Firebase Emulator Suite first, seeded with 100+ documents in at least one
+// collection (not just a handful) — `hasPerm()` below is written to avoid
+// referencing `resource.data` specifically so its `get()` result is cached
+// and reused across an entire list query rather than evaluated per
+// document, but that behavior is worth confirming for real before this
+// gates a live business's data, not just trusted on paper.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Never references resource.data or anything about the document being
+    // accessed — only the caller's own teamUsers doc. That's what lets
+    // Firestore reuse this get() across a whole list() query instead of
+    // re-running it per document once a collection has real production
+    // volume (months of invoices).
+    function myUser() {
+      return get(/databases/$(database)/documents/teamUsers/$(request.auth.uid)).data;
+    }
+
+    function isActiveUser() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/teamUsers/$(request.auth.uid))
+        && myUser().active == true;
+    }
+
+    function isOwner() {
+      return isActiveUser() && myUser().isOwner == true;
+    }
+
+    // `.get(key, default)` (not bracket access) so a module simply absent
+    // from someone's permissions map — the normal "no access to this at
+    // all" case — evaluates to false instead of a rules error.
+    function hasPerm(module, level) {
+      return isActiveUser()
+        && (myUser().isOwner == true
+            || myUser().permissions.get(module, {}).get(level, false) == true);
+    }
+
+    // ---- Master Data: Parties, Items, Inventory ----
+    match /parties/{id} {
+      allow read: if hasPerm('masterData', 'view');
+      allow create, update: if hasPerm('masterData', 'edit');
+      allow delete: if hasPerm('masterData', 'delete');
+    }
+    match /stock-adjustments/{id} {
+      allow read: if hasPerm('masterData', 'view');
+      allow create, update: if hasPerm('masterData', 'edit');
+      allow delete: if hasPerm('masterData', 'delete');
+    }
+    // Items are also written as a side effect of completing a sale/purchase/
+    // return (stock reversal) — a Sales- or Purchase-only user still needs
+    // to be able to finish that one write inside the same atomic batch, or
+    // their otherwise-fully-permitted delete/save fails opaquely on this
+    // collection alone. See src/routes/sales.index.tsx's handleDelete for
+    // the concrete batch this covers.
+    match /items/{id} {
+      allow read: if hasPerm('masterData', 'view');
+      allow create, update: if hasPerm('masterData', 'edit')
+        || hasPerm('sales', 'edit')
+        || hasPerm('purchaseExpenses', 'edit');
+      allow delete: if hasPerm('masterData', 'delete');
+    }
+
+    // ---- Sales, Sale Return ----
+    match /sales/{id} {
+      allow read: if hasPerm('sales', 'view');
+      allow create, update: if hasPerm('sales', 'edit');
+      allow delete: if hasPerm('sales', 'delete');
+    }
+    match /sale-returns/{id} {
+      allow read: if hasPerm('sales', 'view');
+      allow create, update: if hasPerm('sales', 'edit');
+      allow delete: if hasPerm('sales', 'delete');
+    }
+
+    // ---- Purchase, Purchase Return, Expenses, Expense Payees ----
+    match /purchases/{id} {
+      allow read: if hasPerm('purchaseExpenses', 'view');
+      allow create, update: if hasPerm('purchaseExpenses', 'edit');
+      allow delete: if hasPerm('purchaseExpenses', 'delete');
+    }
+    match /purchase-returns/{id} {
+      allow read: if hasPerm('purchaseExpenses', 'view');
+      allow create, update: if hasPerm('purchaseExpenses', 'edit');
+      allow delete: if hasPerm('purchaseExpenses', 'delete');
+    }
+    match /expenses/{id} {
+      allow read: if hasPerm('purchaseExpenses', 'view');
+      allow create, update: if hasPerm('purchaseExpenses', 'edit');
+      allow delete: if hasPerm('purchaseExpenses', 'delete');
+    }
+    match /payees/{id} {
+      allow read: if hasPerm('purchaseExpenses', 'view');
+      allow create, update: if hasPerm('purchaseExpenses', 'edit');
+      allow delete: if hasPerm('purchaseExpenses', 'delete');
+    }
+
+    // ---- Bank Accounts, Cash on Hand, Payments ----
+    // Written directly by Cash & Bank pages, AND as a side effect whenever a
+    // Sales/Purchase transaction settles via bank or adjusts a balance —
+    // same cross-module reasoning as items above.
+    match /banks/{id} {
+      allow read: if hasPerm('cashBank', 'view');
+      allow create, update: if hasPerm('cashBank', 'edit')
+        || hasPerm('sales', 'edit')
+        || hasPerm('purchaseExpenses', 'edit');
+      allow delete: if hasPerm('cashBank', 'delete');
+    }
+    match /bankTxns/{id} {
+      allow read: if hasPerm('cashBank', 'view');
+      allow create, update: if hasPerm('cashBank', 'edit')
+        || hasPerm('sales', 'edit')
+        || hasPerm('purchaseExpenses', 'edit');
+      allow delete: if hasPerm('cashBank', 'delete');
+    }
+    match /payments/{id} {
+      allow read: if hasPerm('cashBank', 'view');
+      allow create, update: if hasPerm('cashBank', 'edit')
+        || hasPerm('sales', 'edit')
+        || hasPerm('purchaseExpenses', 'edit');
+      allow delete: if hasPerm('cashBank', 'delete');
+    }
+    match /cash-adjustments/{id} {
+      allow read: if hasPerm('cashBank', 'view');
+      allow create, update: if hasPerm('cashBank', 'edit') || hasPerm('purchaseExpenses', 'edit');
+      allow delete: if hasPerm('cashBank', 'delete');
+    }
+
+    // Note: Reports/Daybook/GST have no collection of their own — they
+    // aggregate reads across the collections above, already governed by
+    // their own rules. There's nothing to add a rule for here; "reports"
+    // permission is enforced entirely in the UI (see src/routes/__root.tsx).
+
+    // ---- Company settings ----
+    // Read is universal for any active user (invoice numbering, GST calc,
+    // and expense category dropdowns all depend on this doc everywhere, not
+    // just the Settings page) — only writing it is owner-only.
+    match /settings/company {
+      allow read: if isActiveUser();
+      allow write: if isOwner();
+    }
+
+    // ---- Team members ----
+    match /teamUsers/{uid} {
+      // Anyone can read their own doc (required for permission-aware
+      // hydration to work at all); the owner can read any single doc too.
+      allow get: if signedIn() && (request.auth.uid == uid || isOwner());
+      // Only the owner can list the full roster (Settings → Team page).
+      allow list: if isOwner();
+      // The ONLY client-side create ever allowed: the one-time owner
+      // self-bootstrap on this business's very first login, gated by the
+      // system/bootstrap lock below. Every other team member is created via
+      // the trusted server-side Admin SDK function, which bypasses these
+      // rules entirely (by design) — never via a direct client write.
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.isOwner == true
+        && request.resource.data.active == true
+        && !exists(/databases/$(database)/documents/system/bootstrap);
+      // Owner can edit/deactivate anyone EXCEPT an owner-flagged doc
+      // (including their own) — owner docs are immutable once bootstrapped,
+      // so nothing client-side can ever edit them, accidentally or not.
+      allow update: if isOwner() && resource.data.isOwner != true;
+      // No client-side delete — deactivate via update (active: false)
+      // instead; this is reversible and needs no Admin SDK round-trip.
+      allow delete: if false;
+    }
+
+    // One-time lock so the owner-bootstrap create above can only ever
+    // succeed once. Firestore evaluates a batched write's rules against the
+    // pre-batch state, so the teamUsers create and this lock-set happen
+    // atomically together the very first time, and neither can succeed
+    // again afterward.
+    match /system/bootstrap {
+      allow get: if signedIn();
+      allow create: if signedIn() && request.resource.data.ownerCreated == true;
+      allow update, delete: if false;
+    }
+
+    // Everything else defaults to denied (Firestore's own default when no
+    // match applies) — nothing else in this app writes outside the
+    // collections enumerated above.
+  }
+}

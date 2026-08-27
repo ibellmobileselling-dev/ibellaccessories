@@ -1,0 +1,7 @@
+* text=auto eol=lf
+
+# Binary / generated — never touched by line-ending normalisation
+*.png binary
+*.ico binary
+*.xlsx binary
+bun.lock -text
