@@ -30,6 +30,28 @@ export function removalWord(date: string, now: string = today()): "Delete" | "Vo
   return canDeleteOutright(date, now) ? "Delete" : "Void";
 }
 
+/**
+ * Whether a document may still be CHANGED in place.
+ *
+ * The same line, for the same reason. Stopping a filed month's bill from
+ * being deleted while leaving it freely editable closes half a door: change
+ * the total on a three-month-old invoice and that month quietly becomes a
+ * different month, which is the exact outcome voiding exists to prevent —
+ * only now with no record at all that anything happened, because an edit
+ * leaves none.
+ *
+ * Corrections to an older document are made by voiding it and issuing a new
+ * one. Two rows, both explicable, which is what a record is for.
+ */
+export function canEditInPlace(date: string, now: string = today()): boolean {
+  return canDeleteOutright(date, now);
+}
+
+/** Why an older document cannot be edited, in the words to show the shop. */
+export function editRefusalMessage(what: string): string {
+  return `This ${what} is from an earlier day, so it can no longer be changed — its month has already been counted. Void it and issue a new one instead; both stay on record.`;
+}
+
 /** Whether a record has been cancelled. Written as a function so the check
  *  reads the same everywhere and cannot drift into `=== true`. */
 export const isVoided = (r: { voidedAt?: string } | undefined | null): boolean => !!r?.voidedAt;

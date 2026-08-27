@@ -140,7 +140,7 @@ function SettingsPage() {
         ItemRepo.adjustFieldBatched(batch, it.id, "stock", it.delta);
       }
       if (!(await commitBatch(batch, "recalculate stored totals"))) {
-        // The cache already holds the corrected figures, so clIBELLing success
+        // The cache already holds the corrected figures, so claiming success
         // here would be the worst possible lie: the totals look repaired
         // until the rollback lands and puts the wrong ones back.
         setBankPlan(planDataRepair(bankRepairData()));

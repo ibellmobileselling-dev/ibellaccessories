@@ -125,6 +125,25 @@ export function ReturnForm({ mode }: Props) {
       .slice(0, MAX_SUGGESTIONS);
   }, [invQ, invoiceRepo, ret.partyId]);
 
+  /**
+   * Whether a line discount has been seen on this note, ever.
+   *
+   * Per-line Unit and Disc% are off here for the same reasons as on a bill:
+   * the totals card carries one whole-note discount, and Unit belongs to the
+   * item rather than being re-typed. But a credit note gets its lines by
+   * copying them out of the original bill, which happens after the form is
+   * already open — so unlike a bill, this cannot be decided at mount.
+   *
+   * Latched rather than recomputed. Once a discount has been on screen the
+   * column stays, so clearing the last one to retype it cannot unmount the
+   * box being typed in. Monotonic, so it settles in the same render that
+   * brought the lines in.
+   */
+  const sawLineDiscount = useRef(false);
+  if (ret.lineItems.some((l) => (l.discountPct ?? 0) > 0)) sawLineDiscount.current = true;
+  const showUnitCol: boolean = false;
+  const showDiscCol = sawLineDiscount.current;
+
   const loadFromInvoice = (inv: Invoice) => {
     const lines = inv.lineItems.map((l) => ({ ...l, id: genId() }));
     const gst = inv.gstEnabled !== false;
@@ -628,9 +647,9 @@ export function ReturnForm({ mode }: Props) {
                   <th className="text-left px-3 py-2 w-8">#</th>
                   <th className="text-left px-3 py-2">Item</th>
                   <th className="text-right w-20 py-2 px-2">Qty</th>
-                  <th className="text-left w-16 py-2 px-2">Unit</th>
+                  {showUnitCol && <th className="text-left w-16 py-2 px-2">Unit</th>}
                   <th className="text-right w-24 py-2 px-2">Price</th>
-                  <th className="text-right w-20 py-2 px-2">Disc%</th>
+                  {showDiscCol && <th className="text-right w-20 py-2 px-2">Disc%</th>}
                   {gstOn && <th className="text-right w-20 py-2 px-2">GST%</th>}
                   <th className="text-right w-28 py-2 pr-3">Amount</th>
                   <th className="w-8"></th>
@@ -655,13 +674,15 @@ export function ReturnForm({ mode }: Props) {
                         className="w-full h-7 px-1.5 text-right border rounded bg-background focus:border-primary outline-none"
                       />
                     </td>
-                    <td className="py-1.5 px-1">
-                      <input
-                        value={l.unit}
-                        onChange={(e) => updateLine(l.id, { unit: e.target.value })}
-                        className="w-full h-7 px-1.5 border rounded bg-background focus:border-primary outline-none"
-                      />
-                    </td>
+                    {showUnitCol && (
+                      <td className="py-1.5 px-1">
+                        <input
+                          value={l.unit}
+                          onChange={(e) => updateLine(l.id, { unit: e.target.value })}
+                          className="w-full h-7 px-1.5 border rounded bg-background focus:border-primary outline-none"
+                        />
+                      </td>
+                    )}
                     <td className="py-1.5 px-1">
                       <NumInput
                         value={l.price}
@@ -669,13 +690,15 @@ export function ReturnForm({ mode }: Props) {
                         className="w-full h-7 px-1.5 text-right border rounded bg-background focus:border-primary outline-none"
                       />
                     </td>
-                    <td className="py-1.5 px-1">
-                      <NumInput
-                        value={l.discountPct}
-                        onValue={(n) => updateLine(l.id, { discountPct: n })}
-                        className="w-full h-7 px-1.5 text-right border rounded bg-background focus:border-primary outline-none"
-                      />
-                    </td>
+                    {showDiscCol && (
+                      <td className="py-1.5 px-1">
+                        <NumInput
+                          value={l.discountPct}
+                          onValue={(n) => updateLine(l.id, { discountPct: n })}
+                          className="w-full h-7 px-1.5 text-right border rounded bg-background focus:border-primary outline-none"
+                        />
+                      </td>
+                    )}
                     {gstOn && (
                       <td className="py-1.5 px-1">
                         <NumInput

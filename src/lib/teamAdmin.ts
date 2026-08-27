@@ -5,7 +5,7 @@ import type { ModuleKey, ModulePermission } from "@/types";
 type CreateTeamUserInput = {
   /** The CALLER's own Firebase ID token (await auth.currentUser.getIdToken()),
    * not the new user's — this is how the server independently verifies the
-   * caller is really the owner, rather than trusting a client-side clIBELL.
+   * caller is really the owner, rather than trusting a client-side claim.
    * A server endpoint is reachable directly over the network regardless of
    * what the UI hides, so this check has to happen here, not in the browser. */
   callerIdToken: string;

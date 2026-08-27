@@ -374,10 +374,20 @@ function ItemsPage() {
             // stock reversal for it entirely. Block it — same protection
             // parties and payees already have.
             const onDoc =
-              SalesRepo.all().some((i) => i.lineItems.some((l) => l.itemId === r.id)) ||
-              PurchaseRepo.all().some((i) => i.lineItems.some((l) => l.itemId === r.id)) ||
-              SaleReturnRepo.all().some((i) => i.lineItems.some((l) => l.itemId === r.id)) ||
-              PurchaseReturnRepo.all().some((i) => i.lineItems.some((l) => l.itemId === r.id)) ||
+              // allWithVoided: a cancelled bill still names this item, and
+              // its cost is still what the ledger reversed. Deleting the item
+              // would break the stock and profit history of those records —
+              // which is exactly what this guard exists to prevent.
+              SalesRepo.allWithVoided().some((i) => i.lineItems.some((l) => l.itemId === r.id)) ||
+              PurchaseRepo.allWithVoided().some((i) =>
+                i.lineItems.some((l) => l.itemId === r.id),
+              ) ||
+              SaleReturnRepo.allWithVoided().some((i) =>
+                i.lineItems.some((l) => l.itemId === r.id),
+              ) ||
+              PurchaseReturnRepo.allWithVoided().some((i) =>
+                i.lineItems.some((l) => l.itemId === r.id),
+              ) ||
               StockAdjustmentRepo.all().some((a) => a.itemId === r.id);
             if (onDoc) {
               toast.error(

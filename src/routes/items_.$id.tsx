@@ -9,13 +9,16 @@ import {
   PurchaseReturnRepo,
   StockAdjustmentRepo,
 } from "@/repositories";
-import { fmtMoney, fmtDate } from "@/lib/format";
+import { fmtDate, fmtDateShort, fmtMoney, today } from "@/lib/format";
+import { newBatch, commitBatch } from "@/repositories/base";
+import { usePeriodLock } from "@/hooks/usePeriodLock";
+import { toast } from "sonner";
 import { PaginationBar } from "@/components/Pagination";
 import { usePagination } from "@/hooks/usePagination";
 import { ItemDialog, StockAdjustDialog } from "./items";
 import { usePermissions } from "@/hooks/usePermissions";
 import { useRepoData, useRepoMemo } from "@/hooks/useRepoData";
-import type { Item, Invoice, Return } from "@/types";
+import type { Item, Invoice, Return, StockAdjustment } from "@/types";
 import {
   ArrowLeft,
   Package,
@@ -25,6 +28,7 @@ import {
   TrendingUp,
   ArrowDownLeft,
   ArrowUpRight,
+  Undo2,
 } from "lucide-react";
 
 export const Route = createFileRoute("/items_/$id")({ component: ItemDetailPage });
@@ -42,6 +46,10 @@ interface HistoryRow {
   rate: number | null;
   docId?: string;
   docKind?: "sale" | "purchase" | "sale-return" | "purchase-return";
+  /** The stock adjustment behind this row, when that is what it is. Only
+   *  these can be reversed here; every other row belongs to a document that
+   *  owns its own correction. */
+  adjustment?: StockAdjustment;
 }
 
 function ItemDetailPage() {
@@ -55,6 +63,7 @@ function ItemDetailPage() {
   const [editOpen, setEditOpen] = useState(false);
   const [adjustOpen, setAdjustOpen] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
+  const { canPost } = usePeriodLock();
 
   useEffect(() => {
     setItem(ItemRepo.get(id) ?? null);
@@ -120,6 +129,7 @@ function ItemDetailPage() {
         qtyIn: a.type === "add" ? a.qty : 0,
         qtyOut: a.type === "reduce" ? a.qty : 0,
         rate: null,
+        adjustment: a,
       });
     }
     entries.sort(
@@ -129,6 +139,44 @@ function ItemDetailPage() {
   }, [item, id, refreshKey]);
 
   const pg = usePagination(rows, "item-history");
+
+  /**
+   * Correct a stock adjustment by making the opposite one.
+   *
+   * Not by deleting it — these have never been deletable, which is the right
+   * answer and the reason this exists: the correction is a second entry, so
+   * the shelf count and the reason for both stay on the record. All this does
+   * is get the quantity and the direction right, at the moment somebody is
+   * already unsure about a stock figure.
+   */
+  const reverseAdjustment = (a: StockAdjustment) => {
+    if (!canPost(a.date, today())) return;
+    const opposite = a.type === "add" ? "reduce" : "add";
+    if (
+      !confirm(
+        `Reverse this adjustment? A new entry for ${a.qty} ${opposite === "add" ? "in" : "out"} is added today. The original stays on the item's history — both are part of the record.`,
+      )
+    )
+      return;
+    const batch = newBatch();
+    StockAdjustmentRepo.addBatched(batch, {
+      itemId: a.itemId,
+      itemName: a.itemName,
+      date: today(),
+      type: opposite,
+      qty: a.qty,
+      reason: `Reversal of ${fmtDate(a.date)} adjustment${a.reason ? ` — ${a.reason}` : ""}`,
+    } as never);
+    ItemRepo.adjustFieldBatched(batch, a.itemId, "stock", opposite === "add" ? a.qty : -a.qty);
+    commitBatch(batch, "reverse stock adjustment").then((ok) => {
+      if (!ok) {
+        toast.error("Could not reverse — reload and check before trying again");
+        return;
+      }
+      toast.success("Reversed — both entries stay on the history");
+      setRefreshKey((k) => k + 1);
+    });
+  };
 
   const openRow = (e: HistoryRow) => {
     if (!e.docId || !e.docKind) return;
@@ -308,7 +356,7 @@ function ItemDetailPage() {
           <table className="hidden md:table w-full text-[12.5px] border-collapse">
             <thead>
               <tr className="bg-gray-50">
-                {["Date", "Type", "Ref #", "Party", "Rate", "Qty In", "Qty Out"].map((h, i) => (
+                {["Date", "Type", "Ref #", "Party", "Rate", "Qty In", "Qty Out", ""].map((h, i) => (
                   <th
                     key={h}
                     className={`px-4 py-2.5 text-[10px] font-semibold uppercase tracking-wider text-gray-500 border-b border-gray-200 whitespace-nowrap ${i >= 4 ? "text-right" : "text-left"}`}
@@ -321,7 +369,7 @@ function ItemDetailPage() {
             <tbody>
               {rows.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="text-center py-14 text-gray-400">
+                  <td colSpan={8} className="text-center py-14 text-gray-400">
                     No transactions for this item yet
                   </td>
                 </tr>
@@ -334,7 +382,7 @@ function ItemDetailPage() {
                     className={`border-b border-gray-100 hover:bg-gray-50/60 ${e.docId ? "cursor-pointer" : ""}`}
                   >
                     <td className="px-4 py-2.5 text-gray-600 whitespace-nowrap">
-                      {fmtDate(e.date)}
+                      {fmtDateShort(e.date)}
                     </td>
                     <td className="px-4 py-2.5">
                       <span
@@ -355,6 +403,20 @@ function ItemDetailPage() {
                     </td>
                     <td className="px-4 py-2.5 text-right tabular-nums text-rose-600 font-semibold">
                       {e.qtyOut ? `−${e.qtyOut}` : "—"}
+                    </td>
+                    <td className="px-2 py-2.5 text-right">
+                      {e.adjustment && (
+                        <button
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                            reverseAdjustment(e.adjustment!);
+                          }}
+                          title="Reverse this adjustment — adds the opposite entry today, keeping both"
+                          className="h-7 w-7 inline-flex items-center justify-center rounded-md border border-transparent text-gray-400 transition hover:bg-amber-50 hover:text-amber-700 hover:border-amber-200"
+                        >
+                          <Undo2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))

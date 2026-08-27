@@ -11,7 +11,7 @@ import {
   CompanyRepo,
 } from "@/repositories";
 import { buildBankLedger, type BankLedgerRow } from "@/lib/ledger";
-import { fmtMoney, fmtDate } from "@/lib/format";
+import { fmtDate, fmtDateShort, fmtMoney } from "@/lib/format";
 import { printOrEscapeStandalone } from "@/lib/print";
 import { useAutoPrintFromUrl } from "@/hooks/useAutoPrintFromUrl";
 import { useRepoData, useRepoMemo } from "@/hooks/useRepoData";
@@ -381,7 +381,7 @@ function BankStatementPage() {
                     className={`border-b border-gray-100 hover:bg-gray-50/60 ${e.docId ? "cursor-pointer" : ""}`}
                   >
                     <td className="px-4 py-2.5 text-gray-600 whitespace-nowrap">
-                      {e.date ? fmtDate(e.date) : "—"}
+                      {e.date ? fmtDateShort(e.date) : "—"}
                     </td>
                     <td className="px-4 py-2.5 font-medium text-gray-800">{e.type}</td>
                     <td className="px-4 py-2.5 font-mono text-xs text-blue-600">{e.ref}</td>

@@ -2,7 +2,13 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { nextVoucherNo } from "@/repositories";
 import { usePeriodLock } from "@/hooks/usePeriodLock";
 import { VoidDialog, VoidedBadge } from "@/components/VoidDialog";
-import { canDeleteOutright, isVoided, removalWord } from "@/lib/voiding";
+import {
+  canDeleteOutright,
+  canEditInPlace,
+  editRefusalMessage,
+  isVoided,
+  removalWord,
+} from "@/lib/voiding";
 import { matchesQuery } from "@/lib/search";
 import { useEffect, useMemo, useState } from "react";
 import { PageHeader } from "@/components/PageHeader";
@@ -528,11 +534,14 @@ function CashPage() {
               render: (e) => (
                 <CashRowActions
                   row={e}
-                  onEdit={(adj) =>
-                    transferLegsFor(adj, BankTxnRepo.all()).length > 0
-                      ? setEditTransfer(adj)
-                      : setEditAdj(adj)
-                  }
+                  onEdit={(adj) => {
+                    if (!canEditInPlace(adj.date)) {
+                      toast.error(editRefusalMessage("entry"), { duration: 7000 });
+                      return;
+                    }
+                    if (transferLegsFor(adj, BankTxnRepo.all()).length > 0) setEditTransfer(adj);
+                    else setEditAdj(adj);
+                  }}
                   onDelete={deleteRow}
                 />
               ),
@@ -627,7 +636,13 @@ function CashRowActions({
         <button
           onClick={() => adj && onEdit(adj)}
           disabled={!adj}
-          title={isTransfer ? "Edit this transfer (both accounts)" : "Edit entry"}
+          title={
+            !canEditInPlace(row.date)
+              ? editRefusalMessage("entry")
+              : isTransfer
+                ? "Edit this transfer (both accounts)"
+                : "Edit entry"
+          }
           className="h-7 w-7 inline-flex items-center justify-center rounded-md border border-transparent text-gray-400 transition hover:bg-primary-soft hover:text-primary hover:border-primary/25 disabled:opacity-30 disabled:pointer-events-none"
         >
           <Pencil className="h-3.5 w-3.5" />

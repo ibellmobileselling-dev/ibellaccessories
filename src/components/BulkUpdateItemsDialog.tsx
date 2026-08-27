@@ -265,7 +265,7 @@ export function BulkUpdateItemsDialog({
         if (!(await commitBatch(batch, "bulk update items"))) allCommitted = false;
       }
 
-      // Never clIBELL success for writes the cloud rejected. The cache is
+      // Never claim success for writes the cloud rejected. The cache is
       // updated as each write is staged, so the screen behind this dialog
       // would show the new numbers for a moment and then snap back when
       // Firestore's rollback arrives — which reads as "the app changed my

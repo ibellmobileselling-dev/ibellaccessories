@@ -306,7 +306,7 @@ function InvoiceDetailPage() {
               {/* Landscape A4 is only 210mm tall — a full invoice at a scale
                   that "looks" like it fits can still overflow onto a second
                   page once real margins are counted. Scale is deliberately
-                  conservative (with reclIBELLed print margin) so a normal-length
+                  conservative (with reclaimed print margin) so a normal-length
                   bill fits on one page instead of silently spilling over. */}
               <style>{`@media print {
                 @page { size: A4 landscape; margin: 0; }

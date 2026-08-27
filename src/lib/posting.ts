@@ -696,21 +696,17 @@ export function buildJournal(book: Book): JournalEntry[] {
     noteVoid(t.id, t);
   }
 
-  /* Cancelled documents: the original stands, and a reversal follows it on
-     the day it was voided. Applied here, once, over whatever was posted above
-     — rather than inside each posting rule, where seven document types would
-     be seven chances to get a sign backwards. */
-  for (const e of [...entries]) {
-    const on = voidedOn.get(e.docId);
-    if (on) entries.push(reversalEntry(e, on));
-  }
-
   /* The written entries, last. A closing entry is dated the last day of a
      year and must sit after everything else on that day — the accounts it
      empties have to be full when it lands. The sort below keys the same date
      by id, and "je-close-…" is not reliably last alphabetically, so the flag
      is what the statements branch on rather than position. */
   for (const doc of book.journalEntries ?? []) {
+    // Cancelled the same way a bill is: the entry stands and a reversal
+    // follows it, rather than the record being destroyed. A reopened year
+    // therefore shows both, which is the honest account of a year that was
+    // closed and then wasn't.
+    noteVoid(doc.id, doc);
     entries.push({
       id: `je-doc-${doc.id}`,
       date: doc.date,
@@ -722,6 +718,33 @@ export function buildJournal(book: Book): JournalEntry[] {
       periodKey: periodOf(doc.date),
       lines: doc.lines ?? [],
     });
+  }
+
+  /* Cancelled documents: the original stands, and a reversal follows it on
+     the day it was voided. Applied here, once, over everything posted above —
+     rather than inside each posting rule, where eight document types would be
+     eight chances to get a sign backwards. It runs LAST because the stored
+     entries are added above it, and a closing entry can be cancelled too. */
+  for (const e of [...entries]) {
+    const on = voidedOn.get(e.docId);
+    if (!on) continue;
+    /* On the day it was cancelled — except for a year close, which is
+       reversed on its own date.
+
+       A bill is an event: it happened in its month, and undoing it is a
+       second event that happens in another. A closing entry is not an event
+       at all. It is a boundary — a decision that a year is finished — and it
+       exists only at the year end. Reversing it three months later would
+       leave the year still closed as at 31 March and open afterwards, which
+       is not a state a year can be in; the books would show a year that
+       could never be closed again, because nothing would be left in the
+       accounts to close.
+ 
+       It stays append-only either way: the entry survives, the reversal is
+       posted, and voidedAt/voidedBy/voidReason record when and who. Only the
+       posting date differs, because only this document is a boundary rather
+       than an event. */
+    entries.push(reversalEntry(e, e.docKind === "year-close" ? e.date : on));
   }
 
   entries.sort((a, b) =>

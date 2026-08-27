@@ -130,6 +130,64 @@ export function trialBalance(
   };
 }
 
+/**
+ * Every entry that touched one account, oldest first, with a running balance.
+ *
+ * A trial balance without this is a set of assertions: "Accounts Receivable is
+ * 4,12,300" and nothing to do about it but believe. The first question anyone
+ * asks of a figure they doubt is "made up of what?", and an accountant asks it
+ * about every figure. `docKind` and `docId` have been on every entry since the
+ * ledger was built precisely so this could exist.
+ */
+export function accountLedger(
+  entries: JournalEntry[],
+  accountId: string,
+): { rows: AccountLedgerRow[]; debit: number; credit: number; closing: number } {
+  const rows: AccountLedgerRow[] = [];
+  let running = 0;
+  let debit = 0;
+  let credit = 0;
+  // Oldest first: a running balance read from the bottom up is not a running
+  // balance. The trial balance itself sorts the other way, so this is a
+  // deliberate difference, not an oversight.
+  const ordered = [...entries].sort((a, b) =>
+    a.date === b.date ? a.id.localeCompare(b.id) : a.date.localeCompare(b.date),
+  );
+  for (const e of ordered) {
+    for (const l of e.lines) {
+      if (l.accountId !== accountId) continue;
+      running = r2(running + l.debit - l.credit);
+      debit = r2(debit + l.debit);
+      credit = r2(credit + l.credit);
+      rows.push({
+        date: e.date,
+        voucherType: e.voucherType,
+        voucherNo: e.voucherNo,
+        narration: e.narration,
+        docKind: e.docKind,
+        docId: e.docId,
+        debit: l.debit,
+        credit: l.credit,
+        balance: running,
+      });
+    }
+  }
+  return { rows, debit, credit, closing: running };
+}
+
+export interface AccountLedgerRow {
+  date: string;
+  voucherType: string;
+  voucherNo?: string;
+  narration: string;
+  docKind: string;
+  docId: string;
+  debit: number;
+  credit: number;
+  /** Running debit-minus-credit after this line. */
+  balance: number;
+}
+
 /** Subtotal per group, for the trial balance's group rows. */
 export function groupTotals(rows: AccountBalance[]): { group: AccountGroup; balance: number }[] {
   return GROUP_ORDER.map((group) => ({
@@ -162,6 +220,17 @@ export function partyPositionsFromLedger(entries: JournalEntry[]): Map<string, n
 export interface ReconRow {
   key: string;
   label: string;
+  /**
+   * A figure worth showing that has no right answer to be checked against.
+   *
+   * Inventory is the only one: the ledger carries stock at what each movement
+   * actually cost, while the stock report values what is on the shelf at
+   * today's purchase price. Those are two different questions, and they
+   * separate whenever a purchase price moves — which is normal trading, not a
+   * fault. Marking it informational keeps a real difference visible without
+   * turning a screen that must only cry wolf into one that always does.
+   */
+  informational?: boolean;
   /** What the posting ledger says. */
   ledger: number;
   /** What the screens the shop uses today say. */
@@ -209,6 +278,7 @@ export function reconcile(book: Book): Reconciliation {
     app: number,
     why: string,
     eps = 0.02,
+    informational = false,
   ) => {
     const diff = r2(ledger - app);
     rows.push({
@@ -217,8 +287,9 @@ export function reconcile(book: Book): Reconciliation {
       ledger: r2(ledger),
       app: r2(app),
       diff,
-      ok: Math.abs(diff) <= eps,
+      ok: informational || Math.abs(diff) <= eps,
       why,
+      ...(informational ? { informational } : {}),
     });
   };
 
@@ -315,6 +386,31 @@ export function reconcile(book: Book): Reconciliation {
     balanceOf(entries, "bank-unattributed"),
     netFlow(bankFlows(app.sales, app.purchases, app.expenses, app.payments)),
     "Bank, UPI and cheque money never tied to a specific account, against bankFlows. Anything here sits outside every stored bank balance.",
+  );
+
+  /* 4b. Inventory. Two honest answers to two different questions, shown
+        side by side rather than left off because they do not tie out.
+
+        The ledger carries stock at what each movement cost when it happened;
+        the stock report values what is on the shelf at today's purchase
+        price. A shop whose costs never moved would see these agree. A shop
+        whose costs moved sees the difference, and the difference IS the
+        price movement — which is worth knowing and is not an error.
+
+        What WOULD be an error is the quantities disagreeing, and that has
+        its own check: Settings → Fix Calculations rebuilds stock from the
+        documents. This row is about value, not count. */
+  const stockAtCurrentCost = r2(
+    app.items.reduce((s, i) => s + (Number(i.stock) || 0) * (i.purchasePrice || 0), 0),
+  );
+  add(
+    "inventory",
+    "Inventory",
+    balanceOf(entries, "inventory"),
+    stockAtCurrentCost,
+    "The ledger carries stock at what each movement cost at the time; the stock report values it at today's purchase price. They separate when purchase prices move, which is normal trading — shown for information, not as a fault. Quantities are checked separately by Fix Calculations.",
+    0.02,
+    true,
   );
 
   /* 5. Profit. The Reports screen's P&L, against income minus expenses in the

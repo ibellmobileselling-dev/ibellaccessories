@@ -73,7 +73,7 @@ export function PartyLedgerExportDialog({
   const periodLabel = wholeLedger
     ? "All transactions"
     : `${dateFrom ? fmtDate(dateFrom) : "Beginning"} — ${dateTo ? fmtDate(dateTo) : "Today"}`;
-  /** Filenames shouldn't clIBELL a range that wasn't applied. */
+  /** Filenames shouldn't claim a range that wasn't applied. */
   const fileSuffix = wholeLedger ? "all" : `${dateFrom || "start"}-to-${dateTo || "today"}`;
 
   /** Statement rows for one party over the chosen window. */

@@ -2,7 +2,7 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useGoBack } from "@/hooks/useGoBack";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { PayeeRepo, ExpenseRepo, BankRepo, CompanyRepo } from "@/repositories";
-import { fmtMoney, fmtDate } from "@/lib/format";
+import { fmtDate, fmtDateShort, fmtMoney } from "@/lib/format";
 import { printOrEscapeStandalone } from "@/lib/print";
 import { useAutoPrintFromUrl } from "@/hooks/useAutoPrintFromUrl";
 import { useRepoData, useRepoMemo } from "@/hooks/useRepoData";
@@ -304,7 +304,7 @@ function PayeeLedgerPage() {
                   rows.map((r) => (
                     <tr key={r.id} className="border-b border-gray-100">
                       <td className="px-3 py-2.5 text-gray-600 whitespace-nowrap">
-                        {fmtDate(r.date)}
+                        {fmtDateShort(r.date)}
                       </td>
                       <td className="px-3 py-2.5 font-medium text-gray-800 whitespace-nowrap">
                         {r.category}

@@ -258,11 +258,15 @@ function BankPage() {
             // cash adjustments its past deposits created are left dangling.
             // Block until nothing references it.
             const used =
-              BankTxnRepo.all().some((t) => t.bankId === r.id) ||
-              PaymentRepo.all().some((p) => p.bankId === r.id) ||
-              ExpenseRepo.all().some((e) => e.bankId === r.id) ||
-              SalesRepo.all().some((i) => i.bankId === r.id) ||
-              PurchaseRepo.all().some((i) => i.bankId === r.id);
+              // allWithVoided: a cancelled document still references this
+              // account, and the ledger still posts its reversal against it.
+              // Deleting the account would drop it out of the chart and leave
+              // those postings pointing at nothing.
+              BankTxnRepo.allWithVoided().some((t) => t.bankId === r.id) ||
+              PaymentRepo.allWithVoided().some((p) => p.bankId === r.id) ||
+              ExpenseRepo.allWithVoided().some((e) => e.bankId === r.id) ||
+              SalesRepo.allWithVoided().some((i) => i.bankId === r.id) ||
+              PurchaseRepo.allWithVoided().some((i) => i.bankId === r.id);
             if (used) {
               toast.error(
                 `Can't delete "${r.name}" — it has transactions, payments or bills linked to it. Reassign or remove those first.`,

@@ -41,7 +41,13 @@ import { transferLegsFor } from "@/lib/transferLegs";
 import { AuditLogRepo, nextVoucherNo } from "@/repositories";
 import { isLocked, blockedDate, lockMessage } from "@/lib/periodLock";
 import { buildJournal, isBalanced, entryDrift, liveOnly, type Book } from "@/lib/posting";
-import { canDeleteOutright, isVoided, removalWord } from "@/lib/voiding";
+import {
+  canDeleteOutright,
+  canEditInPlace,
+  editRefusalMessage,
+  isVoided,
+  removalWord,
+} from "@/lib/voiding";
 import {
   financialYear,
   profitAndLoss,
@@ -51,7 +57,13 @@ import {
   closingEntryBalances,
 } from "@/lib/financials";
 import { accountsFor } from "@/lib/accounts";
-import { reconcile, trialBalance, balanceOf, partyPositionsFromLedger } from "@/lib/trialBalance";
+import {
+  reconcile,
+  trialBalance,
+  balanceOf,
+  partyPositionsFromLedger,
+  accountLedger,
+} from "@/lib/trialBalance";
 import {
   CASH_PURPOSES,
   CHOOSABLE_PURPOSES,
@@ -1677,7 +1689,7 @@ console.log(`\n═════════════════════�
    side, and the second side is an account. */
 {
   // The choosable set must not offer the one the app writes for itself: a
-  // transfer's other side is a real account, and clIBELLing "transfer" from the
+  // transfer's other side is a real account, and claiming "transfer" from the
   // adjust screen would be a lie about where the money went.
   assert(
     CHOOSABLE_PURPOSES.every((p) => p.key !== "transfer"),
@@ -2968,7 +2980,7 @@ console.log(`\n═════════════════════�
   }
 
   /* ── The identity, over the randomised books ──────────────────────────
-     A balance sheet's whole clIBELL is that what the shop owns equals what it
+     A balance sheet's whole claim is that what the shop owns equals what it
      owes plus what is left over. Asserted over generated books rather than
      one worked example, because the failure mode is an account group being
      read the wrong way round, which a single tidy case can miss. */
@@ -3509,6 +3521,430 @@ console.log(`\n═════════════════════�
       );
     }
   }
+}
+
+/* ═══ TEST 30: the other half of the door ═══════════════════════════════
+   Phase 4 stopped an older document being deleted. It said nothing about
+   editing one, which left the rule half-applied: you could not remove last
+   month's bill, but you could open it and change the total to anything, and
+   that month became a different month with no record that anything had
+   happened. An edit leaves less trace than a deletion does — the audit log at
+   least keeps a snapshot of what was deleted.
+
+   So the same line governs both, and corrections to an older document are
+   made by voiding it and issuing a new one. */
+{
+  const now = "2026-08-26";
+  assert(canEditInPlace("2026-08-26", now), "T30: today's document can still be edited");
+  assert(
+    canEditInPlace("2026-09-01", now),
+    "T30: and a future-dated one — nothing has been counted yet either way",
+  );
+  assert(!canEditInPlace("2026-08-25", now), "T30: yesterday's cannot — its day has been counted");
+  assert(!canEditInPlace("", now), "T30: and neither can one with no date at all");
+
+  /* The same line as deletion, deliberately. Two rules a day apart would be
+     a bill that cannot be deleted but can be edited to zero, which is the
+     same outcome by a quieter route. */
+  for (const d of ["2026-08-24", "2026-08-25", "2026-08-26", "2026-08-27", ""]) {
+    assert(
+      canEditInPlace(d, now) === canDeleteOutright(d, now),
+      `T30: editing and deleting are allowed on exactly the same days — ${JSON.stringify(d)}`,
+    );
+  }
+
+  assert(
+    editRefusalMessage("invoice").includes("Void it and issue a new one"),
+    "T30: and the refusal says what to do instead — a screen that only refuses gets worked around",
+  );
+}
+
+/* ═══ TEST 31: reopening a year reverses the close ══════════════════════
+   Everything else in this application leaves the original where it is and
+   posts a reversal. A year close was the exception: reopening deleted it. Of
+   all the documents to make an exception of, that is the worst one — next
+   year's opening position is built on it, and a deleted close leaves no
+   record that the year was ever closed. */
+{
+  const book: Book = {
+    parties: [],
+    items: [],
+    banks: [],
+    sales: [],
+    purchases: [],
+    saleReturns: [],
+    purchaseReturns: [],
+    payments: [],
+    expenses: [
+      {
+        id: "E1",
+        date: "2025-07-01",
+        category: "Shop Rent",
+        amount: 400,
+        paymentMode: "cash",
+        createdAt: "",
+      },
+    ],
+    cashAdjustments: [],
+    bankTxns: [],
+    stockAdjustments: [],
+  } as unknown as Book;
+  const chart = accountsFor(book.banks, book.expenses);
+  const FY = financialYear("2025-07-01");
+
+  const plan = planYearClose(buildJournal(book), chart, FY.end, "2026-06-01");
+  assert(plan.netProfit === -400, `T31: the year lost 400 — ${plan.netProfit}`);
+  const entry = closingEntry(plan);
+
+  book.journalEntries = [
+    {
+      id: "YC1",
+      date: entry.date,
+      voucherType: entry.voucherType,
+      docKind: entry.docKind,
+      narration: entry.narration,
+      fyLabel: plan.fy.label,
+      lines: entry.lines,
+      createdAt: "2026-06-01T00:00:00Z",
+    },
+  ] as never;
+
+  assert(
+    !!planYearClose(buildJournal(book), chart, FY.end, "2026-06-01").blocked,
+    "T31: once closed, it cannot be closed again",
+  );
+  assert(
+    balanceOf(buildJournal(book), "retained") === 400,
+    `T31: and the loss sits in Retained Earnings — ${balanceOf(buildJournal(book), "retained")}`,
+  );
+
+  /* Reopen it — the way the screen now does, by cancelling the entry rather
+     than destroying it. */
+  (book.journalEntries as unknown as { voidedAt?: string }[])[0].voidedAt = "2026-09-15T00:00:00Z";
+  const reopened = buildJournal(book);
+
+  assert(
+    reopened.some((e) => e.docKind === "year-close"),
+    "T31: the closing entry is STILL on record — that is the whole point",
+  );
+  assert(
+    reopened.some((e) => e.docKind === "year-close-void"),
+    `T31: with a reversal against it — ${JSON.stringify(reopened.map((e) => e.docKind))}`,
+  );
+  /* Dated the year end, NOT the day it was reopened — the one deliberate
+     exception to how every other reversal is dated.
+
+     A bill is an event: it happened in its month, and undoing it is a second
+     event in another. A closing entry is not an event, it is a boundary. A
+     reversal dated three months later would leave the year closed as at 31
+     March and open afterwards, which is not a state a year can be in — and
+     the year could then never be closed again, because nothing would be left
+     in the accounts to close. */
+  assert(
+    reopened.find((e) => e.docKind === "year-close-void")?.date === FY.end,
+    `T31: the reversal lands on the year end, where the close itself is — ${
+      reopened.find((e) => e.docKind === "year-close-void")?.date
+    }`,
+  );
+  assert(
+    !!(book.journalEntries as unknown as { voidedAt?: string }[])[0].voidedAt,
+    "T31: while the record still says WHEN it was reopened",
+  );
+  assert(
+    balanceOf(reopened, "retained") === 0,
+    `T31: Retained Earnings is back where it was — ${balanceOf(reopened, "retained")}`,
+  );
+
+  const plan2 = planYearClose(reopened, chart, FY.end, "2026-10-01");
+  assert(
+    !plan2.blocked,
+    `T31: and the year can be closed again — a reversed close is not a close (${plan2.blocked})`,
+  );
+  assert(
+    plan2.netProfit === -400,
+    `T31: for the same amount it lost the first time — ${plan2.netProfit}`,
+  );
+
+  /* The P&L never moved through any of this. It excludes closing entries AND
+     their reversals: counting the close would report zero, and counting the
+     reversal would report double. */
+  for (const [label, es] of [
+    ["before closing", buildJournal({ ...book, journalEntries: [] })],
+    ["after reopening", reopened],
+  ] as const) {
+    assert(
+      profitAndLoss(es, chart, FY.start, FY.end).netProfit === -400,
+      `T31: the year still reports what it lost, ${label} — ${profitAndLoss(es, chart, FY.start, FY.end).netProfit}`,
+    );
+  }
+
+  assert(
+    balanceSheet(reopened, chart, FY.end).drift === 0,
+    "T31: and the balance sheet still balances with both entries on it",
+  );
+  assert(
+    balanceSheet(reopened, chart, FY.end).currentEarnings === -400,
+    `T31: with the loss back in the open period — ${balanceSheet(reopened, chart, FY.end).currentEarnings}`,
+  );
+}
+
+/* ═══ TEST 32: the repair tools read LIVE documents, and must ═══════════
+   The delete guards had to be taught to count cancelled documents. This is
+   the same question with the opposite answer, which is why it is written
+   down: voiding a sale already puts its stock back, so a repair tool that
+   also counted the cancelled sale would compute a stock figure that is short
+   by the very quantity the void restored — and then "repair" the shop's real
+   stock to it.
+
+   Both readings are one word apart at the call site, and the wrong one is
+   the plausible-looking one after seeing the delete-guard fix. */
+{
+  const item = {
+    id: "RI",
+    name: "Repair Item",
+    unit: "PCS",
+    gstRate: 0,
+    purchasePrice: 100,
+    salePrice: 200,
+    openingStock: 100,
+    // Voiding the sale below restored its 10, so the stored figure is back
+    // where it started. This is the state the shop is actually in.
+    stock: 100,
+    createdAt: "",
+  } as unknown as Item;
+
+  const soldThenVoided = {
+    id: "RS",
+    number: "INV-R",
+    date: "2026-05-01",
+    partyId: "P",
+    partyName: "P",
+    lineItems: [
+      {
+        id: "l",
+        itemId: "RI",
+        name: "Repair Item",
+        qty: 10,
+        unit: "PCS",
+        price: 200,
+        discountPct: 0,
+        gstRate: 0,
+        amount: 2000,
+      },
+    ],
+    subtotal: 2000,
+    discount: 0,
+    taxAmount: 0,
+    total: 2000,
+    paid: 0,
+    paymentMode: "credit",
+    createdAt: "",
+    voidedAt: "2026-07-01T00:00:00Z",
+  } as unknown as Invoice;
+
+  const base = {
+    items: [item],
+    purchases: [] as Invoice[],
+    saleReturns: [] as Return[],
+    purchaseReturns: [] as Return[],
+    stockAdjustments: [] as StockAdjustment[],
+  };
+
+  // What the screen actually passes: SalesRepo.all(), which skips the
+  // cancelled bill.
+  const live = planStockRepair({ ...base, sales: [] });
+  assert(
+    live.length === 0,
+    `T32: with the cancelled sale excluded, stock already agrees and nothing is "repaired" — ${JSON.stringify(live)}`,
+  );
+
+  // And what would happen if someone changed that call to allWithVoided by
+  // analogy with the delete guards: the tool would decide the shop is 10
+  // short and write that figure onto real stock.
+  const withVoided = planStockRepair({ ...base, sales: [soldThenVoided] });
+  assert(
+    withVoided.length === 1 && withVoided[0].correct === 90,
+    `T32: counting it would silently take 10 off the real stock — ${JSON.stringify(withVoided)}`,
+  );
+}
+
+/* ═══ TEST 33: what an account figure is made of ════════════════════════
+   A trial balance without this is a set of assertions: "Accounts Receivable
+   is 4,12,300" and nothing to do but believe it. The first question anyone
+   asks of a figure they doubt is "made up of what", and an accountant asks it
+   of every figure. */
+{
+  const b: Book = {
+    parties: [{ id: "P1", name: "Cust", openingBalance: 0, createdAt: "" }],
+    items: [],
+    banks: [],
+    sales: [
+      {
+        id: "S1",
+        number: "INV-1",
+        date: "2026-05-10",
+        partyId: "P1",
+        partyName: "Cust",
+        gstEnabled: false,
+        lineItems: [],
+        subtotal: 1000,
+        discount: 0,
+        taxAmount: 0,
+        total: 1000,
+        paid: 0,
+        paymentMode: "credit",
+        createdAt: "",
+      },
+      {
+        id: "S2",
+        number: "INV-2",
+        date: "2026-03-02",
+        partyId: "P1",
+        partyName: "Cust",
+        gstEnabled: false,
+        lineItems: [],
+        subtotal: 400,
+        discount: 0,
+        taxAmount: 0,
+        total: 400,
+        paid: 0,
+        paymentMode: "credit",
+        createdAt: "",
+      },
+    ],
+    purchases: [],
+    saleReturns: [],
+    purchaseReturns: [],
+    payments: [
+      {
+        id: "PAY1",
+        date: "2026-06-01",
+        partyId: "P1",
+        partyName: "Cust",
+        type: "in",
+        amount: 250,
+        mode: "cash",
+        createdAt: "",
+      },
+    ],
+    expenses: [],
+    cashAdjustments: [],
+    bankTxns: [],
+    stockAdjustments: [],
+  } as unknown as Book;
+
+  const entries = buildJournal(b);
+  const led = accountLedger(entries, "ar");
+
+  assert(led.rows.length === 3, `T33: every line that touched the account — ${led.rows.length}`);
+  /* Oldest first. A running balance read from the newest end is not a running
+     balance, and the trial balance itself sorts the other way — so this is a
+     deliberate difference rather than an oversight, and worth pinning. */
+  assert(
+    led.rows[0].date === "2026-03-02" &&
+      led.rows[1].date === "2026-05-10" &&
+      led.rows[2].date === "2026-06-01",
+    `T33: oldest first, so the running balance runs — ${led.rows.map((r) => r.date).join(", ")}`,
+  );
+  assert(
+    led.rows.map((r) => r.balance).join(",") === "400,1400,1150",
+    `T33: and the balance runs with it — ${led.rows.map((r) => r.balance).join(",")}`,
+  );
+  assert(
+    led.closing === balanceOf(entries, "ar"),
+    `T33: ending exactly where the trial balance says — ${led.closing} vs ${balanceOf(entries, "ar")}`,
+  );
+  assert(
+    led.debit === 1400 && led.credit === 250,
+    `T33: with both columns totalled — dr ${led.debit} cr ${led.credit}`,
+  );
+  /* Every row names the document behind it, so "why is receivable 1,150"
+     ends at a bill with a number on it rather than at a shrug. */
+  assert(
+    led.rows.every((r) => !!r.docId && !!r.docKind),
+    "T33: every line points back at the document that caused it",
+  );
+  assert(
+    led.rows.some((r) => r.voucherNo === "INV-1"),
+    `T33: by its number — ${led.rows.map((r) => r.voucherNo).join(", ")}`,
+  );
+  assert(
+    accountLedger(entries, "nothing-here").rows.length === 0,
+    "T33: an account nothing touched reads as empty, not as an error",
+  );
+}
+
+/* ═══ TEST 34: Inventory is shown, and shown honestly ═══════════════════
+   Until now the trial balance printed an Inventory figure that nothing on any
+   screen was ever compared against — the one account with no second opinion.
+   It has one now, but the two answer different questions: the ledger carries
+   stock at what each movement cost at the time, the stock report values what
+   is on the shelf at today's purchase price. They separate when a purchase
+   price moves, which is trading, not a fault. So the row is shown and
+   measured, and marked as information rather than as a verdict. */
+{
+  const item = {
+    id: "I1",
+    name: "Item",
+    // Bought at 100, now costs 150 — the ordinary case, not a corner one.
+    purchasePrice: 150,
+    openingStock: 0,
+    stock: 10,
+    createdAt: "2026-01-01T00:00:00Z",
+  } as unknown as Item;
+
+  const b: Book = {
+    parties: [{ id: "P1", name: "Supp", openingBalance: 0, createdAt: "" }],
+    items: [item],
+    banks: [],
+    sales: [],
+    purchases: [
+      {
+        id: "PB1",
+        number: "PB-1",
+        date: "2026-02-01",
+        partyId: "P1",
+        partyName: "Supp",
+        gstEnabled: false,
+        lineItems: [{ itemId: "I1", qty: 10, price: 100, costPrice: 100 }],
+        subtotal: 1000,
+        discount: 0,
+        taxAmount: 0,
+        total: 1000,
+        paid: 1000,
+        paymentMode: "cash",
+        createdAt: "",
+      },
+    ],
+    saleReturns: [],
+    purchaseReturns: [],
+    payments: [],
+    expenses: [],
+    cashAdjustments: [],
+    bankTxns: [],
+    stockAdjustments: [],
+  } as unknown as Book;
+
+  const recon = reconcile(b);
+  const row = recon.rows.find((r) => r.key === "inventory");
+  assert(!!row, "T34: Inventory is on the reconciliation at all — it never used to be");
+  assert(row?.ledger === 1000, `T34: the ledger carries it at what it cost — ${row?.ledger}`);
+  assert(row?.app === 1500, `T34: the stock report values it at today's price — ${row?.app}`);
+  assert(row?.diff === -500, `T34: and the difference is stated — ${row?.diff}`);
+
+  /* The important part. A 500 gap that is purely a price movement must not
+     turn the reconciliation red, or the screen that exists to be believed
+     starts crying wolf every time a supplier raises a price. */
+  assert(row?.informational === true, "T34: marked as information, not as a verdict");
+  assert(row?.ok === true, "T34: so a normal price movement does not read as a failure");
+  assert(
+    recon.ok,
+    "T34: and the book as a whole still reconciles — the other rows are what pass or fail",
+  );
+  assert(
+    (row?.why ?? "").includes("purchase prices move"),
+    `T34: with the reason on the row, where the reader is — ${row?.why}`,
+  );
 }
 
 console.log(`  AUDIT RESULT: ${passed} assertions passed, ${failed} failed`);

@@ -1422,7 +1422,7 @@ async function runAll(): Promise<Results> {
       assert(detail3.length > 0, "back: (no input on the detail page to test typing with)");
     }
 
-    // A key the shortcut must not clIBELL.
+    // A key the shortcut must not claim.
     await act(async () => {
       window.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
     });
@@ -1895,7 +1895,7 @@ async function runAll(): Promise<Results> {
   {
     // Arrive THROUGH the sales list, so there is somewhere to go back to.
     // With a single-entry history the app-wide Escape bails on its own and
-    // this could never tell whether the form actually clIBELLed the key.
+    // this could never tell whether the form actually claimed the key.
     await renderRoute(["/sales", "/sales/new"]);
 
     // Put something on the bill so leaving would cost work.
@@ -1949,7 +1949,7 @@ async function runAll(): Promise<Results> {
     }
     /* On a form, Escape belongs to the FORM, not to the app-wide "go back".
        Both are window listeners and the app-wide one is registered first, so
-       without an explicit clIBELL it would win the race and leave the page
+       without an explicit claim it would win the race and leave the page
        before the form could ask about the unsaved bill. */
     {
       let asked = 0;
@@ -2450,9 +2450,8 @@ async function runAll(): Promise<Results> {
        will actually do; "Delete" on a control that cannot delete is the kind
        of small lie that stops people trusting a screen. */
     assert(
-      !!manual?.querySelector('[title="Edit entry"]') &&
-        !!manual?.querySelector('[title="Void entry"]'),
-      `cash rows: an older manual entry offers Edit and Void — ${Array.from(
+      !!manual?.querySelector('[title="Void entry"]'),
+      `cash rows: an older manual entry offers Void — ${Array.from(
         manual?.querySelectorAll("[title]") ?? [],
       )
         .map((el) => el.getAttribute("title"))
@@ -2461,6 +2460,32 @@ async function runAll(): Promise<Results> {
     assert(
       !manual?.querySelector('[title="Delete entry"]'),
       "cash rows: and does NOT offer to delete something that has been counted",
+    );
+    /* Nor to edit it. Voiding an older entry while leaving it editable would
+       be a door and a way round the door: change the amount instead and the
+       month changes with no record that anything happened. */
+    assert(
+      !manual?.querySelector('[title="Edit entry"]'),
+      "cash rows: and does NOT offer to edit it either — that is the same door",
+    );
+    assert(
+      !!manual?.querySelector('[title*="can no longer be changed"]'),
+      `cash rows: the pencil says why instead — ${Array.from(
+        manual?.querySelectorAll("[title]") ?? [],
+      )
+        .map((el) => el.getAttribute("title"))
+        .join(" / ")}`,
+    );
+    /* And pressing it does nothing. The tooltip is a courtesy; the guard is
+       what happens on the click, and a test that only reads hover text would
+       pass with the rule switched off entirely. */
+    await act(async () => {
+      (manual?.querySelector('[title*="can no longer be changed"]') as HTMLElement)?.click();
+    });
+    await settleMs(150);
+    assert(
+      !document.querySelector('[role="dialog"]'),
+      "cash rows: pressing the pencil on an older entry opens nothing — the tooltip is a courtesy, this is the guard",
     );
 
     const derived = Array.from(table?.querySelectorAll("tbody tr") ?? []).find((tr) =>
@@ -2617,9 +2642,16 @@ async function runAll(): Promise<Results> {
     );
     assert(!!leg, "transfer delete: the cash leg is on the Cash page");
     // A transfer leg cannot be edited on its own — the two ends would disagree.
+    // By name, not by position: the first [title] on the row is the pencil,
+    // whose text changes with the edit rule. A positional selector quietly
+    // starts asserting something else the moment a control is added.
     assert(
-      (leg?.querySelector("[title]") as HTMLElement)?.getAttribute("title")?.includes("transfer"),
-      "transfer delete: the row says it is part of a transfer",
+      !!leg?.querySelector('[title*="transfer on both accounts"]'),
+      `transfer delete: the row's action says it covers both accounts — ${Array.from(
+        leg?.querySelectorAll("[title]") ?? [],
+      )
+        .map((el) => el.getAttribute("title"))
+        .join(" / ")}`,
     );
 
     /* Dated earlier this month, so it is voided rather than destroyed — and
@@ -2669,6 +2701,344 @@ async function runAll(): Promise<Results> {
     assert(
       BankRepo.get("XB1")?.balance === 2000,
       `transfer void: the account balance is put back — ${BankRepo.get("XB1")?.balance} (want 2000)`,
+    );
+  }
+
+  /* ── The bill grid carries no Unit or Disc% column ────────────────────
+     The counter gives one whole-bill "Extra Discount" in the totals card, so
+     a per-line Disc% is a second place to put the same thing — and the
+     client's own report was that it confuses the person entering the bill.
+     Unit belongs to the item and was only ever being re-typed.
+
+     Sales dropped them first and purchases kept them, for no reason the
+     person using the two forms could see. Both are checked here so they
+     cannot drift apart again.
+
+     What must NOT happen: a bill that already carries a line discount losing
+     the column. That would leave an amount changing the total with nowhere
+     to see or correct it — so that case keeps the column, and is checked. */
+  {
+    /* The EDITABLE grid, not every table on the page. The form also renders
+       a hidden printable copy of the bill, which has a Unit column of its own
+       and always should — a printed bill states the unit. Selecting on
+       "thead th" alone read both and reported the print template's column as
+       the form's. */
+    const headersOf = () => {
+      const grid = Array.from(document.querySelectorAll("table")).find(
+        (t) => !!t.querySelector("tbody input"),
+      );
+      assert(!!grid, "bill columns: found the editable line grid");
+      return Array.from(grid?.querySelectorAll("thead th") ?? []).map((th) =>
+        (th.textContent ?? "").trim(),
+      );
+    };
+
+    for (const [route, what] of [
+      ["/sales/new", "sale"],
+      ["/purchase/new", "purchase"],
+    ] as const) {
+      await renderRoute(route);
+      const heads = headersOf();
+      assert(heads.length > 0, `bill columns: the ${what} grid rendered — ${heads}`);
+      assert(
+        !heads.includes("Unit"),
+        `bill columns: a new ${what} has no per-line Unit column — ${heads}`,
+      );
+      assert(!heads.includes("Disc%"), `bill columns: and no per-line Disc% column — ${heads}`);
+      // The columns that must still be there, so this cannot pass by the grid
+      // having failed to render at all.
+      assert(
+        heads.some((h) => /qty/i.test(h)) && heads.some((h) => /price|rate/i.test(h)),
+        `bill columns: while Qty and Price are still there — ${heads}`,
+      );
+    }
+
+    /* An older bill that already has a line discount keeps the column. The
+       figure is affecting its total; hiding it would make the total
+       unexplainable and uncorrectable. */
+    PurchaseRepo.add({
+      id: "OLDDISC",
+      createdAt: "2026-01-01T00:00:00Z",
+      number: "PB-DISC",
+      // Today: this block is about the Disc% column, and a bill from an
+      // earlier day can no longer be opened for editing at all (see the
+      // append-only rule) — so an older one would test the wrong refusal.
+      date: today(),
+      partyId: "P1",
+      partyName: "Acme Traders",
+      gstEnabled: false,
+      lineItems: [
+        {
+          id: "dl",
+          itemId: "I1",
+          name: "Widget",
+          qty: 2,
+          unit: "PCS",
+          price: 100,
+          discountPct: 10,
+          gstRate: 0,
+          amount: 180,
+        },
+      ],
+      subtotal: 200,
+      discount: 0,
+      taxAmount: 0,
+      total: 180,
+      paid: 0,
+      paymentMode: "credit",
+    } as never);
+
+    await renderRoute("/purchase/edit/OLDDISC");
+    const editHeads = headersOf();
+    assert(
+      editHeads.includes("Disc%"),
+      `bill columns: a bill that already carries a line discount keeps the column — ${editHeads}`,
+    );
+    assert(
+      !editHeads.includes("Unit"),
+      `bill columns: but still no Unit column, which nothing depends on — ${editHeads}`,
+    );
+
+    /* And clearing that discount must not take the column away underneath the
+       person clearing it. NumInput reports 0 for an empty box, so a rule
+       computed from the live lines flips the moment Backspace empties the
+       field — the column unmounts, the focused input goes with it, and the
+       one value being corrected is the one that cannot be. */
+    const grid = Array.from(document.querySelectorAll("table")).find(
+      (t) => !!t.querySelector("tbody input"),
+    );
+    const discInput = Array.from(grid?.querySelectorAll("tbody input") ?? []).find(
+      (i) => (i as HTMLInputElement).value === "10",
+    ) as HTMLInputElement | undefined;
+    assert(!!discInput, "bill columns: found the discount box holding 10");
+    await act(async () => {
+      setInput(discInput, "");
+    });
+    await settleMs(120);
+    assert(
+      headersOf().includes("Disc%"),
+      `bill columns: emptying it keeps the column — ${headersOf()}`,
+    );
+    assert(
+      document.body.contains(discInput!),
+      "bill columns: and the box being typed in is still there to type in",
+    );
+  }
+
+  /* ── A credit note carries no Unit or Disc% column either ─────────────
+     Same two columns, gone for the same reasons — with one difference that
+     matters. A bill is opened and edited; a credit note gets its lines by
+     copying them out of the original bill AFTER the form is already open. So
+     "did it arrive with a discount" cannot be answered when the form mounts,
+     and the rule has to latch instead. */
+  {
+    const gridOf = () => {
+      const grid = Array.from(document.querySelectorAll("table")).find(
+        (t) => !!t.querySelector("tbody input"),
+      );
+      return Array.from(grid?.querySelectorAll("thead th") ?? []).map((th) =>
+        (th.textContent ?? "").trim(),
+      );
+    };
+
+    for (const [route, what] of [
+      ["/sale-return/new", "sale return"],
+      ["/purchase-return/new", "purchase return"],
+    ] as const) {
+      await renderRoute(route);
+      const heads = gridOf();
+      assert(heads.length > 0, `return columns: the ${what} grid rendered — ${heads}`);
+      assert(!heads.includes("Unit"), `return columns: no Unit column on a ${what} — ${heads}`);
+      assert(!heads.includes("Disc%"), `return columns: and no Disc% column — ${heads}`);
+      assert(
+        heads.some((h) => /qty/i.test(h)) && heads.some((h) => /price|rate/i.test(h)),
+        `return columns: while Qty and Price are still there — ${heads}`,
+      );
+    }
+
+    /* Loading an original bill that HAS a line discount brings the column
+       back, because that figure is now on the note and changing its total.
+       This is the case a mount-time rule would get wrong: the discount
+       arrives long after the form opened. */
+    SalesRepo.add({
+      id: "RETSRC",
+      createdAt: "2026-01-01T00:00:00Z",
+      number: "INV-RETSRC",
+      date: D2,
+      partyId: "P1",
+      partyName: "Acme Traders",
+      gstEnabled: false,
+      lineItems: [
+        {
+          id: "rl",
+          itemId: "I1",
+          name: "Widget",
+          qty: 3,
+          unit: "PCS",
+          price: 100,
+          discountPct: 20,
+          gstRate: 0,
+          amount: 240,
+        },
+      ],
+      subtotal: 300,
+      discount: 0,
+      taxAmount: 0,
+      total: 240,
+      paid: 0,
+      paymentMode: "credit",
+    } as never);
+
+    await renderRoute("/sale-return/new");
+    assert(
+      !gridOf().includes("Disc%"),
+      "return columns: no Disc% column before anything is loaded",
+    );
+
+    // Find the original-bill picker and choose that invoice.
+    // The box is labelled by what it searches for, not by the word
+    // "invoice" — "Search INV-… to auto-load items".
+    const invBox = Array.from(document.querySelectorAll("input")).find((i) =>
+      /auto-load items/i.test(i.getAttribute("placeholder") ?? ""),
+    ) as HTMLInputElement | undefined;
+    assert(!!invBox, "return columns: found the original-bill box");
+    await act(async () => {
+      setInput(invBox, "INV-RETSRC");
+    });
+    await settleMs(150);
+    // The suggestion is a div that reacts to mousedown, not a button — the
+    // picker commits before the input can blur. Driven the way a person
+    // drives it rather than the way it would be convenient to.
+    const option = Array.from(document.querySelectorAll("div")).find(
+      (el) =>
+        (el.textContent ?? "").includes("INV-RETSRC") &&
+        el.querySelector("span.font-mono") &&
+        !el.querySelector("div div"),
+    );
+    assert(!!option, "return columns: the bill is offered");
+    await act(async () => {
+      option?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    });
+    await settleMs(250);
+
+    assert(
+      gridOf().includes("Disc%"),
+      `return columns: loading a bill that carries a line discount brings the column back — ${gridOf()}`,
+    );
+    assert(!gridOf().includes("Unit"), `return columns: and Unit still stays away — ${gridOf()}`);
+
+    /* And it latches. Clearing the discount must not unmount the box being
+       cleared — the same trap the bill form had. */
+    const grid = Array.from(document.querySelectorAll("table")).find(
+      (t) => !!t.querySelector("tbody input"),
+    );
+    const discBox = Array.from(grid?.querySelectorAll("tbody input") ?? []).find(
+      (i) => (i as HTMLInputElement).value === "20",
+    ) as HTMLInputElement | undefined;
+    assert(!!discBox, "return columns: found the discount box holding 20");
+    await act(async () => {
+      setInput(discBox, "");
+    });
+    await settleMs(120);
+    assert(
+      gridOf().includes("Disc%"),
+      `return columns: clearing it keeps the column — ${gridOf()}`,
+    );
+    assert(
+      document.body.contains(discBox!),
+      "return columns: and the box being cleared is still there",
+    );
+  }
+
+  /* ── One date format across every section's table ─────────────────────
+     Cash and Payments read 22-08-26; every other list read "22 Aug 2026".
+     Two formats in one application is a small thing that makes a screen feel
+     unfinished — and the long one is what pushed the Action column off the
+     right edge on those two tables in the first place, a width problem the
+     other tables have too and simply had not hit yet.
+
+     Checked as a set rather than one screen at a time, because "they all
+     match" is the actual requirement and no single-screen assertion states
+     it. */
+  {
+    /* Purchase Returns carries no rows from any earlier block, and a screen
+       with no rows checks nothing — so it gets one. */
+    PurchaseReturnRepo.add({
+      id: "PRDATE",
+      createdAt: "2026-01-01T00:00:00Z",
+      number: "DN-DATE",
+      date: D2,
+      partyId: "P1",
+      partyName: "Acme Traders",
+      gstEnabled: false,
+      lineItems: [],
+      subtotal: 100,
+      taxAmount: 0,
+      total: 100,
+    } as never);
+
+    /* Anchored at the start rather than matching the whole cell: a cancelled
+       row carries its Voided mark in this same cell, so "22-08-26Voided" is a
+       correct date that an exact match would reject. The negative check below
+       is what stops the long form creeping back. */
+    const SHORT = /^\d{2}-\d{2}-\d{2}(?!\d)/; // 22-08-26
+    const LONG = /^\d{1,2} [A-Za-z]{3} \d{4}$/; // 22 Aug 2026
+
+    let checked = 0;
+    for (const [route, label] of [
+      ["/sales", "Sales"],
+      ["/purchase", "Purchases"],
+      ["/sale-return", "Sale Returns"],
+      ["/purchase-return", "Purchase Returns"],
+      ["/expenses", "Expenses"],
+      ["/payments", "Payments"],
+      ["/cash", "Cash"],
+    ] as const) {
+      await renderRoute(route);
+      const table = document.querySelector(".data-table table");
+      const heads = Array.from(table?.querySelectorAll("thead th") ?? []).map((th) =>
+        (th.textContent ?? "").trim(),
+      );
+      const dateCol = heads.indexOf("Date");
+      assert(dateCol >= 0, `date format: ${label} has a Date column — ${heads}`);
+
+      const cells = Array.from(table?.querySelectorAll("tbody tr") ?? [])
+        .map((tr) => (tr.querySelectorAll("td")[dateCol]?.textContent ?? "").trim())
+        .filter(Boolean);
+      /* Asserted, not skipped. A screen with no rows checks nothing, and
+         "continue" turns that into a pass — which is exactly how the purchase
+         returns screen sailed through with the long date still on it. */
+      assert(cells.length > 0, `date format: ${label} has rows to check`);
+      checked++;
+
+      assert(
+        cells.every((c) => SHORT.test(c)),
+        `date format: ${label} shows the short form — ${JSON.stringify(cells.slice(0, 3))}`,
+      );
+      assert(
+        !cells.some((c) => LONG.test(c)),
+        `date format: and nothing on ${label} still reads the long way — ${JSON.stringify(cells.slice(0, 3))}`,
+      );
+    }
+    assert(checked === 7, `date format: all seven section tables were checked — ${checked}`);
+  }
+
+  /* A statement handed to a customer keeps the long date. It is a document,
+     not a list to scan, and "22-08-26" on something a customer reads is worse
+     in a way that saving a few pixels does not pay for. */
+  {
+    await renderRoute("/parties/P1");
+    const rows = Array.from(document.querySelectorAll("tbody tr"))
+      .map((tr) => (tr.querySelector("td")?.textContent ?? "").trim())
+      .filter((t) => /\d/.test(t));
+    assert(rows.length > 0, "date format: the party statement has rows");
+    assert(
+      rows.some((c) => /^\d{1,2} [A-Za-z]{3} \d{4}$/.test(c)),
+      `date format: a party statement still reads the long way — it is a document handed to a customer, not a list to scan — ${JSON.stringify(rows.slice(0, 3))}`,
+    );
+    assert(
+      !rows.some((c) => /^\d{2}-\d{2}-\d{2}$/.test(c)),
+      `date format: and none of its rows were switched to the short form — ${JSON.stringify(rows.slice(0, 3))}`,
     );
   }
 
@@ -2873,8 +3243,10 @@ async function runAll(): Promise<Results> {
     const NOTE = "Transfer to Legacy Transfer Bank — OLD ENTRY";
     CashAdjustmentRepo.add({
       id: "OLDCA",
+      // Dated today: this block is about recognising an unstamped PAIR, not
+      // about the edit-window rule, which is asserted separately below.
       createdAt: "2026-01-01T00:00:00Z",
-      date: D2,
+      date: today(),
       type: "reduce",
       amount: 1200,
       reason: NOTE,
@@ -2883,7 +3255,8 @@ async function runAll(): Promise<Results> {
       id: "OLDBT",
       createdAt: "2026-01-01T00:00:00Z",
       bankId: "OLDB",
-      date: D2,
+      // Same date as its cash leg — a pair with mismatched dates is not one.
+      date: today(),
       type: "deposit",
       amount: 1200,
       notes: NOTE,
@@ -2977,47 +3350,31 @@ async function runAll(): Promise<Results> {
     );
 
     /* Cancelling it still clears both sides and puts the balance back — the
-       pair holds at the end of the document's life as well as during it. It
-       is dated in the past, so it voids rather than deletes. */
+       pair holds at the end of the document's life as well as during it.
+       Dated today, so removing it is an outright delete — an OLDER transfer
+       being voided instead is covered by its own block above. */
     await renderRoute("/cash");
     const del = legRow()?.querySelector(
-      '[title="Void this transfer on both accounts"]',
+      '[title="Delete this transfer on both accounts"]',
     ) as HTMLButtonElement | null;
     assert(!!del, "old transfer: the action says it will clear both accounts");
-    await act(async () => {
-      del?.click();
-    });
-    await settleMs(200);
-    const oDlg = currentDialog();
-    const oReason = Array.from(oDlg.querySelectorAll("input")).find((i) =>
-      (i.getAttribute("placeholder") ?? "").startsWith("Entered twice"),
-    ) as HTMLInputElement | undefined;
-    assert(!!oReason, "old transfer: the void dialog asks why");
-    await act(async () => {
-      setInput(oReason, "Wrong account");
-    });
-    await settleMs(60);
-    await act(async () => {
-      (
-        Array.from(oDlg.querySelectorAll("button")).find((b) =>
-          /^Void this cash entry$/.test((b.textContent ?? "").trim()),
-        ) as HTMLButtonElement | undefined
-      )?.click();
-    });
-    await settleMs(250);
+    const realConfirm = window.confirm;
+    window.confirm = () => true;
+    try {
+      await act(async () => {
+        del?.click();
+      });
+      await settleMs(250);
+    } finally {
+      window.confirm = realConfirm;
+    }
     assert(
-      CashAdjustmentRepo.all().every((a) => !(a.reason ?? "").includes("OLD ENTRY")),
-      "old transfer: the cash leg stops counting",
+      CashAdjustmentRepo.allWithVoided().every((a) => !(a.reason ?? "").includes("OLD ENTRY")),
+      "old transfer: the cash leg is gone",
     );
     assert(
-      BankTxnRepo.all().every((t) => !(t.notes ?? "").includes("OLD ENTRY")),
+      BankTxnRepo.allWithVoided().every((t) => !(t.notes ?? "").includes("OLD ENTRY")),
       "old transfer: AND the bank leg with it",
-    );
-    assert(
-      CashAdjustmentRepo.allWithVoided().some(
-        (a) => (a.reason ?? "").includes("OLD ENTRY") && !!a.voidedAt,
-      ),
-      "old transfer: and both are still on file, marked",
     );
     assert(
       BankRepo.get("OLDB")?.balance === 3800,
@@ -3030,7 +3387,9 @@ async function runAll(): Promise<Results> {
     CashAdjustmentRepo.add({
       id: "PLAINCA",
       createdAt: "2026-01-01T00:00:00Z",
-      date: D2,
+      // Today: this block is about the dialog's wording, and only today's
+      // entries can be opened for editing at all.
+      date: today(),
       type: "add",
       amount: 500,
       reason: "Till top-up",
@@ -3489,7 +3848,7 @@ async function runAll(): Promise<Results> {
       );
       assert(
         !document.body.textContent?.includes("The ledger agrees with every screen"),
-        "reconcile: and the screen does not also clIBELL everything is fine",
+        "reconcile: and the screen does not also claim everything is fine",
       );
     }
 
@@ -3545,7 +3904,7 @@ async function runAll(): Promise<Results> {
       assert(page.includes(section), `balance sheet: the ${section} section is there`);
     }
 
-    /* The clIBELL a balance sheet lives or dies by, read off the rendered
+    /* The claim a balance sheet lives or dies by, read off the rendered
        figures rather than recomputed — a total that is right in the library
        and wrong on screen is still wrong on screen. */
     const num = (s: string) => Number((s || "").replace(/[^\d.-]/g, ""));
@@ -3643,9 +4002,26 @@ async function runAll(): Promise<Results> {
     } finally {
       window.confirm = realConfirm;
     }
+    /* Reopening CANCELS the closing entry; it does not destroy it. Of every
+       document in this application, a year close is the last one to make an
+       exception of — next year opening position was built on it, and a
+       deleted close leaves no record that the year was ever closed.
+
+       Asserted against allWithVoided, because all() hides a cancelled entry
+       just as thoroughly as a delete would: the previous version of this
+       check passed whichever way it was implemented. */
     assert(
       LedgerEntryRepo.all().filter((e) => e.docKind === "year-close").length === 0,
-      "year close: reopening removes the closing entry",
+      "year close: reopening takes the closing entry out of the books",
+    );
+    const keptClose = LedgerEntryRepo.allWithVoided().find((e) => e.docKind === "year-close");
+    assert(
+      !!keptClose,
+      "year close: but the entry is still on file — reopening reverses it, it does not delete it",
+    );
+    assert(
+      !!keptClose?.voidedAt && !!keptClose?.voidReason,
+      `year close: marked with when and why — ${keptClose?.voidReason}`,
     );
     const reopened = await readMounted();
     assert(
@@ -3862,6 +4238,361 @@ async function runAll(): Promise<Results> {
       (el.getAttribute("title") ?? "").includes("Billed to the wrong customer"),
     );
     assert(!!badge, "void sale: hovering it says why, and when");
+  }
+
+  /* ── A cancelled document still protects its master records ───────────
+     Phase 4 changed what Repository.all() means, and every "is this still
+     referenced?" guard in the app was written before that. A party whose only
+     remaining bill is voided reads as unused to a guard that calls all() — so
+     it can be permanently deleted, and the ledger is left posting a reversal
+     against a party that no longer exists.
+
+     The whole point of voiding is that the history survives. A guard that
+     cannot see the history cannot protect it. */
+  {
+    PartyRepo.add({
+      id: "VOIDONLY",
+      createdAt: "2026-01-01T00:00:00Z",
+      name: "Void Only Party",
+      type: "customer",
+      openingBalance: 0,
+    } as never);
+    SalesRepo.add({
+      id: "VOSALE",
+      createdAt: "2026-01-01T00:00:00Z",
+      number: "INV-VOIDONLY",
+      date: D2,
+      partyId: "VOIDONLY",
+      partyName: "Void Only Party",
+      gstEnabled: false,
+      lineItems: [],
+      subtotal: 500,
+      discount: 0,
+      taxAmount: 0,
+      total: 500,
+      paid: 0,
+      paymentMode: "credit",
+      // Its ONLY bill, and it is cancelled.
+      voidedAt: "2026-08-01T00:00:00Z",
+      voidedBy: "someone@shop",
+      voidReason: "Entered twice",
+    } as never);
+
+    // Permanent delete is owner-only, so the test has to be the owner or
+    // the button is not on the page at all — which is how the first version
+    // of this test passed with the guard broken.
+    const wasOwner = globalThis.__TEST_IS_OWNER__;
+    globalThis.__TEST_IS_OWNER__ = true;
+    try {
+      await renderRoute("/parties");
+      const table = document.querySelector(".data-table table");
+      const row = Array.from(table?.querySelectorAll("tbody tr") ?? []).find((tr) =>
+        (tr.textContent ?? "").includes("Void Only Party"),
+      );
+      assert(!!row, "void guard: the party is listed");
+
+      const del = row?.querySelector(
+        '[title="Permanently delete (only if no history)"]',
+      ) as HTMLButtonElement | null;
+      // Asserted, not skipped: a control this test cannot find is a test that
+      // proves nothing.
+      assert(!!del, "void guard: the permanent-delete control is on the row");
+
+      const realConfirm = window.confirm;
+      window.confirm = () => true;
+      try {
+        await act(async () => {
+          del?.click();
+        });
+        await settleMs(200);
+      } finally {
+        window.confirm = realConfirm;
+      }
+
+      assert(
+        !!PartyRepo.get("VOIDONLY"),
+        "void guard: a party whose only bill is CANCELLED is still protected from deletion — the ledger posts that bill and its reversal against them",
+      );
+      // The refusal toast cannot be asserted here: sonner's Toaster lives in
+      // the root component, which this harness replaces with a bare Outlet.
+      // What matters is the outcome, and that is asserted above.
+    } finally {
+      globalThis.__TEST_IS_OWNER__ = wasOwner;
+    }
+  }
+
+  /* ── An older bill cannot be rewritten ────────────────────────────────
+     The other half of the same door. Stopping last month's bill being
+     deleted while leaving it freely editable is not a rule — change the total
+     instead and the month changes just the same, and an edit leaves even less
+     trace than a delete does, because the audit log at least keeps a snapshot
+     of what was removed.
+
+     Checked on the ROUTE, not on the button that leads to it: a typed URL or
+     an old bookmark reaches the edit form too, and a guard on the button
+     would be a lock on the front door of a building with no back wall. */
+  {
+    SalesRepo.add({
+      id: "EDITOLD",
+      createdAt: "2026-01-01T00:00:00Z",
+      number: "INV-EDITOLD",
+      date: D2,
+      partyId: "P1",
+      partyName: "Acme Traders",
+      gstEnabled: false,
+      lineItems: [],
+      subtotal: 700,
+      discount: 0,
+      taxAmount: 0,
+      total: 700,
+      paid: 0,
+      paymentMode: "credit",
+    } as never);
+
+    const page = await renderRoute("/sales/edit/EDITOLD");
+    assert(
+      page.includes("can no longer be changed"),
+      `void edit: an older bill cannot be opened for editing — ${JSON.stringify(page.slice(0, 140))}`,
+    );
+    assert(page.includes("INV-EDITOLD"), "void edit: and the notice names the bill it is refusing");
+    /* A screen that only refuses gets worked around. This one says what to do
+       instead, in the same words the toast on the list screens uses. */
+    assert(
+      page.includes("void this invoice and issue a new one"),
+      `void edit: it says what to do instead — ${JSON.stringify(page.slice(0, 400))}`,
+    );
+    // And the form itself must not be there — a disabled-looking form that is
+    // actually live is worse than no guard at all.
+    assert(
+      !document.querySelector('input[placeholder*="Search item"]') &&
+        !Array.from(document.querySelectorAll("button")).some((b) =>
+          /^(Save|Update)/.test((b.textContent ?? "").trim()),
+        ),
+      "void edit: the edit form is not rendered at all, not merely hidden",
+    );
+
+    // Today's bill still opens normally — the rule is a date, not a ban.
+    const todayPage = await renderRoute("/sales/edit/VNEW");
+    assert(
+      !todayPage.includes("can no longer be changed"),
+      "void edit: today's bill still opens for editing",
+    );
+  }
+
+  /* ── A figure you can open ────────────────────────────────────────────
+     A trial balance is a list of claims until you can ask one of them what it
+     is made of. That is the first question anyone puts to a number they
+     doubt, and the back-pointers to do it have been on every entry since the
+     ledger was built. */
+  {
+    await renderRoute("/reports?r=trial-balance");
+    const table = document.querySelector(".data-table table") ?? document.querySelector("table");
+    const arRow = Array.from(table?.querySelectorAll("tbody tr") ?? []).find((tr) =>
+      (tr.textContent ?? "").includes("Accounts Receivable"),
+    );
+    assert(!!arRow, "drill-down: Accounts Receivable is on the trial balance");
+    assert(
+      !!arRow?.getAttribute("title"),
+      "drill-down: and the row says it can be opened, rather than leaving it to be discovered",
+    );
+
+    await act(async () => {
+      (arRow as HTMLElement)?.click();
+    });
+    await settleMs(150);
+
+    const page = await readMounted();
+    assert(
+      page.includes("oldest first"),
+      `drill-down: clicking it opens what the figure is made of — ${JSON.stringify(page.slice(0, 120))}`,
+    );
+
+    /* The panel's closing balance must be the same number that was clicked.
+       A drill-down that does not add up to the figure above it is worse than
+       none: it turns one number nobody can check into two that disagree. */
+    const panel = Array.from(document.querySelectorAll("table")).find((t) =>
+      (t.querySelector("thead")?.textContent ?? "").includes("Balance"),
+    );
+    assert(!!panel, "drill-down: the entries are listed in their own table");
+    const num = (s: string) => Number((s || "").replace(/[^\d.-]/g, ""));
+    const panelFoot = Array.from(panel?.querySelectorAll("tfoot td") ?? []).map((td) =>
+      (td.textContent ?? "").trim(),
+    );
+    const rowCells = Array.from(arRow?.querySelectorAll("td") ?? []).map((td) =>
+      (td.textContent ?? "").trim(),
+    );
+    // Trial balance row: code | account | debit | credit
+    const rowNet = num(rowCells[2]) - num(rowCells[3]);
+    assert(
+      Math.abs(num(panelFoot[panelFoot.length - 1]) - rowNet) < 0.02,
+      `drill-down: and they add up to exactly the figure that was clicked — ${panelFoot[panelFoot.length - 1]} vs ${rowNet}`,
+    );
+    assert(
+      (panel?.querySelectorAll("tbody tr").length ?? 0) > 0,
+      "drill-down: with the entries themselves listed, not just a total",
+    );
+
+    // Clicking the same row again puts it away.
+    await act(async () => {
+      (arRow as HTMLElement)?.click();
+    });
+    await settleMs(120);
+    assert(
+      !(await readMounted()).includes("oldest first"),
+      "drill-down: clicking it again closes it",
+    );
+  }
+
+  /* ── Inventory is on the reconciliation, as information ───────────────
+     It was the one account the reconciliation never mentioned, so its figure
+     went unexamined. It is shown now — and marked, because the ledger's cost
+     basis and the stock report's valuation answer different questions and
+     separate whenever a purchase price moves. A screen that must only cry
+     wolf cannot go red over ordinary trading. */
+  {
+    const page = await renderRoute("/reports?r=reconcile");
+    assert(page.includes("Inventory"), "inventory row: it is on the reconciliation at all");
+    assert(
+      page.includes("for information"),
+      "inventory row: marked as information rather than as a pass or a fail",
+    );
+    const table = document.querySelector("table");
+    const invRow = Array.from(table?.querySelectorAll("tbody tr") ?? []).find((tr) =>
+      (tr.textContent ?? "").includes("Inventory"),
+    );
+    assert(
+      (invRow?.textContent ?? "").includes("purchase prices move"),
+      `inventory row: with the reason it can differ, on the row — ${JSON.stringify(invRow?.textContent?.slice(0, 120))}`,
+    );
+  }
+
+  /* ── Correcting a stock adjustment ────────────────────────────────────
+     These have never been deletable, which is the right answer and is why
+     this exists rather than a void action: the correction is a second entry,
+     so the shelf count and the reason for both stay on the record. What was
+     missing was any way to make it without working out the opposite quantity
+     by hand — arithmetic asked of somebody at the exact moment they are
+     already unsure about a stock figure. */
+  {
+    ItemRepo.add({
+      id: "RVITEM",
+      createdAt: "2026-01-01T00:00:00Z",
+      name: "Reverse Test Item",
+      unit: "PCS",
+      gstRate: 0,
+      purchasePrice: 50,
+      salePrice: 90,
+      stock: 40,
+      openingStock: 40,
+    } as never);
+    StockAdjustmentRepo.add({
+      id: "RVADJ",
+      createdAt: "2026-01-01T00:00:00Z",
+      itemId: "RVITEM",
+      itemName: "Reverse Test Item",
+      date: D2,
+      type: "reduce",
+      qty: 6,
+      reason: "Damaged in transit",
+    } as never);
+
+    // A bill for the same item, so the row that must NOT offer reversal is
+    // actually on the page. The first version of this guarded with
+    // `if (billRow)` and the item had no bills — so it asserted nothing.
+    SalesRepo.add({
+      id: "RVSALE",
+      createdAt: "2026-01-01T00:00:00Z",
+      number: "INV-RV",
+      date: D3,
+      partyId: "P1",
+      partyName: "Acme Traders",
+      gstEnabled: false,
+      lineItems: [
+        {
+          id: "l",
+          itemId: "RVITEM",
+          name: "Reverse Test Item",
+          qty: 2,
+          unit: "PCS",
+          price: 90,
+          discountPct: 0,
+          gstRate: 0,
+          amount: 180,
+        },
+      ],
+      subtotal: 180,
+      discount: 0,
+      taxAmount: 0,
+      total: 180,
+      paid: 0,
+      paymentMode: "credit",
+    } as never);
+
+    await renderRoute("/items/RVITEM");
+    const table = document.querySelector("table");
+    const adjRow = Array.from(table?.querySelectorAll("tbody tr") ?? []).find((tr) =>
+      (tr.textContent ?? "").includes("Damaged in transit"),
+    );
+    assert(!!adjRow, "reverse stock: the adjustment is on the item's history");
+
+    const btn = adjRow?.querySelector(
+      '[title*="Reverse this adjustment"]',
+    ) as HTMLButtonElement | null;
+    assert(!!btn, "reverse stock: and offers to reverse it");
+
+    /* A row that belongs to a bill must NOT offer this — that document owns
+       its own correction, and reversing the stock underneath it would leave
+       the bill saying one thing and the shelf another. */
+    const billRow = Array.from(table?.querySelectorAll("tbody tr") ?? []).find((tr) =>
+      (tr.textContent ?? "").includes("INV-RV"),
+    );
+    assert(!!billRow, "reverse stock: the bill is on the history too");
+    assert(
+      !billRow?.querySelector('[title*="Reverse this adjustment"]'),
+      "reverse stock: a row that belongs to a bill does not offer it",
+    );
+
+    const before = ItemRepo.get("RVITEM")?.stock ?? 0;
+    const countBefore = StockAdjustmentRepo.all().filter((a) => a.itemId === "RVITEM").length;
+
+    const realConfirm = window.confirm;
+    window.confirm = () => true;
+    try {
+      await act(async () => {
+        btn?.click();
+      });
+      await settleMs(250);
+    } finally {
+      window.confirm = realConfirm;
+    }
+
+    const after = StockAdjustmentRepo.all().filter((a) => a.itemId === "RVITEM");
+    assert(
+      after.length === countBefore + 1,
+      `reverse stock: a second entry is added — ${after.length - countBefore}`,
+    );
+    assert(
+      !!StockAdjustmentRepo.get("RVADJ"),
+      "reverse stock: and the original stays exactly where it was — the correction is a record, not an erasure",
+    );
+
+    const made = after.find((a) => a.id !== "RVADJ");
+    assert(
+      made?.type === "add" && made?.qty === 6,
+      `reverse stock: the opposite direction, same quantity — ${made?.type} ${made?.qty}`,
+    );
+    assert(
+      made?.date === today(),
+      `reverse stock: dated today, because that is when the correction was made — ${made?.date}`,
+    );
+    assert(
+      (made?.reason ?? "").includes("Reversal of"),
+      `reverse stock: and says what it reverses — ${made?.reason}`,
+    );
+    assert(
+      (ItemRepo.get("RVITEM")?.stock ?? 0) === before + 6,
+      `reverse stock: the shelf count moves back by exactly the quantity — ${ItemRepo.get("RVITEM")?.stock} (want ${before + 6})`,
+    );
   }
 
   /* ── A test deployment says so, on every screen ───────────────────────

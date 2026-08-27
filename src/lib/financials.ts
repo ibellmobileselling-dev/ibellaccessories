@@ -46,6 +46,16 @@ const r2 = (n: number) => Math.round(n * 100) / 100;
 /** `docKind` on a closing entry. The one value both statements branch on. */
 export const YEAR_CLOSE = "year-close";
 
+/**
+ * A closing entry, or the reversal of one.
+ *
+ * Both are outside the P&L for the same reason: a year whose statement
+ * counted the entry that emptied its own accounts would report zero, and one
+ * that counted the reversal of that entry would report double.
+ */
+export const isClosingEntry = (e: { docKind: string }) =>
+  e.docKind === YEAR_CLOSE || e.docKind === `${YEAR_CLOSE}-void`;
+
 /** India's financial year runs April to March. Configurable so the code does
  *  not lie about being universal, but nothing in this shop will change it. */
 export const FY_START_MONTH = 4;
@@ -146,7 +156,7 @@ export function profitAndLoss(
   to: string,
 ): ProfitAndLoss {
   const inRange = entries.filter(
-    (e) => e.docKind !== YEAR_CLOSE && (!from || e.date >= from) && (!to || e.date <= to),
+    (e) => !isClosingEntry(e) && (!from || e.date >= from) && (!to || e.date <= to),
   );
   const income = linesFor(inRange, accounts, "income");
   const expense = linesFor(inRange, accounts, "expense");
@@ -276,7 +286,16 @@ export function planYearClose(
   const totalExpense = sum(expense);
   const netProfit = r2(totalIncome - totalExpense);
 
-  const existing = entries.find((e) => e.docKind === YEAR_CLOSE && e.date === fy.end);
+  /* A close that has since been reversed is not a close. Both entries are
+     still in the ledger — that is what append-only means — but the year is
+     open again, and must be closable again. Recognised by its reversal rather
+     than by the original being gone, because the original never goes. */
+  const reversed = new Set(
+    entries.filter((e) => e.docKind === `${YEAR_CLOSE}-void`).map((e) => e.docId),
+  );
+  const existing = entries.find(
+    (e) => e.docKind === YEAR_CLOSE && e.date === fy.end && !reversed.has(e.docId),
+  );
 
   const lines: PostingLine[] = [];
   // Empty each account into Retained Earnings: income carries a credit

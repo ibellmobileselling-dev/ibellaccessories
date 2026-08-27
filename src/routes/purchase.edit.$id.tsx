@@ -3,6 +3,8 @@ import { useEffect, useState } from "react";
 import { PurchaseRepo } from "@/repositories";
 import { InvoiceForm } from "@/components/InvoiceForm";
 import { useRepoData } from "@/hooks/useRepoData";
+import { canEditInPlace } from "@/lib/voiding";
+import { OlderDocumentNotice } from "@/components/OlderDocumentNotice";
 import type { Invoice } from "@/types";
 import { AlertCircle } from "lucide-react";
 
@@ -31,6 +33,20 @@ function EditPurchasePage() {
           ← Back to Purchase
         </button>
       </div>
+    );
+  }
+  // A document from an earlier day is corrected by voiding and re-issuing,
+  // not by being rewritten. Checked HERE rather than only on the button that
+  // leads here, because a typed URL or an old bookmark reaches this page too.
+  if (!canEditInPlace(inv.date)) {
+    return (
+      <OlderDocumentNotice
+        what="bill"
+        name={inv.number}
+        date={inv.date}
+        backTo="/purchase"
+        backLabel="Back to Purchases"
+      />
     );
   }
   return <InvoiceForm key={inv.id} mode="purchase" existing={inv} />;

@@ -255,7 +255,7 @@ export interface Return extends Voidable {
  * document, and next year's opening position is built on it — so it is stored,
  * and it must not move once it is.
  */
-export interface JournalEntryDoc extends Audited {
+export interface JournalEntryDoc extends Audited, Voidable {
   id: ID;
   date: string;
   /** "Closing Entry" today; manual journals will use their own. */

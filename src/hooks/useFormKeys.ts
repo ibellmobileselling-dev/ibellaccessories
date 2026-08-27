@@ -91,7 +91,7 @@ export function stepBackOnBackspace(
  * with unsaved work now asks. What Escape means is the same everywhere in the
  * app — close the innermost thing that is open, and only then leave the page.
  */
-let escapeClIBELLs = 0;
+let escapeClaims = 0;
 
 /** Is a form currently answering Escape itself?
  *
@@ -99,16 +99,16 @@ let escapeClIBELLs = 0;
  * better answer (leave THIS form, asking first if there is work on it). Both
  * are window listeners, and the app-wide one is registered first, so it would
  * otherwise win the race and go back before the form ever saw the key. An
- * explicit clIBELL decides it by intent rather than by mount order. */
-export function isEscapeClIBELLed() {
-  return escapeClIBELLs > 0;
+ * explicit claim decides it by intent rather than by mount order. */
+export function isEscapeClaimed() {
+  return escapeClaims > 0;
 }
 
 export function useEscapeToLeave(leave: () => void, isDirty: () => boolean) {
   useEffect(() => {
-    escapeClIBELLs++;
+    escapeClaims++;
     return () => {
-      escapeClIBELLs--;
+      escapeClaims--;
     };
   }, []);
 
@@ -118,8 +118,8 @@ export function useEscapeToLeave(leave: () => void, isDirty: () => boolean) {
       // A dialog owns Escape while it is open — taking it here would leave
       // the page with the sheet still standing on top of the next one.
       if (document.querySelector('[role="dialog"],[role="alertdialog"]')) return;
-      // ClIBELL the key BEFORE asking. Answering "no, stay" is still this form
-      // handling Escape; leaving it unclIBELLed let the app-wide handler pick
+      // Claim the key BEFORE asking. Answering "no, stay" is still this form
+      // handling Escape; leaving it unclaimed let the app-wide handler pick
       // the same keystroke up afterwards and go back anyway — declining the
       // prompt and losing the bill regardless.
       e.preventDefault();

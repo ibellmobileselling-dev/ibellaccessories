@@ -148,6 +148,40 @@ function checkBackupKeepsVoided() {
  * screen is the failure that costs the shop a day's takings, so the wiring is
  * checked here instead.
  */
+/**
+ * "Is this master record still referenced?" must count cancelled documents.
+ *
+ * These guards decide whether a party, item or bank account may be destroyed
+ * permanently. Since voiding, all() no longer sees cancelled documents — so a
+ * guard written the obvious way silently stopped protecting the very records
+ * whose history voiding exists to keep. One rendered test covers parties;
+ * this covers the shape wherever it appears, including guards not yet
+ * written.
+ */
+function checkDeleteGuardsSeeVoided() {
+  const files = ["src/routes/parties.tsx", "src/routes/items.tsx", "src/routes/bank.tsx"];
+  // A reference check against a transaction collection, using the live-only
+  // read. StockAdjustment is excluded: it is not voidable.
+  const LIVE_ONLY_REFERENCE =
+    /(Sales|Purchase|SaleReturn|PurchaseReturn|Payment|Expense|BankTxn|CashAdjustment)Repo\.all\(\)\s*\.\s*(some|filter)\s*\(/;
+  const offenders = [];
+  for (const rel of files) {
+    const p = path.resolve(__dirname, "..", rel);
+    if (!fs.existsSync(p)) continue;
+    if (LIVE_ONLY_REFERENCE.test(fs.readFileSync(p, "utf8"))) offenders.push(rel);
+  }
+  if (offenders.length) {
+    console.log("\n  DELETE GUARDS: these check for references with all(), which no longer");
+    console.log("  sees cancelled documents — so a record referenced only by a voided");
+    console.log("  bill reads as unused and can be destroyed:");
+    offenders.forEach((f) => console.log("    x " + f));
+    console.log("");
+    return false;
+  }
+  console.log("  Delete guards count cancelled documents as references.");
+  return true;
+}
+
 function checkTestBannerMounted() {
   const src = fs.readFileSync(path.resolve(__dirname, "../src/routes/__root.tsx"), "utf8");
   const mounted = /<TestDataBanner\s*\/>/.test(src);
@@ -208,6 +242,7 @@ async function main() {
   const lockOk = checkPeriodLockCoverage();
   const voidOk = checkVoidCoverage();
   const bannerOk = checkTestBannerMounted();
+  const guardsOk = checkDeleteGuardsSeeVoided();
   const backupOk = checkBackupKeepsVoided();
   fs.mkdirSync(OUT_DIR, { recursive: true });
 
@@ -355,7 +390,9 @@ run().then((r) => { (window as any).__RESULT__ = r; })
   }
   console.log("══════════════════════════════════════\n");
   process.exit(
-    result.failed || pageErrors.length || !lockOk || !voidOk || !backupOk || !bannerOk ? 1 : 0,
+    result.failed || pageErrors.length || !lockOk || !voidOk || !backupOk || !bannerOk || !guardsOk
+      ? 1
+      : 0,
   );
 }
 

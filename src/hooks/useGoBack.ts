@@ -1,6 +1,6 @@
 import { useCallback, useEffect } from "react";
 import { useNavigate, useRouter } from "@tanstack/react-router";
-import { isEscapeClIBELLed } from "@/hooks/useFormKeys";
+import { isEscapeClaimed } from "@/hooks/useFormKeys";
 import { useWorkspace } from "@/store/workspace";
 
 /**
@@ -104,7 +104,7 @@ export function useBackShortcuts(enabled: boolean, back: () => void) {
  *   1. A dropdown that is open — it calls preventDefault, and this checks.
  *   2. An open dialog — Radix closes it; taking the key here would leave the
  *      page with the sheet still standing on top of the next one.
- *   3. A form that clIBELLs Escape (see useEscapeToLeave) — "leave THIS form,
+ *   3. A form that claims Escape (see useEscapeToLeave) — "leave THIS form,
  *      asking first if there is work on it" beats "go back a page".
  *   4. The open tab — the app keeps its own Chrome-style tab strip, and
  *      "close this screen" means that tab, exactly as its × does. You land
@@ -125,7 +125,7 @@ export function useAppEscape() {
       if (e.key !== "Escape" || e.defaultPrevented) return;
       if (isTyping(e.target)) return;
       if (document.querySelector('[role="dialog"],[role="alertdialog"]')) return;
-      if (isEscapeClIBELLed()) return;
+      if (isEscapeClaimed()) return;
 
       // The tab strip is the app's own idea of "what is open", so closing the
       // current tab is what closing the current screen means here.

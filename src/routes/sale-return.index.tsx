@@ -4,7 +4,7 @@ import { SaleReturnRepo, ItemRepo } from "@/repositories";
 import { useRepoData } from "@/hooks/useRepoData";
 import { newBatch, commitBatch } from "@/repositories/base";
 import type { Return } from "@/types";
-import { fmtMoney, fmtDate } from "@/lib/format";
+import { fmtDate, fmtDateShort, fmtMoney } from "@/lib/format";
 import { Plus, CornerDownLeft, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { DataTable } from "@/components/DataTable";
@@ -210,7 +210,7 @@ function SaleReturnPage() {
             {
               key: "date",
               label: "Date",
-              render: (r) => fmtDate(r.date),
+              render: (r) => <span className="whitespace-nowrap">{fmtDateShort(r.date)}</span>,
               sortValue: (r) => r.date,
             },
             {

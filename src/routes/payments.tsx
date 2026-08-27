@@ -31,7 +31,13 @@ import {
 } from "lucide-react";
 import { usePermissions } from "@/hooks/usePermissions";
 import { VoidDialog, VoidedBadge } from "@/components/VoidDialog";
-import { canDeleteOutright, isVoided, removalWord } from "@/lib/voiding";
+import {
+  canDeleteOutright,
+  canEditInPlace,
+  editRefusalMessage,
+  isVoided,
+  removalWord,
+} from "@/lib/voiding";
 import { Ban } from "lucide-react";
 import { toast } from "sonner";
 import { genId } from "@/repositories/base";
@@ -133,6 +139,12 @@ function PaymentsPage() {
     setOpen(true);
   };
   const openEdit = (r: Payment) => {
+    // One door for the pencil AND for clicking the row. Guarding the button
+    // alone would leave the row itself wide open.
+    if (!canEditInPlace(r.date)) {
+      toast.error(editRefusalMessage("payment"), { duration: 7000 });
+      return;
+    }
     setFormType(r.type);
     setEditing(r);
     setOpen(true);
@@ -299,7 +311,7 @@ function PaymentsPage() {
                 openEdit(r);
               }}
               className="h-7 w-7 inline-flex items-center justify-center rounded-md border border-transparent text-gray-400 transition hover:bg-primary-soft hover:text-primary hover:border-primary/25"
-              title="Edit payment"
+              title={canEditInPlace(r.date) ? "Edit payment" : editRefusalMessage("payment")}
             >
               <Pencil className="h-3.5 w-3.5" />
             </button>
@@ -519,7 +531,9 @@ function PaymentsPage() {
                             openEdit(r);
                           }}
                           className="p-1.5 rounded hover:bg-blue-50 text-gray-300 hover:text-blue-600 transition"
-                          title="Edit payment"
+                          title={
+                            canEditInPlace(r.date) ? "Edit payment" : editRefusalMessage("payment")
+                          }
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>

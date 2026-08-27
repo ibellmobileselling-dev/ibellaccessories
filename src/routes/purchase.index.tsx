@@ -12,7 +12,7 @@ import {
 import { useRepoData } from "@/hooks/useRepoData";
 import { newBatch, commitBatch } from "@/repositories/base";
 import type { Invoice } from "@/types";
-import { fmtMoney, fmtDate, ymd, today } from "@/lib/format";
+import { fmtDate, fmtDateShort, fmtMoney, today, ymd } from "@/lib/format";
 import {
   Plus,
   Search,
@@ -628,7 +628,7 @@ function PurchasePage() {
             {
               key: "date",
               label: "Date",
-              render: (r) => fmtDate(r.date),
+              render: (r) => <span className="whitespace-nowrap">{fmtDateShort(r.date)}</span>,
               sortValue: (r) => r.date,
             },
             {

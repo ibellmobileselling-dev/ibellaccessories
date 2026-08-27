@@ -325,12 +325,19 @@ function PartiesPage() {
    * bills were removed. Naming the exact records, with counts, turns a dead
    * end into an instruction. */
   const deleteBlockers = (r: Party): string[] => {
+    // allWithVoided throughout: a cancelled bill is still this party's
+    // history, and the ledger still carries both it and its reversal against
+    // them. A guard that cannot see cancelled documents would let the party
+    // be deleted out from under their own ledger.
     const counts: [string, number][] = [
-      ["sale", SalesRepo.all().filter((i) => i.partyId === r.id).length],
-      ["purchase", PurchaseRepo.all().filter((i) => i.partyId === r.id).length],
-      ["sale return", SaleReturnRepo.all().filter((i) => i.partyId === r.id).length],
-      ["purchase return", PurchaseReturnRepo.all().filter((i) => i.partyId === r.id).length],
-      ["payment", PaymentRepo.all().filter((i) => i.partyId === r.id).length],
+      ["sale", SalesRepo.allWithVoided().filter((i) => i.partyId === r.id).length],
+      ["purchase", PurchaseRepo.allWithVoided().filter((i) => i.partyId === r.id).length],
+      ["sale return", SaleReturnRepo.allWithVoided().filter((i) => i.partyId === r.id).length],
+      [
+        "purchase return",
+        PurchaseReturnRepo.allWithVoided().filter((i) => i.partyId === r.id).length,
+      ],
+      ["payment", PaymentRepo.allWithVoided().filter((i) => i.partyId === r.id).length],
     ];
     const blockers = counts
       .filter(([, n]) => n > 0)

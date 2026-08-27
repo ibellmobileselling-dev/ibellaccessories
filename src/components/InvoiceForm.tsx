@@ -105,23 +105,40 @@ export function InvoiceForm({ mode, existing }: Props) {
 
   const gstOn = inv.gstEnabled !== false;
 
-  // Per-line Unit and Disc% are off on SALE bills: the counter gives one
-  // whole-bill "Extra Discount" in the totals card instead, and Unit belongs
-  // to the item rather than being re-typed per bill. Two fewer columns also
-  // makes the grid fit a phone without sideways scrolling.
+  // Per-line Unit and Disc% are off on BOTH sale and purchase bills: the
+  // counter gives one whole-bill "Extra Discount" in the totals card instead,
+  // and Unit belongs to the item rather than being re-typed per bill. Two
+  // fewer columns also makes the grid fit a phone without sideways scrolling.
+  //
+  // Sales dropped them first and purchases kept them, only because that was
+  // all that had been asked for. Two forms that look different for no reason
+  // the person using them can see is its own small cost, and the reason for
+  // hiding them was never a sales-only reason.
   //
   // The DATA is untouched — `discountPct` still exists, is still 0 on new
-  // lines, and every existing bill keeps calculating exactly as before, so
-  // no historical total or GST figure moves. Purchase bills keep both
-  // columns (the client only asked about sales).
+  // lines, and every existing bill keeps calculating exactly as before, so no
+  // historical total or GST figure moves. A new line takes its unit from the
+  // item it was picked from, which is where that value came from anyway.
   //
   // The one exception: if a bill being edited already carries a line
   // discount, the column stays visible. Hiding a live, non-zero discount
   // would leave an amount affecting the total that nobody could see or
   // correct.
-  const hasLineDiscount = inv.lineItems.some((l) => (l.discountPct ?? 0) > 0);
-  const showUnitCol = !isSale;
-  const showDiscCol = !isSale || hasLineDiscount;
+  // Whether the bill ARRIVED carrying a line discount — decided once, when
+  // the form opens, and then held.
+  //
+  // Recomputing it from the live lines looks equivalent and is not. NumInput
+  // reports 0 for an empty box, so backspacing the last discount away to
+  // retype it flips this to false mid-keystroke: the column unmounts and
+  // takes the focused input with it, and the value that is actually being
+  // corrected is the one that makes correcting it impossible. Holding the
+  // answer keeps the column for as long as the bill is open, which is the
+  // only span that matters.
+  const [hadLineDiscount] = useState(() =>
+    (existing?.lineItems ?? []).some((l) => (l.discountPct ?? 0) > 0),
+  );
+  const showUnitCol: boolean = false;
+  const showDiscCol = hadLineDiscount;
 
   const allParties = useRepoMemo(() => PartyRepo.all());
   const parties = useMemo(() => allParties.filter(partyFilter), [allParties]);
