@@ -20,7 +20,7 @@
 const DATABASE_ID =
   (typeof import.meta !== "undefined" && import.meta.env?.VITE_FIRESTORE_DB) ||
   process.env.VITE_FIRESTORE_DB ||
-  "kinteshmobileacce";
+  "ibellaccessory";
 
 let appPromise: Promise<import("firebase-admin").app.App> | null = null;
 

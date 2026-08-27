@@ -9,7 +9,7 @@
  * never dereferenced on that path, so dummies are enough.
  */
 export const DATABASE_ID = "test-only-never-a-real-database";
-export const PRODUCTION_DATABASE_ID = "kinteshmobileacce";
+export const PRODUCTION_DATABASE_ID = "ibellaccessory";
 /** The harness is, by definition, never the shop's real books — which is what
  *  lets the screen tests assert the warning strip renders. */
 export const isProductionData = false;

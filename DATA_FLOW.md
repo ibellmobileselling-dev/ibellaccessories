@@ -29,7 +29,7 @@ Keyboard jumps: `Alt+1…8` → Dashboard, Parties, Items, Sales, Purchase, Expe
 Firebase Auth  ──(sign in)──►  AuthGate (__root.tsx)
                                    │  hydrateRepos(uid)  — only the modules this user can view
                                    ▼
-Firestore (cloud, named DB "kinteshmobileacce")
+Firestore (cloud, named DB "ibellaccessory")
    │  onSnapshot (live listener, per collection)
    ▼
 Repository in-memory cache  ◄────────────────────────────┐

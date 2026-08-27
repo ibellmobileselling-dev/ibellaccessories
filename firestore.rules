@@ -1,11 +1,11 @@
 rules_version = '2';
 
 // Deploy this to the NAMED database this app actually uses
-// ("kinteshmobileacce", see DATABASE_ID in src/lib/firebase.ts) — not
+// ("ibellaccessory", see DATABASE_ID in src/lib/firebase.ts) — not
 // necessarily the "(default)" database, if your project has more than one.
 // Via Firebase Console: Firestore Database → select that database → Rules
 // tab → paste this in → Publish. Via CLI: `firebase deploy --only
-// firestore:rules --database=kinteshmobileacce` (adjust flag to match your
+// firestore:rules --database=ibellaccessory` (adjust flag to match your
 // Firebase CLI/firebase.json setup).
 //
 // STRONGLY RECOMMENDED before publishing to production: test against the

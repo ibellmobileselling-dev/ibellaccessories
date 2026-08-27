@@ -24,7 +24,7 @@ const firebaseConfig = {
  * is wrong for a test site but is at least obvious the moment anyone looks at
  * the data.
  */
-export const PRODUCTION_DATABASE_ID = "kinteshmobileacce";
+export const PRODUCTION_DATABASE_ID = "ibellaccessory";
 
 /**
  * Named Firestore database (not the "(default)" one).
