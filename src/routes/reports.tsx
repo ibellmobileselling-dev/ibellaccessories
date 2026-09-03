@@ -1,4 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { stockOf } from "@/lib/serials";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   SalesRepo,
@@ -10,7 +11,9 @@ import {
   PurchaseReturnRepo,
   PaymentRepo,
   CompanyRepo,
+  SerialRepo,
 } from "@/repositories";
+import { matchesQuery } from "@/lib/search";
 import { fmtMoney, fmtDate, today, ymd } from "@/lib/format";
 import { printOrEscapeStandalone } from "@/lib/print";
 import { useAutoPrintFromUrl } from "@/hooks/useAutoPrintFromUrl";
@@ -417,6 +420,7 @@ function ReportView({
   );
   const parties = useRepoMemo(() => PartyRepo.all());
   const items = useRepoMemo(() => ItemRepo.all());
+  const serials = useRepoMemo(() => SerialRepo.all());
   const [partySearch, setPartySearch] = useState("");
 
   // Every party's full statement, built ONCE per (report, date-range) — not on
@@ -452,7 +456,7 @@ function ReportView({
     const netRevenue = r2(revenue - saleReturnTotal);
     // Stock-based COGS: cost of items actually sold (net of returned goods),
     // not total purchases — unsold stock does not reduce profit.
-    const cogs = computeCogs(sales, saleReturns, items);
+    const cogs = computeCogs(sales, saleReturns, items, serials);
     const netPurchases = r2(valueExTax(purchases) - valueExTax(purchaseReturns));
     const grossProfit = r2(netRevenue - cogs);
     const exp = expenses.reduce((a, s) => a + s.amount, 0);
@@ -937,10 +941,11 @@ function ReportView({
   }
 
   if (which === "stock") {
-    const totalValue = items.reduce((a, i) => a + i.stock * i.purchasePrice, 0);
-    const lowStock = items.filter(
-      (i) => (i.minStock != null && i.stock <= i.minStock) || i.stock < 0,
-    ).length;
+    const totalValue = items.reduce((a, i) => a + stockOf(i) * i.purchasePrice, 0);
+    const lowStock = items.filter((i) => {
+      const s = stockOf(i);
+      return (i.minStock != null && s <= i.minStock) || s < 0;
+    }).length;
     return (
       <TableReport
         label={label}
@@ -965,12 +970,12 @@ function ReportView({
             i.name,
             i.sku || "—",
             i.category || "—",
-            String(i.stock),
+            String(stockOf(i)),
             i.unit,
             i.minStock ? String(i.minStock) : "—",
             fmtMoney(i.purchasePrice),
             fmtMoney(i.salePrice),
-            fmtMoney(i.stock * i.purchasePrice),
+            fmtMoney(stockOf(i) * i.purchasePrice),
           ])}
       />
     );
@@ -1137,6 +1142,14 @@ function TableReport({
 }) {
   const [sortCol, setSortCol] = useState<number | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  const [q, setQ] = useState("");
+
+  /* Rows are already strings by the time they reach here, so searching them
+     covers every column the report shows — including Category on the Stock
+     report, which is what this was asked for. A per-report field list would
+     have to be kept in step with nine sets of columns and would fall behind
+     the first time one changed. */
+  const matching = q.trim() ? rows.filter((r) => matchesQuery(q, ...r)) : rows;
 
   const toggleSort = (i: number) => {
     if (sortCol === i) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
@@ -1148,8 +1161,8 @@ function TableReport({
 
   const sortedRows =
     sortCol == null
-      ? rows
-      : [...rows].sort((a, b) => {
+      ? matching
+      : [...matching].sort((a, b) => {
           const cmp = smartCompare(a[sortCol] ?? "", b[sortCol] ?? "");
           return sortDir === "asc" ? cmp : -cmp;
         });
@@ -1171,13 +1184,33 @@ function TableReport({
       {label && (
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-base font-bold text-gray-800">{label}</h2>
-          <button
-            onClick={() => downloadCsv(label, cols, sortedRows)}
-            className="no-print inline-flex items-center gap-1.5 h-8 px-3 bg-white border border-gray-200 rounded-lg text-xs font-semibold text-gray-600 hover:bg-gray-50 hover:shadow-sm transition"
-          >
-            <Download className="h-3.5 w-3.5" /> Export CSV
-          </button>
+          <div className="flex items-center gap-2">
+            <div className="no-print relative">
+              <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-gray-400" />
+              <input
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                placeholder="Search this report…"
+                aria-label={`Search ${label}`}
+                className="h-8 w-44 sm:w-56 pl-8 pr-2 border border-gray-200 rounded-lg text-xs bg-white outline-none focus:border-primary"
+              />
+            </div>
+            {/* Export what is on screen, so a filtered report and its CSV
+                cannot disagree about what they contain. */}
+            <button
+              onClick={() => downloadCsv(label, cols, sortedRows)}
+              className="no-print inline-flex items-center gap-1.5 h-8 px-3 bg-white border border-gray-200 rounded-lg text-xs font-semibold text-gray-600 hover:bg-gray-50 hover:shadow-sm transition"
+            >
+              <Download className="h-3.5 w-3.5" /> Export CSV
+            </button>
+          </div>
         </div>
+      )}
+      {q.trim() && (
+        <p className="no-print text-[11px] text-gray-500 mb-2">
+          Showing {sortedRows.length} of {rows.length} rows. The totals below are for the whole
+          report, not this search.
+        </p>
       )}
       <div className="bg-white border border-gray-200/80 rounded-xl shadow-card overflow-hidden">
         {/* The mobile/desktop split below is screen-only — print must

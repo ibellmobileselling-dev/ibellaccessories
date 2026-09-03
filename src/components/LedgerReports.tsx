@@ -27,6 +27,7 @@ import {
   SaleReturnRepo,
   SalesRepo,
   StockAdjustmentRepo,
+  SerialRepo,
   LedgerEntryRepo,
 } from "@/repositories";
 import { useRepoMemo } from "@/hooks/useRepoData";
@@ -76,6 +77,7 @@ function useBook(): Book {
     cashAdjustments: CashAdjustmentRepo.allWithVoided(),
     bankTxns: BankTxnRepo.allWithVoided(),
     stockAdjustments: StockAdjustmentRepo.all(),
+    serials: SerialRepo.all(),
     journalEntries: LedgerEntryRepo.allWithVoided(),
   }));
 }

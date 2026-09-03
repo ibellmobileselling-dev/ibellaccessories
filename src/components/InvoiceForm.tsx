@@ -1,9 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { stockOf, isSerialised, warrantyEnd, serialShortfalls, serialIdsOn } from "@/lib/serials";
+import { SerialEntry } from "@/components/SerialEntry";
+import { planPurchaseSerials, planSaleSerials, soldSerialsOf } from "@/lib/serialMoves";
+import { SerialRepo } from "@/repositories";
 import { createPortal } from "react-dom";
 import { useNavigate } from "@tanstack/react-router";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Field } from "@/components/Field";
+import { ComboInput } from "@/components/ComboInput";
 import {
   PartyRepo,
   ItemRepo,
@@ -30,6 +35,7 @@ import { fmtMoney, fmtDate, today } from "@/lib/format";
 import { toast } from "sonner";
 import {
   Trash2,
+  Plus,
   UserPlus,
   Save,
   X,
@@ -46,7 +52,7 @@ import { NumInput, NumField } from "@/components/NumInput";
 import { ModePills } from "@/components/ModePills";
 import { QuickAddPartyDialog, type QuickAddPartyDetails } from "@/components/QuickAddPartyDialog";
 import { genId, newBatch, commitBatch } from "@/repositories/base";
-import { stepBackOnBackspace, useEscapeToLeave } from "@/hooks/useFormKeys";
+import { enterMovesAlongRow, useEscapeToLeave } from "@/hooks/useFormKeys";
 import { usePeriodLock } from "@/hooks/usePeriodLock";
 import { stockShortfalls } from "@/lib/stock";
 import { useRepoData, useRepoMemo } from "@/hooks/useRepoData";
@@ -168,9 +174,6 @@ export function InvoiceForm({ mode, existing }: Props) {
   // "qty-<lineId>") so the amount can be typed immediately — not to the next
   // blank search row. Pressing Enter in Qty is what advances to the next row.
   const focusQtyId = useRef<string | null>(null);
-  /** Line whose item picker the Qty box asked to reopen (Backspace on an
-   *  empty Qty = "wrong item, let me choose again"). */
-  const [reopenPickerFor, setReopenPickerFor] = useState<string | null>(null);
   const { canPost } = usePeriodLock();
   useEffect(() => {
     if (focusQtyId.current) {
@@ -193,7 +196,15 @@ export function InvoiceForm({ mode, existing }: Props) {
     paid: number;
     andPrint: boolean;
   } | null>(null);
-  const [quickAddItem, setQuickAddItem] = useState<{ name: string; rowId: string } | null>(null);
+  /** rowId = a blank entry row waiting to become a line. replaceLineId = an
+   *  existing line whose item is being swapped. Exactly one is set: creating
+   *  an item from the change-item picker must REPLACE what is on that line,
+   *  not append a second one and leave the wrong item behind. */
+  const [quickAddItem, setQuickAddItem] = useState<{
+    name: string;
+    rowId: string | null;
+    replaceLineId?: string;
+  } | null>(null);
   const partyRef = useRef<HTMLInputElement>(null);
   const phoneRef = useRef<HTMLInputElement>(null);
   const [partyQ, setPartyQ] = useState(existing?.partyName ?? "");
@@ -246,6 +257,21 @@ export function InvoiceForm({ mode, existing }: Props) {
       (b) => b.name.toLowerCase().includes(q) || (b.accountNumber ?? "").toLowerCase().includes(q),
     );
   }, [banks, bankQ]);
+  /* Keep the arrow-key highlight visible. Guarded on the index ACTUALLY
+     moving, for the reason spelled out on the item picker's copy of this: an
+     unguarded version runs on every render and snaps a hand-scrolled list
+     back to the top, which feels exactly like a list that cannot be
+     scrolled. */
+  const bankOptionsRef = useRef<HTMLDivElement>(null);
+  const prevBankIdx = useRef(bankIdx);
+  useEffect(() => {
+    if (prevBankIdx.current === bankIdx) return;
+    prevBankIdx.current = bankIdx;
+    bankOptionsRef.current
+      ?.querySelector(`[data-bank-opt="${bankIdx}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [bankIdx]);
+
   const selectBank = (b: BankAccount) => {
     setInv({ ...inv, bankId: b.id });
     setBankQ(b.name);
@@ -380,13 +406,19 @@ export function InvoiceForm({ mode, existing }: Props) {
   // Returns the id of the line that was added/updated, so the caller can move
   // focus straight to that row's Qty field for fast entry.
   const addLineItem = (it: Item): string => {
-    // Repeat items cannot be added twice — increase quantity of the existing line instead
-    const existingLine = inv.lineItems.find((l) => l.itemId === it.id);
-    if (existingLine) {
-      updateLine(existingLine.id, { qty: existingLine.qty + 1 });
-      toast.info(`${it.name} — quantity increased to ${existingLine.qty + 1}`);
-      return existingLine.id;
-    }
+    /* The same item added again gets its OWN line, and does not fold into the
+       one above it.
+
+       This shop sells phones. Two of the same model routinely go out at
+       different prices on one bill — a trade-in, a haggle, a damaged box —
+       and folding them into a single line of quantity 2 makes that
+       impossible to write down. It also lost the itemisation the customer is
+       reading: they want to see what they are paying for each handset, not a
+       multiplied total.
+
+       Merging was the old behaviour and it was deliberate; the shop asked for
+       it to go. Nothing is lost by it — a genuine repeat is still one keystroke
+       away from becoming quantity 2 by hand. */
     // This party's own last price wins; otherwise what the item last
     // actually went out at; only then the catalogue figure.
     const historicalPrice = lastPartyPrice(it.id) ?? lastAnyPrice(it.id);
@@ -415,19 +447,28 @@ export function InvoiceForm({ mode, existing }: Props) {
   const confirmQuickAddItem = (details: {
     name: string;
     unit: string;
+    category: string;
     gstRate: number;
     salePrice: number;
     purchasePrice: number;
   }) => {
     if (!quickAddItem) return;
-    const rowId = quickAddItem.rowId;
+    const { rowId, replaceLineId } = quickAddItem;
     setQuickAddItem(null);
+    /** Put the item where the person was standing when they asked for it. */
+    const place = (it: Item) => {
+      if (replaceLineId) {
+        changeLineItem(replaceLineId, it);
+        return;
+      }
+      focusQtyId.current = addLineItem(it);
+      if (rowId) completePendingRow(rowId);
+    };
     const existingMatch = items.find(
       (i) => i.name.trim().toLowerCase() === details.name.trim().toLowerCase(),
     );
     if (existingMatch) {
-      focusQtyId.current = addLineItem(existingMatch);
-      completePendingRow(rowId);
+      place(existingMatch);
       return;
     }
     const newItem = ItemRepo.add({
@@ -436,11 +477,14 @@ export function InvoiceForm({ mode, existing }: Props) {
       gstRate: Math.max(0, details.gstRate),
       purchasePrice: Math.max(0, details.purchasePrice),
       salePrice: Math.max(0, details.salePrice),
+      /* Left off entirely when blank rather than stored as "": an item with
+         no category and an item categorised as nothing are the same thing to
+         the shop, and only one of them shows up in a category filter. */
+      ...(details.category.trim() ? { category: details.category.trim() } : {}),
       stock: 0,
       openingStock: 0,
     }) as Item;
-    focusQtyId.current = addLineItem(newItem);
-    completePendingRow(rowId);
+    place(newItem);
     toast.success(`New item added: ${newItem.name}`);
   };
 
@@ -492,6 +536,15 @@ export function InvoiceForm({ mode, existing }: Props) {
     setInv({ ...merged, lineItems: lines, ...recalc(lines) });
   };
 
+  /* What the footing under the grid adds up.
+     Total Price is the sum of the per-unit prices, NOT the value of the bill —
+     it is there to be read across against the quantity beside it, which is
+     how somebody spots a price typed into the wrong row. The value of the
+     bill is Total Amount, and the summary panel below it. */
+  const totalQty = r2(inv.lineItems.reduce((s, l) => s + (l.qty || 0), 0));
+  const totalPrice = r2(inv.lineItems.reduce((s, l) => s + (l.price || 0), 0));
+  const totalLineAmount = r2(inv.lineItems.reduce((s, l) => s + (l.amount || 0), 0));
+
   const removeLine = (id: string) => {
     const lines = inv.lineItems.filter((l) => l.id !== id);
     setInv({ ...inv, lineItems: lines, ...recalc(lines) });
@@ -504,26 +557,11 @@ export function InvoiceForm({ mode, existing }: Props) {
   // id of the row that ends up holding the item, so the caller can move
   // focus straight to its Qty field.
   const changeLineItem = (lineId: string, it: Item): string => {
-    const dup = inv.lineItems.find((l) => l.itemId === it.id && l.id !== lineId);
-    if (dup) {
-      const removed = inv.lineItems.find((l) => l.id === lineId);
-      const mergedQty = dup.qty + (removed?.qty ?? 0);
-      const gstMult = gstOn ? 1 + dup.gstRate / 100 : 1;
-      const lines = inv.lineItems
-        .filter((l) => l.id !== lineId)
-        .map((l) =>
-          l.id === dup.id
-            ? {
-                ...l,
-                qty: mergedQty,
-                amount: r2(r2(mergedQty * l.price * (1 - l.discountPct / 100)) * gstMult),
-              }
-            : l,
-        );
-      setInv({ ...inv, lineItems: lines, ...recalc(lines) });
-      toast.info(`${it.name} — merged into existing line, quantity increased to ${mergedQty}`);
-      return dup.id;
-    }
+    /* No merging here either, for the same reason as addLineItem — and for
+       consistency: two lines of one item must mean the same thing however
+       the bill arrived at them. Reaching that state by changing a line used
+       to silently delete the line being edited, which is a surprising way to
+       lose a row. */
     // This party's own last price wins; otherwise what the item last
     // actually went out at; only then the catalogue figure.
     const historicalPrice = lastPartyPrice(it.id) ?? lastAnyPrice(it.id);
@@ -538,6 +576,12 @@ export function InvoiceForm({ mode, existing }: Props) {
       // exchange-rate change re-prices every line that still has one, which
       // would overwrite the new item's price with the OLD item's landed cost.
       foreignPrice: undefined,
+      /* Nor its units. Serial numbers belong to the item they were stamped
+         on, so units picked for the OLD item cannot follow it to a new one:
+         saving would mark units of one item as sold on a line for another,
+         and the shelf count for both would be wrong from that moment. The
+         line asks for its units again, which is the only honest answer. */
+      serialIds: undefined,
     });
     return lineId;
   };
@@ -638,6 +682,11 @@ export function InvoiceForm({ mode, existing }: Props) {
 
     const finalInv: Invoice = {
       ...inv,
+      /* Minted here, not left to addBatched. The serial plan below stamps
+         every unit with THIS id, and addBatched only generates one when the
+         record arrives without it — which is after the stamping. An empty id
+         here silently unlinked every unit from the bill that sold it. */
+      id: inv.id || genId(),
       number: inv.number.trim(),
       paid,
       partyId,
@@ -712,8 +761,74 @@ export function InvoiceForm({ mode, existing }: Props) {
       const origDelta = isSale ? 1 : -1;
       for (const l of existing.lineItems) {
         const it = ItemRepo.get(l.itemId);
-        if (it) ItemRepo.adjustFieldBatched(batch, it.id, "stock", origDelta * l.qty);
+        // Serialised items are reversed by moving their serials, not by
+        // nudging a number nothing reads.
+        if (it && !isSerialised(it))
+          ItemRepo.adjustFieldBatched(batch, it.id, "stock", origDelta * l.qty);
       }
+    }
+
+    /* The units. Planned first and applied here, on the same batch as the
+       document itself: a bill that saved while its serials did not would
+       leave the shelf disagreeing with the paperwork, which is the one
+       outcome this whole feature exists to prevent. */
+    const serialPlan = isSale
+      ? planSaleSerials(finalInv, existing, (id) => ItemRepo.get(id))
+      : planPurchaseSerials(finalInv, existing, (id) => ItemRepo.get(id));
+
+    if (!isSale && existing) {
+      /* A unit already in a customer's hands cannot be un-received. The
+         shop's record of where it came from is the only thing that lets them
+         claim it back from the vendor. */
+      const stillOut = soldSerialsOf(
+        existing,
+        SerialRepo.all(),
+        new Set(serialPlan.release.map((r) => r.id)),
+      );
+      if (stillOut.length) {
+        toast.error(`Cannot remove ${stillOut.map((s) => s.serial).join(", ")} — already sold`, {
+          duration: 7000,
+        });
+        return;
+      }
+    }
+
+    /* Drafts become records, and the line is rewritten to point at them.
+       Ids, not serial strings, so correcting a mis-scan later moves the line
+       with it. */
+    const draftToReal = new Map<string, string>();
+    for (const c of serialPlan.create) {
+      const made = SerialRepo.addBatched(batch, {
+        itemId: c.itemId,
+        serial: c.serial,
+        status: "in_stock",
+      } as never);
+      draftToReal.set(c.draftId, made.id);
+    }
+    if (draftToReal.size) {
+      finalInv.lineItems = finalInv.lineItems.map((l) =>
+        l.serialIds?.length
+          ? { ...l, serialIds: l.serialIds.map((id) => draftToReal.get(id) ?? id) }
+          : l,
+      );
+      // Re-stamp the freshly created ones now that they have real ids.
+      for (const c of serialPlan.create) {
+        const realId = draftToReal.get(c.draftId);
+        const item = ItemRepo.get(c.itemId);
+        const line = finalInv.lineItems.find((l) => l.itemId === c.itemId);
+        if (!realId || !item || !line) continue;
+        SerialRepo.updateBatched(batch, realId, {
+          purchaseId: finalInv.id,
+          purchaseDate: finalInv.date,
+          vendorId: finalInv.partyId,
+          vendorName: finalInv.partyName,
+          cost: Math.round((line.price || 0) * 100) / 100,
+          vendorWarrantyEnd: warrantyEnd(finalInv.date, item.vendorWarrantyMonths),
+        } as never);
+      }
+    }
+    for (const u of [...serialPlan.update, ...serialPlan.release]) {
+      SerialRepo.updateBatched(batch, u.id, u.patch as never);
     }
 
     const stockDelta = isSale ? -1 : 1;
@@ -730,14 +845,21 @@ export function InvoiceForm({ mode, existing }: Props) {
         // Purchase price: always the LATEST cost, so profit stays accurate.
         if (!isSale && it.purchasePrice !== l.price) extra.purchasePrice = l.price;
       }
-      ItemRepo.adjustFieldBatched(batch, it.id, "stock", stockDelta * l.qty, extra);
+      if (isSerialised(it)) {
+        // Its stock is the serial count — the stored number is not read for
+        // this item, and writing it would leave a second figure that nothing
+        // maintains and somebody eventually believes.
+        if (Object.keys(extra).length) ItemRepo.updateBatched(batch, it.id, extra);
+      } else {
+        ItemRepo.adjustFieldBatched(batch, it.id, "stock", stockDelta * l.qty, extra);
+      }
     }
 
     // Warn (non-blocking) when a sale pushes stock below zero — shop can still bill
     if (isSale) {
       const negative = finalInv.lineItems
         .map((l) => ItemRepo.get(l.itemId))
-        .filter((it): it is Item => !!it && it.stock < 0);
+        .filter((it): it is Item => !!it && stockOf(it) < 0);
       if (negative.length) {
         toast.warning(
           `Stock below zero: ${negative.map((i) => i.name).join(", ")} — add purchase entry`,
@@ -819,6 +941,14 @@ export function InvoiceForm({ mode, existing }: Props) {
   };
 
   const save = (andPrint = false) => {
+    /* Serial count must equal line quantity. Without this the data rots
+       inside a month, and a warranty screen that is confidently wrong is
+       worse than no warranty screen at all. */
+    const missing = serialShortfalls(inv.lineItems, (id) => items.find((x) => x.id === id));
+    if (missing.length) {
+      toast.error(missing.join(" · "), { duration: 7000 });
+      return;
+    }
     if (savingRef.current) return; // double-click / Ctrl+S repeat protection
     // Both dates: an edit that moves a bill out of a closed month changes that
     // month's filed totals as surely as one posted into it.
@@ -1326,11 +1456,13 @@ export function InvoiceForm({ mode, existing }: Props) {
                   <tr
                     key={l.id}
                     className="border-t hover:bg-accent/30"
-                    // Backspace in an empty box walks back along the line —
-                    // price to unit, unit to qty, qty to the item picker.
-                    onKeyDown={(e) =>
-                      stepBackOnBackspace(e, { onStart: () => setReopenPickerFor(l.id) })
-                    }
+                    /* Enter walks the row and only leaves at the end. The
+                       shop asked for the Backspace-walks-backwards flow to
+                       go: it surprised people, and Shift+Tab already does
+                       that job the way every other application does. The
+                       item name stays a button, so a wrong item is still one
+                       click from being changed. */
+                    onKeyDown={(e) => enterMovesAlongRow(e, { onEnd: focusFirstPendingRow })}
                   >
                     <td className="px-3 py-1.5 text-muted-foreground text-[11px]">{idx + 1}</td>
                     <td className="px-3 py-1.5">
@@ -1340,8 +1472,9 @@ export function InvoiceForm({ mode, existing }: Props) {
                         isSale={isSale}
                         gstOn={gstOn}
                         onChange={(it) => changeLineItem(l.id, it)}
-                        openNow={reopenPickerFor === l.id}
-                        onOpened={() => setReopenPickerFor(null)}
+                        onAddNew={(name) =>
+                          setQuickAddItem({ name, rowId: null, replaceLineId: l.id })
+                        }
                       />
                     </td>
                     <td className="py-1.5 px-1">
@@ -1349,12 +1482,6 @@ export function InvoiceForm({ mode, existing }: Props) {
                         id={`qty-${l.id}`}
                         value={l.qty}
                         onValue={(n) => updateLine(l.id, { qty: n })}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") {
-                            e.preventDefault();
-                            focusFirstPendingRow();
-                          }
-                        }}
                         className="w-full h-7 px-1.5 text-right border rounded bg-background focus:border-primary outline-none"
                       />
                     </td>
@@ -1425,6 +1552,32 @@ export function InvoiceForm({ mode, existing }: Props) {
                     </td>
                   </tr>
                 ))}
+                {/* Serial rows, one under each line that needs them. A
+                    separate pass rather than a second <tr> inside the map,
+                    because a fragment of two rows per line makes the keying
+                    and the hover striping fight each other. */}
+                {inv.lineItems.flatMap((l) => {
+                  const it = items.find((x) => x.id === l.itemId);
+                  if (!isSerialised(it) || !it) return [];
+                  return [
+                    <tr key={`${l.id}-serials`} className="border-t-0">
+                      <td />
+                      <td colSpan={99} className="px-3 pb-2">
+                        <SerialEntry
+                          item={it}
+                          mode={isSale ? "issuing" : "receiving"}
+                          qty={l.qty}
+                          value={l.serialIds ?? []}
+                          onChange={(ids) => updateLine(l.id, { serialIds: ids })}
+                          alreadyOnThisDocument={
+                            existing?.lineItems.find((x) => x.id === l.id)?.serialIds ?? []
+                          }
+                          usedElsewhere={serialIdsOn(inv.lineItems.filter((x) => x.id !== l.id))}
+                        />
+                      </td>
+                    </tr>,
+                  ];
+                })}
                 {pendingRowIds.map((id) => (
                   <ItemEntryRow
                     key={id}
@@ -1445,6 +1598,38 @@ export function InvoiceForm({ mode, existing }: Props) {
                   />
                 ))}
               </tbody>
+              {/* A footing that adds the column up.
+                  Asked for so the counter can check a bill against the pile
+                  of goods in front of them: eleven pieces on the counter, so
+                  the bill had better say eleven. The printed copy has carried
+                  this line for a long time; the screen where the mistake
+                  actually gets made did not.
+
+                  Every span is computed from the same flags the header uses,
+                  so a hidden Unit or Disc% column cannot knock it out of
+                  alignment. */}
+              {inv.lineItems.length > 0 && (
+                <tfoot className="border-t-2 bg-muted/30 font-semibold">
+                  <tr>
+                    <td className="px-3 py-2" />
+                    <td className="px-3 py-2 text-[12px] uppercase tracking-wider text-muted-foreground">
+                      Total
+                    </td>
+                    <td className="text-right py-2 px-2 tabular-nums">{totalQty}</td>
+                    {showUnitCol && <td />}
+                    {inv.isInternational && <td />}
+                    <td className="text-right py-2 px-2 tabular-nums text-muted-foreground">
+                      {fmtMoney(totalPrice)}
+                    </td>
+                    {showDiscCol && <td />}
+                    {gstOn && <td />}
+                    <td className="text-right py-2 pr-3 tabular-nums">
+                      {fmtMoney(totalLineAmount)}
+                    </td>
+                    <td />
+                  </tr>
+                </tfoot>
+              )}
             </table>
           </div>
         </div>
@@ -1464,16 +1649,20 @@ export function InvoiceForm({ mode, existing }: Props) {
                   className="w-28 h-8 px-2 text-right border rounded-md bg-background focus:border-primary focus:ring-2 focus:ring-ring/20 outline-none tabular-nums"
                 />
               </div>
-              {isSale && (
-                <div className="flex justify-between items-center gap-2">
-                  <span className="text-muted-foreground">Shipping Charge</span>
-                  <NumInput
-                    value={inv.shippingCharge ?? 0}
-                    onValue={(n) => setShippingCharge(n)}
-                    className="w-28 h-8 px-2 text-right border rounded-md bg-background focus:border-primary focus:ring-2 focus:ring-ring/20 outline-none tabular-nums"
-                  />
-                </div>
-              )}
+              {/* On purchases too: the shop pays courier on goods coming in
+                  just as it charges it on goods going out, and asked for the
+                  same box. recalc() already folded this into the total for
+                  either kind of document — only the field was hidden. */}
+              <div className="flex justify-between items-center gap-2">
+                <span className="text-muted-foreground">
+                  {isSale ? "Shipping Charge" : "Courier / Shipping"}
+                </span>
+                <NumInput
+                  value={inv.shippingCharge ?? 0}
+                  onValue={(n) => setShippingCharge(n)}
+                  className="w-28 h-8 px-2 text-right border rounded-md bg-background focus:border-primary focus:ring-2 focus:ring-ring/20 outline-none tabular-nums"
+                />
+              </div>
               {!!inv.roundOff && Math.abs(inv.roundOff) > 0.001 && (
                 <Row
                   label="Round Off"
@@ -1541,10 +1730,14 @@ export function InvoiceForm({ mode, existing }: Props) {
                     className="h-9 px-3 border rounded-md bg-background focus:border-primary focus:ring-2 focus:ring-ring/20 outline-none text-[13px]"
                   />
                   {bankOpen && bankSuggests.length > 0 && (
-                    <div className="absolute z-20 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-elevated max-h-56 overflow-auto">
+                    <div
+                      ref={bankOptionsRef}
+                      className="absolute z-20 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-elevated max-h-56 overflow-auto"
+                    >
                       {bankSuggests.map((b, i) => (
                         <div
                           key={b.id}
+                          data-bank-opt={i}
                           onMouseDown={(e) => {
                             e.preventDefault();
                             selectBank(b);
@@ -1690,8 +1883,13 @@ export function InvoiceForm({ mode, existing }: Props) {
         onCancel={() => setQuickAddItem(null)}
         onPickExisting={(it) => {
           if (!quickAddItem) return;
-          focusQtyId.current = addLineItem(it);
-          completePendingRow(quickAddItem.rowId);
+          // Same rule as confirmQuickAddItem: put it where they were standing.
+          if (quickAddItem.replaceLineId) {
+            changeLineItem(quickAddItem.replaceLineId, it);
+          } else {
+            focusQtyId.current = addLineItem(it);
+            if (quickAddItem.rowId) completePendingRow(quickAddItem.rowId);
+          }
           setQuickAddItem(null);
         }}
         onConfirm={confirmQuickAddItem}
@@ -1874,6 +2072,7 @@ function ItemEntryRow({
                 top: dropdownRect.top,
                 left: dropdownRect.left,
                 width: dropdownRect.width,
+                pointerEvents: "auto",
               }}
               className="z-50 border rounded-md bg-popover shadow-elevated max-h-72 flex flex-col"
             >
@@ -1894,7 +2093,7 @@ function ItemEntryRow({
                     <div>
                       <div className="font-semibold">{it.name}</div>
                       <div className="text-[11px] text-muted-foreground">
-                        Stock: {it.stock} {it.unit}
+                        Stock: {stockOf(it)} {it.unit}
                       </div>
                     </div>
                     <div className="text-right">
@@ -1994,6 +2193,7 @@ function ItemNameCell({
   isSale,
   gstOn,
   onChange,
+  onAddNew,
   openNow,
   onOpened,
 }: {
@@ -2001,6 +2201,11 @@ function ItemNameCell({
   items: Item[];
   isSale: boolean;
   gstOn: boolean;
+  /** Offered when what was typed matches nothing. Picking the wrong item and
+   *  then typing the right one is the commonest slip on this screen, and
+   *  until now that path dead-ended: the blank entry row could create an item
+   *  and this picker could not. */
+  onAddNew?: (name: string) => void;
   onChange: (it: Item) => string;
   /** Reopen the picker from outside — see the Qty box's Backspace. */
   openNow?: boolean;
@@ -2056,6 +2261,18 @@ function ItemNameCell({
     : items;
   const suggests = allMatches.slice(0, MAX_SUGGESTIONS);
   const hiddenCount = allMatches.length - suggests.length;
+  const typed = q.trim();
+  const showAddNew =
+    !!onAddNew &&
+    !!typed &&
+    !items.some((i) => i.name.trim().toLowerCase() === typed.toLowerCase());
+  /** The add row sits after the matches, so it is the last thing arrowed to. */
+  const addIdx = suggests.length;
+
+  const startAddNew = () => {
+    setEditing(false);
+    onAddNew?.(typed);
+  };
 
   // Keep the keyboard-highlighted option visible — but ONLY when the
   // highlight actually moves. This used to be a ref callback that ran on
@@ -2121,13 +2338,14 @@ function ItemNameCell({
             setEditing(false);
           } else if (e.key === "ArrowDown") {
             e.preventDefault();
-            setIdx((i) => Math.min(suggests.length - 1, i + 1));
+            setIdx((i) => Math.min(suggests.length - 1 + (showAddNew ? 1 : 0), i + 1));
           } else if (e.key === "ArrowUp") {
             e.preventDefault();
             setIdx((i) => Math.max(0, i - 1));
           } else if (e.key === "Enter") {
             e.preventDefault();
             if (suggests[idx]) pick(suggests[idx]);
+            else if (showAddNew) startAddNew();
           }
         }}
         placeholder="Type to change item…"
@@ -2136,11 +2354,20 @@ function ItemNameCell({
       {rect &&
         createPortal(
           <div
-            style={{ position: "fixed", top: rect.top, left: rect.left, width: rect.width }}
+            style={{
+              position: "fixed",
+              top: rect.top,
+              left: rect.left,
+              width: rect.width,
+              // See the note in ComboInput: a modal Radix dialog switches
+              // pointer events off on <body>, and anything portalled there
+              // goes with it unless it says otherwise.
+              pointerEvents: "auto",
+            }}
             className="z-50 border rounded-md bg-popover shadow-elevated max-h-72 flex flex-col"
           >
             <div ref={optionsRef} className="overflow-auto flex-1 min-h-0">
-              {suggests.length === 0 && (
+              {suggests.length === 0 && !showAddNew && (
                 <div className="px-3 py-3 text-[12px] text-muted-foreground text-center">
                   No items found
                 </div>
@@ -2158,7 +2385,7 @@ function ItemNameCell({
                   <div>
                     <div className="font-semibold">{it.name}</div>
                     <div className="text-[11px] text-muted-foreground">
-                      Stock: {it.stock} {it.unit}
+                      Stock: {stockOf(it)} {it.unit}
                     </div>
                   </div>
                   <div className="text-right">
@@ -2171,6 +2398,21 @@ function ItemNameCell({
                   </div>
                 </div>
               ))}
+              {showAddNew && (
+                <div
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    startAddNew();
+                  }}
+                  data-opt={addIdx}
+                  className={`px-3 py-2 text-sm cursor-pointer flex items-center gap-1.5 text-primary font-medium border-t ${
+                    idx === addIdx ? "bg-accent" : "hover:bg-accent"
+                  }`}
+                >
+                  <Plus className="h-3.5 w-3.5 shrink-0" />
+                  Add &ldquo;{typed}&rdquo; as a new item
+                </div>
+              )}
             </div>
             {hiddenCount > 0 && (
               <div className="shrink-0 px-3 py-2 text-[11px] text-muted-foreground border-t bg-muted/40">
@@ -2235,7 +2477,16 @@ function PriceHistoryCell({
         rect &&
         createPortal(
           <div
-            style={{ position: "fixed", top: rect.top, left: rect.left, width: rect.width }}
+            style={{
+              position: "fixed",
+              top: rect.top,
+              left: rect.left,
+              width: rect.width,
+              // See the note in ComboInput: a modal Radix dialog switches
+              // pointer events off on <body>, and anything portalled there
+              // goes with it unless it says otherwise.
+              pointerEvents: "auto",
+            }}
             className="z-50 border rounded-md bg-popover shadow-elevated overflow-hidden"
           >
             <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground bg-muted/50 border-b">
@@ -2287,7 +2538,7 @@ function QuickAddItemDialog({
   onPickExisting,
   onConfirm,
 }: {
-  draft: { name: string; rowId: string } | null;
+  draft: { name: string; rowId: string | null; replaceLineId?: string } | null;
   isSale: boolean;
   existingItems?: Item[];
   onCancel: () => void;
@@ -2295,6 +2546,7 @@ function QuickAddItemDialog({
   onConfirm: (details: {
     name: string;
     unit: string;
+    category: string;
     gstRate: number;
     salePrice: number;
     purchasePrice: number;
@@ -2302,6 +2554,13 @@ function QuickAddItemDialog({
 }) {
   const [name, setName] = useState("");
   const [unit, setUnit] = useState("pcs");
+  const [category, setCategory] = useState("");
+  /* Straight off the catalogue this dialog is already handed, so the picker
+     offers exactly the categories in use and nothing has to be plumbed in. */
+  const knownCategories = useMemo(
+    () => existingItems.map((i) => i.category ?? "").filter(Boolean),
+    [existingItems],
+  );
   const [gstRate, setGstRate] = useState(0);
   const [salePrice, setSalePrice] = useState(0);
   const [purchasePrice, setPurchasePrice] = useState(0);
@@ -2328,7 +2587,7 @@ function QuickAddItemDialog({
       toast.error("Name required");
       return;
     }
-    onConfirm({ name, unit, gstRate, salePrice, purchasePrice });
+    onConfirm({ name, unit, category, gstRate, salePrice, purchasePrice });
   };
 
   // Live "does this already exist?" hint — the name typed at the counter
@@ -2386,7 +2645,7 @@ function QuickAddItemDialog({
                   >
                     <span className="font-medium">{it.name}</span>
                     <span className="text-[11px] text-muted-foreground">
-                      Stock: {it.stock} {it.unit}
+                      Stock: {stockOf(it)} {it.unit}
                     </span>
                   </div>
                 ))}
@@ -2400,6 +2659,22 @@ function QuickAddItemDialog({
             )}
           </div>
           <Field label="Unit" value={unit} onChange={(e) => setUnit(e.target.value)} />
+          {/* A searchable picker rather than a free text box, for the reason
+              the bulk grid gives: this is the moment a third spelling of a
+              category that already exists gets invented. An item created
+              here used to have no category at all, which is worse — it
+              simply never appears under any of them. */}
+          <label className="flex flex-col gap-1 text-[12px]">
+            <span className="text-muted-foreground font-medium">Category</span>
+            <ComboInput
+              value={category}
+              onValue={setCategory}
+              options={knownCategories}
+              placeholder="Search or add…"
+              ariaLabel="Category for the new item"
+              className="h-9 px-3 border rounded-md bg-background focus:border-primary focus:ring-2 focus:ring-ring/20 outline-none text-[13px] w-full"
+            />
+          </label>
           <NumField
             label="GST Rate (%)"
             value={gstRate}

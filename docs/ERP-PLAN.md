@@ -49,13 +49,13 @@ optional.
 Minimum real set. Each row is an account; `system` accounts are created on
 first run and cannot be deleted.
 
-| Group | Accounts |
-|---|---|
-| Asset | Cash in Hand · one per Bank Account · Accounts Receivable · Inventory · Input GST |
-| Liability | Accounts Payable · Output GST · Round-off |
-| Equity | Owner's Capital · Owner's Drawings · Retained Earnings · Opening Balance Equity |
-| Income | Sales · Discount Received · Other Income |
-| Expense | Cost of Goods Sold · Discount Allowed · Cash Short/Over · Stock Written Off · one per expense category |
+| Group     | Accounts                                                                                               |
+| --------- | ------------------------------------------------------------------------------------------------------ |
+| Asset     | Cash in Hand · one per Bank Account · Accounts Receivable · Inventory · Input GST                      |
+| Liability | Accounts Payable · Output GST · Round-off                                                              |
+| Equity    | Owner's Capital · Owner's Drawings · Retained Earnings · Opening Balance Equity                        |
+| Income    | Sales · Discount Received · Other Income                                                               |
+| Expense   | Cost of Goods Sold · Discount Allowed · Cash Short/Over · Stock Written Off · one per expense category |
 
 `Opening Balance Equity` is what makes the ₹29,000 "CASH ADD TILL TODAY FROM
 VYAPAR" postable: an opening figure has to land somewhere, and equity is where.
@@ -80,43 +80,44 @@ source.
 The whole design in one table. Every existing write point gets exactly one of
 these.
 
-| Document | Debit | Credit |
-|---|---|---|
-| Sale (GST) | Accounts Receivable (total) | Sales (taxable) + Output GST |
-| — cash taken at billing | Cash / Bank | Accounts Receivable |
-| — cost of the goods | Cost of Goods Sold | Inventory |
-| Purchase | Inventory + Input GST | Accounts Payable |
-| — paid at billing | Accounts Payable | Cash / Bank |
-| Payment in | Cash / Bank | Accounts Receivable |
-| — settlement discount | Discount Allowed | Accounts Receivable |
-| Payment out | Accounts Payable | Cash / Bank |
-| — settlement discount | Accounts Payable | Discount Received |
-| Expense | Expense (category) | Cash / Bank |
-| Transfer | destination account | source account |
-| Cash adjustment | Cash *or* the reason account | the reason account *or* Cash |
-| Sale return | Sales + Output GST | Accounts Receivable (and Inventory ← COGS) |
-| Purchase return | Accounts Payable | Inventory + Input GST |
-| Stock adjustment | Inventory *or* Stock Written Off | the other |
+| Document                | Debit                            | Credit                                     |
+| ----------------------- | -------------------------------- | ------------------------------------------ |
+| Sale (GST)              | Accounts Receivable (total)      | Sales (taxable) + Output GST               |
+| — cash taken at billing | Cash / Bank                      | Accounts Receivable                        |
+| — cost of the goods     | Cost of Goods Sold               | Inventory                                  |
+| Purchase                | Inventory + Input GST            | Accounts Payable                           |
+| — paid at billing       | Accounts Payable                 | Cash / Bank                                |
+| Payment in              | Cash / Bank                      | Accounts Receivable                        |
+| — settlement discount   | Discount Allowed                 | Accounts Receivable                        |
+| Payment out             | Accounts Payable                 | Cash / Bank                                |
+| — settlement discount   | Accounts Payable                 | Discount Received                          |
+| Expense                 | Expense (category)               | Cash / Bank                                |
+| Transfer                | destination account              | source account                             |
+| Cash adjustment         | Cash _or_ the reason account     | the reason account _or_ Cash               |
+| Sale return             | Sales + Output GST               | Accounts Receivable (and Inventory ← COGS) |
+| Purchase return         | Accounts Payable                 | Inventory + Input GST                      |
+| Stock adjustment        | Inventory _or_ Stock Written Off | the other                                  |
 
 **Where each is added** (the existing posting points, from a grep of the tree):
 
-| File | Posts |
-|---|---|
-| `src/components/InvoiceForm.tsx` | Sale, Purchase (+ the cash/bank leg, + COGS) |
-| `src/components/ReturnForm.tsx` | Sale return, Purchase return |
-| `src/routes/payments.tsx` | Payment in / out, incl. discount lines |
-| `src/routes/expenses.tsx` | Expense |
-| `src/components/CashBankTransferDialog.tsx` | Transfer (both legs) |
-| `src/routes/bank.tsx` | Deposit / withdraw |
-| `src/routes/cash.tsx` | Cash adjustment |
-| `src/routes/items.tsx`, `BulkUpdateItemsDialog.tsx` | Stock adjustment |
+| File                                                                                                     | Posts                                                            |
+| -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `src/components/InvoiceForm.tsx`                                                                         | Sale, Purchase (+ the cash/bank leg, + COGS)                     |
+| `src/components/ReturnForm.tsx`                                                                          | Sale return, Purchase return                                     |
+| `src/routes/payments.tsx`                                                                                | Payment in / out, incl. discount lines                           |
+| `src/routes/expenses.tsx`                                                                                | Expense                                                          |
+| `src/components/CashBankTransferDialog.tsx`                                                              | Transfer (both legs)                                             |
+| `src/routes/bank.tsx`                                                                                    | Deposit / withdraw                                               |
+| `src/routes/cash.tsx`                                                                                    | Cash adjustment                                                  |
+| `src/routes/items.tsx`, `BulkUpdateItemsDialog.tsx`                                                      | Stock adjustment                                                 |
 | `src/routes/sales.index.tsx`, `purchase.index.tsx`, `sale-return.index.tsx`, `purchase-return.index.tsx` | Deletions — post a **reversal**, never delete the original entry |
 
 ---
 
 ## 4. Feature-by-feature: what is added, and what it touches
 
-### 4.1 Audit trail — *independent, cheap, do first*
+### 4.1 Audit trail — _independent, cheap, do first_
+
 - **Add** `createdBy`, `createdAt`, `updatedBy`, `updatedAt` on every record;
   stamped centrally in `Repository.add/update/adjustField` so no call site can
   forget. Current user from `auth.currentUser.email`.
@@ -124,7 +125,8 @@ these.
   screens.
 - **Risk** none — additive fields, empty on existing records.
 
-### 4.2 Period lock — *independent, cheap*
+### 4.2 Period lock — _independent, cheap_
+
 - **Add** `Company.booksLockedUpto: string`. Every write path checks the
   document date against it.
 - **Touches** the same posting points listed above; one shared guard
@@ -133,6 +135,7 @@ these.
   on a locked period.
 
 ### 4.3 Voucher numbers
+
 - **Add** a per-type counter (`CN`, `JV`, `CT`, `RV`) on cash/bank/journal
   entries, which today have no reference at all.
 - **Touches** cash, bank, transfer, adjustment write paths; the tables that list
@@ -141,6 +144,7 @@ these.
   the same batch as the document, not before it.
 
 ### 4.4 Reason categories on cash adjustments — **DONE (Phase 1)**
+
 - **Add** `CashAdjustment.accountId` (Owner Capital, Owner Drawing, Cash
   Short/Over, Opening Balance Equity, …) via the existing `ComboInput`.
 - **Touches** `src/routes/cash.tsx`; the P&L and balance sheet then stop
@@ -159,6 +163,7 @@ Phase 2 maps six known keys to six real accounts and the two cannot drift apart
 in the meantime.
 
 Three things the plan did not say, which the build settled:
+
 - The purpose is asked **before** the amount and **sets the direction** where
   only one direction is possible. "Owner took out" already says which way the
   money went; asking again is asking twice, and lets the two answers contradict
@@ -183,6 +188,7 @@ like the rest, a reason pre-picked, and the transfer fallback removed — each
 caught by a named assertion.
 
 ### 4.5 Append-only corrections — **DONE (Phase 4)**
+
 - **Add** "Reverse this entry" on anything outside today; edit stays for same-day.
   A reversal is a new document with the opposite signs and `reversalOf` set.
 - **Touches** every delete/edit path — the four `*.index.tsx` deletes, payments,
@@ -217,6 +223,7 @@ sites. "Remember to filter" is not a mechanism, and one forgotten total is the
 entire failure mode of this feature.
 
 **Three things the build settled that the plan did not say:**
+
 1. **A reason is required.** "Why is INV-0047 voided" is the question somebody
    asks six months later, and nothing else can answer it.
 2. **A transfer's two legs are cancelled together**, for the same reason they
@@ -249,6 +256,7 @@ leaves a voided row on the list instead of removing it, the row is hidden
 until the "Voided" button is pressed, and a reason has to be typed.
 
 ### 4.6 Posting ledger + Trial Balance — **DONE (Phase 2)**
+
 - **Add** the two collections above; `src/lib/posting.ts` builds the lines for a
   document; `src/lib/trialBalance.ts` sums the ledger.
 - **Touches** every posting point (table in §3) — the largest single change.
@@ -262,7 +270,7 @@ until the "Voided" button is pressed, and a reason has to be typed.
 **Built, and the one deliberate departure from §1.** The posting rules are
 complete and live in `src/lib/posting.ts`; the chart of accounts is
 `src/lib/accounts.ts`; `src/lib/trialBalance.ts` sums it and reconciles it.
-What §1 got wrong is *when* the rules run: it said write ledger lines on every
+What §1 got wrong is _when_ the rules run: it said write ledger lines on every
 document's batch. They are applied **on read** instead, and the reasons only
 became clear with the shop's real data in view:
 
@@ -275,7 +283,7 @@ became clear with the shop's real data in view:
    is the exact shape of the bug this phase exists to kill: the dashboard
    double-count happened because two places answered the same question
    separately. A derived ledger cannot disagree with the documents, because it
-   *is* the documents.
+   _is_ the documents.
 3. **Nothing needs it stored yet.** Storage buys immutability, and immutability
    matters only for what no document implies — a manual journal voucher, a
    year-end closing entry, an append-only reversal. Those are Phases 3 and 4,
@@ -288,6 +296,7 @@ figure it already had.
 
 **Three accounts exist to expose gaps rather than hide them,** and they are
 what makes the trial balance worth reading on this shop's data:
+
 - **Suspense** — money recorded as paid on a Credit-mode bill. It reduces what
   the party owes and reaches no cash or bank position anywhere.
 - **Bank (account not recorded)** — bank/UPI/cheque money never tied to WHICH
@@ -322,6 +331,7 @@ against itself — two totals computed the same wrong way agree perfectly. Both
 tests were fixed and the mutations then failed as they should.
 
 ### 4.7 Balance Sheet + P&L from the ledger, and year close — **DONE (Phase 3)**
+
 - **Add** `/reports?r=balance-sheet`, `?r=trial-balance`; a Year Close action
   posting closing entries into Retained Earnings and carrying balances forward.
 - **Touches** reports only — it reads the ledger, writes nothing except the
@@ -337,11 +347,11 @@ they decide a year is finished.
 phase, and getting any part of it backwards makes a statement confidently
 wrong rather than obviously broken:
 
-| | Closing entries |
-|---|---|
-| **P&L** | **excluded** — a year whose own statement included the entry emptying its accounts would report zero |
-| **Balance sheet / trial balance** | **included** — that is how profit reaches equity, and how a closed year stops being counted twice |
-| **The close itself** | **includes every earlier close** — which is what leaves only this year's income standing, and is why year two does not carry year one's profit again |
+|                                   | Closing entries                                                                                                                                      |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **P&L**                           | **excluded** — a year whose own statement included the entry emptying its accounts would report zero                                                 |
+| **Balance sheet / trial balance** | **included** — that is how profit reaches equity, and how a closed year stops being counted twice                                                    |
+| **The close itself**              | **includes every earlier close** — which is what leaves only this year's income standing, and is why year two does not carry year one's profit again |
 
 Each row of that table is a mutation in the suite. All three were caught.
 
@@ -354,6 +364,7 @@ with everything else and **included in backups** — a backup without it would
 restore a shop whose years had silently reopened.
 
 **Two judgement calls worth recording.**
+
 1. **A close may post into a locked period; reopening may not.** A closing
    entry is dated the last day of a year, which is usually inside a month the
    shop locked after filing GST. It is allowed through because it moves no
@@ -386,6 +397,7 @@ suppressed, reopening leaving the entry behind, and the close written without
 its year label.
 
 ### 4.8 Unit conversion (box ↔ piece)
+
 - **Add** `Item.baseUnit`, `altUnit`, `altPerBase`; `LineItem.unitUsed` and
   `baseQty`. **Stock, valuation and every report use `baseQty` only** — the
   chosen unit is presentation.
@@ -394,26 +406,29 @@ its year label.
 - **Risk** MEDIUM. The rule that keeps it safe: nothing except the line's own
   display reads `unitUsed`.
 
-### 4.9 Serial / IMEI tracking
+### 4.9 Serial / IMEI tracking — **DONE, all 8 steps (docs/SERIALS-PLAN.md)**
+
 - **Add** `Item.trackSerials`; `serialUnits { id, itemId, serial, status,
-  purchaseDocId, saleDocId }`; `LineItem.serials: string[]`.
+purchaseDocId, saleDocId }`; `LineItem.serials: string[]`.
 - **Touches** the bill and purchase forms (pick/scan serials), returns (restore
   them), stock reconciliation (serial count must equal `baseQty` for tracked
   items — a new invariant for the audit suite), item detail (per-serial history).
 - **Risk** MEDIUM. Highest real value for a phone shop: warranty by serial.
 
 ### 4.10 Document workflow
+
 - **Add** `quotations`, `salesOrders`, `deliveryChallans`, `purchaseOrders`,
   `grns`, each with `status` and a convert-to-next action carrying the lines
   forward and linking back.
 - **Rule** stock moves on the **challan/GRN or the invoice, once** — never on a
-  quotation or an order. An order may *reserve*, which is a separate figure from
+  quotation or an order. An order may _reserve_, which is a separate figure from
   stock and must never be subtracted from it.
 - **Touches** new screens and routes; the item picker's available-stock display;
   the tab strip's title map.
 - **Risk** MEDIUM — mostly new surface rather than changes to existing paths.
 
 ### 4.11 Multi-location
+
 - **Add** `locations`; move stock to `itemStock { itemId, locationId, qty }`;
   every document gets a `locationId`; inter-location transfer document.
 - **Touches** EVERYTHING that reads `item.stock` — 23 references across 12
@@ -423,12 +438,14 @@ its year label.
   across locations so old readers keep working during the migration.
 
 ### 4.12 Cost centres, budgets, TDS/TCS
+
 - **Add** `costCentreId` on documents and ledger lines; a budget per account per
   period; TDS/TCS rate on party and line.
 - **Touches** reports; the ledger line shape.
 - **Risk** low, additive.
 
 ### 4.13 e-Invoicing / e-way bill
+
 - **Blocked on the client, not on code.** Needs a GSP account (Masters India,
   ClearTax, …), API credentials, and the GSTIN registered for e-invoicing.
   Cannot be built or tested without them. Ask before scheduling.
@@ -439,19 +456,25 @@ its year label.
 
 Dependency-driven, cheapest-safest first:
 
-| # | Phase | Depends on | State |
-|---|---|---|---|
-| 0 | Audit trail · Period lock · Voucher numbers | — | **done** |
-| 1 | Reason categories on cash | 0 | **done** |
-| 2 | Posting ledger + reconciliation report + Trial Balance | 0 | **done** |
-| 3 | Balance Sheet · P&L from ledger · Year close | 2 reconciled | **done** |
-| 4 | Append-only corrections | 2 | **done** |
-| 5 | Unit conversion | — | |
-| 6 | Serial / IMEI | 5 | |
-| 7 | Document workflow | — | |
-| 8 | Multi-location | 5, 7 | |
-| 9 | Cost centres · budgets · TDS/TCS | 2 | |
-| 10 | e-Invoicing | client credentials | |
+| #   | Phase                                                  | Depends on         | State    |
+| --- | ------------------------------------------------------ | ------------------ | -------- |
+| 0   | Audit trail · Period lock · Voucher numbers            | —                  | **done** |
+| 1   | Reason categories on cash                              | 0                  | **done** |
+| 2   | Posting ledger + reconciliation report + Trial Balance | 0                  | **done** |
+| 3   | Balance Sheet · P&L from ledger · Year close           | 2 reconciled       | **done** |
+| 4   | Append-only corrections                                | 2                  | **done** |
+| 5   | Unit conversion                                        | —                  |          |
+| 6   | Serial / IMEI                                          | — (see note)       | **done** |
+| 7   | Document workflow                                      | —                  |          |
+| 8   | Multi-location                                         | 5, 7               |          |
+| 9   | Cost centres · budgets · TDS/TCS                       | 2                  |          |
+| 10  | e-Invoicing                                            | client credentials |          |
+
+**Note on 6 (Serial / IMEI):** listed above as depending on unit conversion.
+It does not, for this shop — adapters are bought and sold as single pieces, so
+there is no box-to-piece conversion in the way. Fully planned in
+docs/SERIALS-PLAN.md, including the 11 stock-write points and 10 stock-reader
+files it touches.
 
 ## 6. Standing rules for this programme
 

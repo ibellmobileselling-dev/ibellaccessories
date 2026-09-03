@@ -1,6 +1,8 @@
 import type { Invoice, Company } from "@/types";
 import { fmtMoney, fmtDate } from "@/lib/format";
 import { fmtMode } from "@/lib/paymentMode";
+import { serialTextIndex } from "@/lib/serials";
+import { PrintedSerials } from "@/components/PrintedSerials";
 
 interface Props {
   inv: Invoice;
@@ -81,6 +83,8 @@ export function PrintableInvoice({
   scale = 1,
 }: Props) {
   const gstOn = inv.gstEnabled !== false;
+  // One pass over the units for the whole document — see serialTextIndex.
+  const serialIndex = serialTextIndex();
   const showDisc = inv.lineItems.some((l) => (l.discountPct ?? 0) > 0);
 
   // The line table has optional columns (Disc%, and GST%/GST Amt), so the
@@ -220,7 +224,10 @@ export function PrintableInvoice({
             return (
               <tr key={l.id}>
                 <td style={{ ...cellStyle, textAlign: "center" }}>{i + 1}</td>
-                <td style={cellStyle}>{l.name}</td>
+                <td style={cellStyle}>
+                  {l.name}
+                  <PrintedSerials line={l} index={serialIndex} />
+                </td>
                 <td style={{ ...cellStyle, textAlign: "right" }}>{l.qty}</td>
                 <td style={cellStyle}>{l.unit}</td>
                 <td style={{ ...cellStyle, textAlign: "right" }}>{fmtMoney(l.price)}</td>

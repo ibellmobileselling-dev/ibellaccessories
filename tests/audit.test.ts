@@ -25,6 +25,7 @@ import type {
   StockAdjustment,
   BankTxn,
   CashAdjustment,
+  Serial,
   Invoice,
   Payment,
   Return,
@@ -37,6 +38,30 @@ import type {
 import { Repository } from "@/repositories/base";
 import { correctBankPaidAmount, planBankRepair } from "@/lib/bankRepair";
 import { planStockRepair } from "@/lib/dataRepair";
+import { checkSerialIntegrity } from "@/lib/serialAudit";
+import { serialCostIndex, lineCostBasis } from "@/lib/serialCost";
+import {
+  isSerialised,
+  inStockCounts,
+  stockOf,
+  serialsOf,
+  findSerial,
+  warrantyEnd,
+  warrantyDaysLeft,
+  serialShortfalls,
+  lookupSerials,
+  warrantyState,
+  vendorClaimState,
+  SERIAL_MATCH_LIMIT,
+} from "@/lib/serials";
+import {
+  planPurchaseSerials,
+  planSaleReturnSerials,
+  planPurchaseReturnSerials,
+  planSaleSerials,
+  soldSerialsOf,
+  undoSerialsOf,
+} from "@/lib/serialMoves";
 import { transferLegsFor } from "@/lib/transferLegs";
 import { AuditLogRepo, nextVoucherNo } from "@/repositories";
 import { isLocked, blockedDate, lockMessage } from "@/lib/periodLock";
@@ -3944,6 +3969,1058 @@ console.log(`\n═════════════════════�
   assert(
     (row?.why ?? "").includes("purchase prices move"),
     `T34: with the reason on the row, where the reader is — ${row?.why}`,
+  );
+}
+
+/* ═══ TEST 35: stock that is counted, not stored ════════════════════════
+   The shop buys adapters by the box and sells them one at a time, and every
+   unit carries the serial the customer's warranty is written against.
+
+   The decision the whole feature rests on: for a serialised item, stock stops
+   being the stored `item.stock` number and becomes the count of serials on
+   hand. `item.stock` is one of only two stored running totals in this
+   application and lib/dataRepair.ts exists because it drifts — for these
+   items that entire class of bug disappears, because there is one source and
+   nothing for it to disagree with.
+
+   Which means the stored number must be *ignored*, not trusted as a fallback.
+   That is what most of this checks. */
+{
+  const plain = { id: "P", name: "Cable", stock: 7, purchasePrice: 50 } as unknown as Item;
+  /* A stored number that is deliberately WRONG. Every assertion below that
+     expects 2 rather than 999 is checking that the stored figure is not
+     consulted at all — a fallback here would be the worst of both: a number
+     nothing maintains, shown as though something did. */
+  const tracked = {
+    id: "T",
+    name: "Adapter",
+    stock: 999,
+    purchasePrice: 100,
+    trackSerials: true,
+  } as unknown as Item;
+
+  const serials = [
+    { id: "s1", itemId: "T", serial: "AAA1", status: "in_stock", createdAt: "3" },
+    { id: "s2", itemId: "T", serial: "AAA2", status: "in_stock", createdAt: "2" },
+    { id: "s3", itemId: "T", serial: "AAA3", status: "sold", createdAt: "1" },
+    { id: "s4", itemId: "T", serial: "AAA4", status: "damaged", createdAt: "4" },
+    { id: "s5", itemId: "OTHER", serial: "BBB1", status: "in_stock", createdAt: "5" },
+  ] as unknown as Serial[];
+
+  assert(isSerialised(tracked) && !isSerialised(plain), "T35: an item says which kind it is");
+  assert(!isSerialised(undefined), "T35: and a missing item is not serialised");
+
+  const counts = inStockCounts(serials);
+  assert(counts.get("T") === 2, `T35: only what is on the shelf counts — ${counts.get("T")}`);
+  assert(counts.get("OTHER") === 1, "T35: counted per item, not lumped together");
+
+  assert(
+    stockOf(tracked, counts) === 2,
+    `T35: a serialised item's stock is its serial count — ${stockOf(tracked, counts)}`,
+  );
+  assert(
+    stockOf(tracked, counts) !== 999,
+    "T35: and the stored number is ignored entirely, not used as a fallback",
+  );
+  assert(
+    stockOf(plain, counts) === 7,
+    `T35: an ordinary item still reads its stored stock — ${stockOf(plain, counts)}`,
+  );
+
+  /* A serialised item with no serials is zero. Falling back to item.stock
+     here is the tempting bug: it would make a brand-new tracked item claim
+     whatever number happened to be sitting on it. */
+  const empty = { id: "E", name: "New", stock: 42, trackSerials: true } as unknown as Item;
+  assert(
+    stockOf(empty, counts) === 0,
+    `T35: a serialised item with no serials has none, whatever the old number said — ${stockOf(empty, counts)}`,
+  );
+
+  // Sold and damaged units are off the shelf but still on file.
+  assert(
+    serialsOf("T", serials).length === 4,
+    `T35: every unit of the item is still listed — ${serialsOf("T", serials).length}`,
+  );
+  assert(
+    serialsOf("T", serials)[0].serial === "AAA4",
+    "T35: newest first, so the last one received is at the top",
+  );
+
+  /* Uniqueness is per ITEM, not global: two manufacturers can legitimately
+     stamp the same string, and a global rule would refuse a real unit with no
+     way to explain why. */
+  assert(!!findSerial("T", "AAA1", serials), "T35: a serial is found under its own item");
+  assert(
+    !findSerial("OTHER", "AAA1", serials),
+    "T35: and not under a different one — uniqueness is per item",
+  );
+  /* Scanners add spaces and cases differ. "f2lx9k3" and "F2LX9K3 " are the
+     same adapter to everyone except a string compare. */
+  assert(
+    findSerial("T", "  aaa1 ", serials)?.id === "s1",
+    "T35: found whatever the scanner did to the spacing and case",
+  );
+  assert(!findSerial("T", "   ", serials), "T35: and an empty scan finds nothing");
+}
+
+/* ═══ TEST 36: warranty dates a customer could argue about ══════════════
+   The whole point of the serial is the warranty, so the date it produces has
+   to survive being read off a bill by someone who wants it honoured. */
+{
+  assert(
+    warrantyEnd("2026-03-12", 12) === "2027-03-12",
+    `T36: a year's warranty ends a year later — ${warrantyEnd("2026-03-12", 12)}`,
+  );
+  assert(
+    warrantyEnd("2026-08-27", 6) === "2027-02-27",
+    `T36: six months crosses the year end correctly — ${warrantyEnd("2026-08-27", 6)}`,
+  );
+  /* 31 January plus one month. A naive setMonth gives 2 or 3 March, which is
+     a date the customer would rightly argue with — the month ends on the
+     28th, so the warranty does. */
+  assert(
+    warrantyEnd("2026-01-31", 1) === "2026-02-28",
+    `T36: a month from the 31st lands on the last day of a short month — ${warrantyEnd("2026-01-31", 1)}`,
+  );
+  assert(
+    warrantyEnd("2028-01-31", 1) === "2028-02-29",
+    `T36: and on the 29th in a leap year — ${warrantyEnd("2028-01-31", 1)}`,
+  );
+  assert(!warrantyEnd("2026-03-12", 0), "T36: no warranty means no end date, not today");
+  assert(!warrantyEnd("2026-03-12", undefined), "T36: and neither does an unset policy");
+  assert(!warrantyEnd("", 12), "T36: nor a missing sale date");
+
+  assert(
+    warrantyDaysLeft("2026-09-01", "2026-08-27") === 5,
+    `T36: days left counts forward — ${warrantyDaysLeft("2026-09-01", "2026-08-27")}`,
+  );
+  assert(
+    (warrantyDaysLeft("2026-08-20", "2026-08-27") ?? 0) < 0,
+    "T36: and goes negative once it has run out, rather than clamping to zero",
+  );
+  assert(
+    warrantyDaysLeft(undefined, "2026-08-27") === undefined,
+    "T36: no warranty is not the same as an expired one",
+  );
+}
+
+/* ═══ TEST 37: the repair tool leaves serialised items alone ════════════
+   planStockRepair rebuilds item.stock from documents. For a serialised item
+   that is the wrong question — stock IS the serial count, so there is nothing
+   to rebuild, and "repairing" it would write a documents-derived figure over
+   a shelf count that is already right.
+
+   Note this is the OPPOSITE answer to the delete guards, which had to start
+   counting voided documents. The two look alike and are not: that one asks
+   "is this still referenced", this asks "what should the number be". */
+{
+  const line = { itemId: "T", qty: 3, price: 100 };
+  const base = {
+    purchases: [] as Invoice[],
+    saleReturns: [] as Return[],
+    purchaseReturns: [] as Return[],
+    stockAdjustments: [] as StockAdjustment[],
+    sales: [{ id: "S", lineItems: [line] }] as unknown as Invoice[],
+  };
+
+  const plain = planStockRepair({
+    ...base,
+    items: [{ id: "T", name: "Adapter", openingStock: 10, stock: 10 }] as unknown as Item[],
+  });
+  assert(
+    plain.length === 1 && plain[0].correct === 7,
+    `T37: an ordinary item is still rebuilt from its documents — ${JSON.stringify(plain)}`,
+  );
+
+  const tracked = planStockRepair({
+    ...base,
+    items: [
+      { id: "T", name: "Adapter", openingStock: 10, stock: 10, trackSerials: true },
+    ] as unknown as Item[],
+  });
+  assert(
+    tracked.length === 0,
+    `T37: a serialised item is left alone — its serials are the stock, and this would overwrite them — ${JSON.stringify(tracked)}`,
+  );
+}
+
+/* ═══ TEST 38: the rule the whole feature rests on ══════════════════════
+   Serial count equals line quantity, and the document will not save
+   otherwise. Without it the data rots inside a month, and a warranty screen
+   that is confidently wrong is worse than no warranty screen at all. */
+{
+  const tracked = { id: "T", trackSerials: true };
+  const plain = { id: "P" };
+  const itemOf = (id: string) => (id === "T" ? tracked : plain) as never;
+
+  assert(
+    serialShortfalls([{ itemId: "P", name: "Cable", qty: 5 }], itemOf).length === 0,
+    "T38: an ordinary item is never asked for serials",
+  );
+  assert(
+    serialShortfalls([{ itemId: "T", name: "Adapter", qty: 2, serialIds: ["a", "b"] }], itemOf)
+      .length === 0,
+    "T38: a matched line passes",
+  );
+  const short = serialShortfalls(
+    [{ itemId: "T", name: "Adapter", qty: 3, serialIds: ["a"] }],
+    itemOf,
+  );
+  assert(
+    short.length === 1 && short[0].includes("2 serials still to scan"),
+    `T38: a short line says how many are missing — ${short[0]}`,
+  );
+  const over = serialShortfalls(
+    [{ itemId: "T", name: "Adapter", qty: 1, serialIds: ["a", "b"] }],
+    itemOf,
+  );
+  assert(
+    over.length === 1 && over[0].includes("more serials than quantity"),
+    `T38: and too many is refused just as firmly — ${over[0]}`,
+  );
+  assert(
+    serialShortfalls([{ itemId: "T", name: "Adapter", qty: 1 }], itemOf).length === 1,
+    "T38: a serialised line with no serials at all is short, not exempt",
+  );
+}
+
+/* ═══ TEST 39: what a purchase and a sale do to the units ═══════════════
+   Only a document moves a serial. These are the two that matter most, and
+   the edit paths — where a unit is taken off a bill it used to be on — are
+   where the mistakes live. */
+{
+  const item = {
+    id: "T",
+    name: "Adapter",
+    trackSerials: true,
+    warrantyMonths: 12,
+    vendorWarrantyMonths: 24,
+  } as unknown as Item;
+  const itemOf = (id: string) => (id === "T" ? item : undefined);
+
+  const bill = (over: Record<string, unknown> = {}) =>
+    ({
+      id: "PB1",
+      number: "PB-1",
+      date: "2026-05-10",
+      partyId: "V1",
+      partyName: "Mehta Distributors",
+      lineItems: [{ id: "l1", itemId: "T", name: "Adapter", qty: 2, price: 1180, serialIds: [] }],
+      total: 2360,
+      ...over,
+    }) as unknown as Invoice;
+
+  /* Receiving. Two scanned units do not exist yet — they are drafts, and
+     become records only when the bill saves. Writing them the moment they
+     are scanned would leave orphan stock behind every time somebody opened a
+     purchase and changed their mind. */
+  const received = bill();
+  received.lineItems[0].serialIds = ["draft:AAA1", "draft:AAA2"];
+  const p1 = planPurchaseSerials(received, null, itemOf);
+  assert(p1.create.length === 2, `T39: both scanned units are created — ${p1.create.length}`);
+  assert(
+    p1.create.every((c) => c.itemId === "T") && p1.create[0].serial === "AAA1",
+    "T39: under the right item, with the serial that was scanned",
+  );
+  assert(p1.update.length === 0 && p1.release.length === 0, "T39: and nothing else moves");
+
+  /* Editing the bill: one unit taken off. It never arrived, so it stops
+     being stock — but the record of it survives, like every other
+     cancellation in this application. */
+  const before = bill();
+  before.lineItems[0].serialIds = ["s1", "s2"];
+  const after = bill();
+  after.lineItems[0].serialIds = ["s1"];
+  const p2 = planPurchaseSerials(after, before, itemOf);
+  assert(
+    p2.release.length === 1 && p2.release[0].id === "s2",
+    `T39: the unit taken off the bill is released — ${JSON.stringify(p2.release)}`,
+  );
+  /* Guarded. Without it the assertion above fails correctly and then this
+     line throws on an empty array, killing the run before it can report —
+     the harness has no per-block catch, so one broken rule would hide the
+     other hundred thousand assertions. */
+  if (p2.release[0]) {
+    assert(
+      !!(p2.release[0].patch as { voidedAt?: string }).voidedAt,
+      "T39: by being marked, not by being deleted",
+    );
+  }
+  assert(
+    p2.update.length === 1 && p2.update[0].id === "s1",
+    "T39: and the one still on it is re-stamped, in case the date or price changed",
+  );
+  assert(
+    (p2.update[0].patch as { cost?: number }).cost === 1180,
+    `T39: with what THIS unit cost — ${(p2.update[0].patch as { cost?: number }).cost}`,
+  );
+  assert(
+    (p2.update[0].patch as { vendorWarrantyEnd?: string }).vendorWarrantyEnd === "2028-05-10",
+    `T39: and the shop's own claim window against the vendor — ${(p2.update[0].patch as { vendorWarrantyEnd?: string }).vendorWarrantyEnd}`,
+  );
+
+  /* Selling. */
+  const sale = bill({
+    id: "S1",
+    number: "INV-1",
+    date: "2026-06-01",
+    partyId: "C1",
+    partyName: "Ramesh",
+  });
+  sale.lineItems[0].serialIds = ["s1", "s2"];
+  const p3 = planSaleSerials(sale, null, itemOf);
+  assert(p3.update.length === 2, "T39: both units are marked sold");
+  const patch = p3.update[0].patch as Record<string, unknown>;
+  assert(patch.status === "sold", "T39: off the shelf");
+  assert(
+    patch.customerName === "Ramesh" && patch.saleDate === "2026-06-01",
+    "T39: with who bought it and when — the two things a warranty claim needs",
+  );
+  assert(
+    patch.warrantyEnd === "2027-06-01" && patch.warrantyMonths === 12,
+    `T39: and the warranty it was sold with — ${patch.warrantyEnd}`,
+  );
+
+  /* Taking a unit off a sale on an edit. It goes back on the shelf AND
+     forgets who had it: leaving a customer's name on a unit that is back in
+     stock is how a warranty lookup ends up naming the wrong person. */
+  const soldBefore = bill({ id: "S1", date: "2026-06-01" });
+  soldBefore.lineItems[0].serialIds = ["s1", "s2"];
+  const soldAfter = bill({ id: "S1", date: "2026-06-01" });
+  soldAfter.lineItems[0].serialIds = ["s1"];
+  const p4 = planSaleSerials(soldAfter, soldBefore, itemOf);
+  assert(p4.release.length === 1 && p4.release[0].id === "s2", "T39: the removed unit is released");
+  const back = p4.release[0].patch as Record<string, unknown>;
+  assert(back.status === "in_stock", "T39: back on the shelf");
+  /* The KEYS must be present and undefined, not merely absent. The write is a
+     full set() of the merged record with undefined stripped, so a key that is
+     present-and-undefined disappears from the stored document while a key
+     that was never mentioned keeps whatever it had. Checking "=== undefined"
+     alone cannot tell those two apart, and only one of them actually forgets
+     the customer. */
+  for (const k of [
+    "customerName",
+    "customerId",
+    "saleId",
+    "saleDate",
+    "warrantyEnd",
+    "warrantyMonths",
+  ]) {
+    assert(
+      Object.prototype.hasOwnProperty.call(back, k) && back[k] === undefined,
+      `T39: releasing a unit clears ${k} explicitly, so the stored record loses it — ${JSON.stringify(back)}`,
+    );
+  }
+  assert(
+    back.customerName === undefined && back.saleId === undefined,
+    "T39: and the customer forgotten with it",
+  );
+
+  /* An ordinary item is never touched by any of this. */
+  const plainBill = bill();
+  plainBill.lineItems[0].itemId = "OTHER";
+  plainBill.lineItems[0].serialIds = ["draft:X"];
+  const p5 = planPurchaseSerials(plainBill, null, itemOf);
+  assert(
+    p5.create.length === 0 && p5.update.length === 0,
+    "T39: an item that is not serialised moves no units, whatever is on the line",
+  );
+}
+
+/* ═══ TEST 40: a unit in a customer's hands cannot be un-received ═══════
+   The shop's record of where a unit came from is the only thing that lets
+   them claim a faulty one back from the vendor. Editing that purchase out
+   from under a sold unit would destroy exactly that. */
+{
+  const inv = {
+    id: "PB1",
+    lineItems: [{ id: "l", itemId: "T", qty: 2, serialIds: ["s1", "s2"] }],
+  } as unknown as Invoice;
+  const serials = [
+    { id: "s1", itemId: "T", serial: "A1", status: "sold" },
+    { id: "s2", itemId: "T", serial: "A2", status: "in_stock" },
+  ] as unknown as Serial[];
+
+  const sold = soldSerialsOf(inv, serials);
+  assert(
+    sold.length === 1 && sold[0].serial === "A1",
+    `T40: the unit already sold is named — ${JSON.stringify(sold.map((s) => s.serial))}`,
+  );
+  assert(
+    soldSerialsOf(inv, serials, new Set(["s2"])).length === 0,
+    "T40: and a unit still on the shelf is no obstacle to removing it",
+  );
+  assert(
+    soldSerialsOf(inv, serials, new Set(["s1"])).length === 1,
+    "T40: while removing the sold one is refused",
+  );
+}
+
+/* ═══ TEST 41: undoing a document puts its units back ═══════════════════
+   Deleting and voiding need exactly the same serial movements — the document
+   stops counting either way — so they share one answer rather than two that
+   drift apart silently until a shelf count goes wrong. */
+{
+  const item = { id: "T", trackSerials: true } as unknown as Item;
+  const itemOf = (id: string) => (id === "T" ? item : undefined);
+  const doc = { lineItems: [{ itemId: "T", serialIds: ["s1", "s2"] }] };
+
+  const undoneSale = undoSerialsOf(doc, "sale", itemOf);
+  assert(undoneSale.length === 2, "T41: every unit on the bill moves");
+  assert(
+    (undoneSale[0].patch as Record<string, unknown>).status === "in_stock",
+    "T41: a cancelled sale puts them back on the shelf",
+  );
+  assert(
+    Object.prototype.hasOwnProperty.call(undoneSale[0].patch, "customerName"),
+    "T41: and forgets the customer explicitly, so the stored record loses it",
+  );
+
+  const undonePurchase = undoSerialsOf(doc, "purchase", itemOf);
+  assert(
+    !!(undonePurchase[0].patch as { voidedAt?: string }).voidedAt,
+    "T41: a cancelled purchase means the units never arrived",
+  );
+  assert(
+    (undonePurchase[0].patch as Record<string, unknown>).status === undefined,
+    "T41: marked rather than restatused — the record survives, the count does not",
+  );
+
+  assert(
+    (undoSerialsOf(doc, "sale-return", itemOf)[0].patch as Record<string, unknown>).status ===
+      "sold",
+    "T41: undoing a sale return means the customer still has it",
+  );
+  assert(
+    (undoSerialsOf(doc, "purchase-return", itemOf)[0].patch as Record<string, unknown>).status ===
+      "in_stock",
+    "T41: undoing a purchase return means it never went back to the vendor",
+  );
+
+  const plain = { lineItems: [{ itemId: "OTHER", serialIds: ["x"] }] };
+  assert(
+    undoSerialsOf(plain, "sale", itemOf).length === 0,
+    "T41: an item that is not serialised moves nothing, whatever is on the line",
+  );
+}
+
+/* ═══ TEST 42: looking a unit up by what is printed on it ═══════════════
+   The counter's search, not the accountant's: somebody is holding an adapter
+   and wants to know whether the shop still owes them a warranty. They do not
+   know the item id, and half the time they are reading the last characters
+   down a phone line. */
+{
+  const serials = [
+    { id: "s1", itemId: "A", serial: "F2LX9K3", status: "sold" },
+    { id: "s2", itemId: "B", serial: "F2LX9K3", status: "in_stock" },
+    { id: "s3", itemId: "A", serial: "QQ119K3", status: "in_stock" },
+    { id: "s4", itemId: "A", serial: "ZZZ0001", status: "in_stock" },
+  ] as unknown as Serial[];
+
+  const exact = lookupSerials("f2lx9k3", serials);
+  assert(exact.hits.length === 2, "T42: an exact match on two items returns both");
+  assert(!exact.partial, "T42: and is not reported as a guess");
+  assert(
+    lookupSerials("  F2LX9K3 ", serials).hits.length === 2,
+    "T42: a scanner's stray space and case change nothing",
+  );
+
+  const tail = lookupSerials("9K3", serials);
+  assert(
+    tail.hits.length === 3 && tail.partial,
+    `T42: read out from the end, it matches every unit ending that way — got ${tail.hits.length}`,
+  );
+  // "K3" genuinely ends three of these — so this only passes because the
+  // length floor refuses it, not because the search happened to find nothing.
+  assert(
+    lookupSerials("K3", serials).hits.length === 0,
+    "T42: two characters is too loose to mean anything, so it answers nothing",
+  );
+  assert(
+    lookupSerials("F2L", serials).hits.length === 0,
+    "T42: and it is ends-with, not contains — a prefix is not a match",
+  );
+  assert(lookupSerials("", serials).hits.length === 0, "T42: an empty box searches for nothing");
+
+  const many = Array.from({ length: SERIAL_MATCH_LIMIT + 5 }, (_, i) => ({
+    id: `m${i}`,
+    itemId: "A",
+    serial: `X${i}999`,
+    status: "in_stock",
+  })) as unknown as Serial[];
+  const flood = lookupSerials("999", many);
+  assert(
+    flood.hits.length === SERIAL_MATCH_LIMIT && flood.truncated,
+    "T42: a search that matches the whole shelf says so rather than listing it",
+  );
+}
+
+/* ═══ TEST 43: is it still under warranty? ══════════════════════════════
+   "No warranty was given" and "the warranty has run out" lead to different
+   conversations. Collapsing them into one "not covered" is how a shop refuses
+   a repair it had in fact promised. */
+{
+  const TODAY = "2026-06-15";
+  const sold = (warrantyEnd?: string) =>
+    warrantyState({ status: "sold", warrantyEnd } as Serial, TODAY);
+
+  assert(
+    warrantyState({ status: "in_stock", warrantyEnd: "2027-01-01" } as Serial, TODAY).tone ===
+      "none",
+    "T43: a unit on the shelf has no promise running, whatever date is left on it",
+  );
+  assert(
+    sold(undefined).label.includes("no warranty recorded"),
+    "T43: sold with no warranty says so, and does not say expired",
+  );
+  assert(sold("2027-06-15").tone === "ok", "T43: a year out is simply covered");
+  assert(
+    sold("2026-07-01").tone === "expiring",
+    "T43: inside a month, the counter is told before being asked",
+  );
+  // Zero is the last covered day, not the first uncovered one — a warranty
+  // "until the 15th" is honoured on the 15th, which is the day the customer
+  // actually turns up.
+  assert(sold(TODAY).tone === "expiring", "T43: the last day is still a covered day");
+  assert(sold(TODAY).label === "Warranty ends today", "T43: and is said in those words");
+  assert(sold("2026-06-14").tone === "expired", "T43: the day after is not");
+  assert(
+    sold("2026-06-14").label.includes("1 day ago"),
+    `T43: singular when it is one day — "${sold("2026-06-14").label}"`,
+  );
+  assert(
+    sold("2026-06-13").label.includes("2 days ago"),
+    "T43: plural when it is more, because it will be read out loud",
+  );
+
+  assert(
+    vendorClaimState({ vendorWarrantyEnd: "2026-12-01" } as Serial, TODAY).tone === "ok",
+    "T43: the shop's own claim window is answered separately from the customer's",
+  );
+  assert(
+    vendorClaimState({ vendorWarrantyEnd: "2026-01-01" } as Serial, TODAY).tone === "expired",
+    "T43: a closed vendor window is the half that quietly costs money",
+  );
+  assert(
+    vendorClaimState({} as Serial, TODAY).tone === "none",
+    "T43: and an unrecorded one is not silently treated as open",
+  );
+}
+
+/* ═══ TEST 44: a sale return takes named units back ═════════════════════
+   The unit really was sold to that customer and really did come back. Both
+   halves are the record — erasing the first is what makes a return
+   impossible to undo correctly. */
+{
+  const item = { id: "T", trackSerials: true } as unknown as Item;
+  const itemOf = (id: string) => (id === "T" ? item : undefined);
+  const ret = {
+    id: "CR1",
+    date: "2026-06-10",
+    lineItems: [{ itemId: "T", serialIds: ["s1", "s2"] }],
+  } as unknown as Return;
+
+  const p = planSaleReturnSerials(ret, null, itemOf);
+  assert(p.update.length === 2, "T44: every unit named on the note moves");
+  const patch = p.update[0].patch as Record<string, unknown>;
+  assert(patch.status === "in_stock", "T44: a returned unit goes back on the shelf");
+  assert(patch.returnId === "CR1", "T44: stamped with the note that brought it back");
+  assert(patch.returnDate === "2026-06-10", "T44: and when");
+  // The sale must survive: it is the trail, and it is what undoing this
+  // return puts back. A patch that MENTIONED these keys would clear them,
+  // because a full set() strips undefined.
+  assert(
+    !Object.prototype.hasOwnProperty.call(patch, "customerName"),
+    "T44: the customer who had it is not erased — the return is not a denial of the sale",
+  );
+  assert(
+    !Object.prototype.hasOwnProperty.call(patch, "saleId"),
+    "T44: nor which bill it went out on",
+  );
+
+  // A warranty failure is the commonest sale return there is.
+  const faulty = planSaleReturnSerials({ ...ret, unitsDamaged: true }, null, itemOf);
+  assert(
+    (faulty.update[0].patch as Record<string, unknown>).status === "damaged",
+    "T44: a faulty unit is marked damaged, not put back on the sellable shelf",
+  );
+
+  // Taken off the note before saving: it did not come back after all.
+  const edited = planSaleReturnSerials(
+    { ...ret, lineItems: [{ itemId: "T", serialIds: ["s1"] }] } as unknown as Return,
+    ret,
+    itemOf,
+  );
+  assert(edited.release.length === 1, "T44: a unit removed from the note is put back as it was");
+  const rel = edited.release[0].patch as Record<string, unknown>;
+  assert(rel.status === "sold", "T44: which means it is with the customer again");
+  assert(
+    Object.prototype.hasOwnProperty.call(rel, "returnId") && rel.returnId === undefined,
+    "T44: and the note is cleared explicitly, not merely left unmentioned",
+  );
+
+  const plain = { ...ret, lineItems: [{ itemId: "OTHER", serialIds: ["x"] }] } as unknown as Return;
+  assert(
+    planSaleReturnSerials(plain, null, itemOf).update.length === 0,
+    "T44: an item that is not serialised moves nothing, whatever is on the line",
+  );
+}
+
+/* ═══ TEST 45: a purchase return sends named units back to the vendor ═══
+   These leave for good, which is why they stop counting as stock without
+   being deleted — the shop still has to say where a unit went. */
+{
+  const item = { id: "T", trackSerials: true } as unknown as Item;
+  const itemOf = (id: string) => (id === "T" ? item : undefined);
+  const ret = {
+    id: "DR1",
+    date: "2026-06-11",
+    lineItems: [{ itemId: "T", serialIds: ["s1"] }],
+  } as unknown as Return;
+
+  const p = planPurchaseReturnSerials(ret, null, itemOf);
+  const patch = p.update[0].patch as Record<string, unknown>;
+  assert(patch.status === "returned_to_vendor", "T45: the unit goes back to the vendor");
+  assert(patch.returnId === "DR1", "T45: stamped with the note that sent it");
+  assert(
+    !Object.prototype.hasOwnProperty.call(patch, "purchaseId"),
+    "T45: and keeps where it came from, which is the whole point of the record",
+  );
+
+  const edited = planPurchaseReturnSerials(
+    { ...ret, lineItems: [] } as unknown as Return,
+    ret,
+    itemOf,
+  );
+  assert(
+    (edited.release[0].patch as Record<string, unknown>).status === "in_stock",
+    "T45: a unit taken off the note never left the shop",
+  );
+}
+
+/* ═══ TEST 46: undoing a return clears the note as well as the status ═══
+   A status put back while the note id stayed would leave a unit claiming to
+   have been returned by a document that no longer counts. */
+{
+  const item = { id: "T", trackSerials: true } as unknown as Item;
+  const itemOf = (id: string) => (id === "T" ? item : undefined);
+  const doc = { lineItems: [{ itemId: "T", serialIds: ["s1"] }] };
+
+  for (const kind of ["sale-return", "purchase-return"] as const) {
+    const patch = undoSerialsOf(doc, kind, itemOf)[0].patch as Record<string, unknown>;
+    assert(
+      Object.prototype.hasOwnProperty.call(patch, "returnId") && patch.returnId === undefined,
+      `T46: cancelling a ${kind} clears the note off the unit explicitly`,
+    );
+    assert(
+      Object.prototype.hasOwnProperty.call(patch, "returnDate") && patch.returnDate === undefined,
+      `T46: including the date, so nothing is left half-set on a ${kind}`,
+    );
+  }
+}
+
+/* ═══ TEST 47: does the unit list still agree with the documents? ═══════
+   A serial's status is not derived, it is MOVED, one document at a time. Miss
+   a move and nothing else in the app notices — the shelf count comes from the
+   units, so the shop keeps trading on a figure that has quietly stopped being
+   true. This is the only thing looking. */
+{
+  const items = [
+    { id: "A", name: "Apple 20W Adapter", trackSerials: true },
+    { id: "P", name: "USB Cable" },
+  ] as unknown as Item[];
+  const base = {
+    items,
+    sales: [] as Invoice[],
+    purchases: [] as Invoice[],
+    saleReturns: [] as Return[],
+    purchaseReturns: [] as Return[],
+  };
+  const unit = (over: Record<string, unknown>) =>
+    ({ id: "u1", itemId: "A", serial: "SN1", status: "in_stock", ...over }) as unknown as Serial;
+  const bill = (number: string, serialIds: string[], qty = serialIds.length) =>
+    ({ number, lineItems: [{ itemId: "A", qty, serialIds }] }) as unknown as Invoice;
+
+  // Nothing wrong: a sold unit with a bill that sold it.
+  const clean = checkSerialIntegrity({
+    ...base,
+    serials: [unit({ status: "sold" })],
+    sales: [bill("INV-1", ["u1"])],
+  });
+  assert(
+    clean.issues.length === 0,
+    `T47: a shop in order reports nothing — ${JSON.stringify(clean.issues)}`,
+  );
+  assert(clean.checked === 1, "T47: and says how many units it actually looked at");
+
+  // The move that got missed: the bill is gone, the unit still says sold.
+  const ghost = checkSerialIntegrity({ ...base, serials: [unit({ status: "sold" })] });
+  assert(ghost.issues[0]?.kind === "sold-but-no-bill", "T47: a unit sold by nothing is found");
+  assert(
+    // ?? "": a bare .message here throws when the array is empty, which
+    // kills the run and reports NOTHING instead of failing this one line.
+    (ghost.issues[0]?.message ?? "").includes("one short"),
+    "T47: and says which way the shelf count is wrong, because that is the consequence",
+  );
+
+  // The opposite: counted on the shelf while a live bill still holds it.
+  const over = checkSerialIntegrity({
+    ...base,
+    serials: [unit({ status: "in_stock" })],
+    sales: [bill("INV-2", ["u1"])],
+  });
+  assert(
+    over.issues[0]?.kind === "in-stock-but-still-sold",
+    "T47: a unit on the shelf that a live bill sold is found",
+  );
+  assert(
+    (over.issues[0]?.message ?? "").includes("INV-2"),
+    "T47: naming the bill, so it can be looked at",
+  );
+
+  // Sold, then returned. Back on the shelf WITH the sale still named on it —
+  // that is the design, and it must not be reported as a fault.
+  const returned = checkSerialIntegrity({
+    ...base,
+    serials: [unit({ status: "in_stock" })],
+    sales: [bill("INV-3", ["u1"])],
+    saleReturns: [
+      {
+        number: "CR-1",
+        lineItems: [{ itemId: "A", qty: 1, serialIds: ["u1"] }],
+      } as unknown as Return,
+    ],
+  });
+  assert(
+    returned.issues.length === 0,
+    `T47: a returned unit is back on the shelf legitimately, not a fault — ${JSON.stringify(returned.issues)}`,
+  );
+
+  // The same unit on two live bills.
+  const twice = checkSerialIntegrity({
+    ...base,
+    serials: [unit({ status: "sold" })],
+    sales: [bill("INV-4", ["u1"]), bill("INV-5", ["u1"])],
+  });
+  assert(
+    twice.issues.some((i) => i.kind === "on-two-bills"),
+    "T47: one unit sold on two bills is found",
+  );
+
+  // A line that names SOME of its units. The form cannot produce this; a
+  // console edit or a bug can, and it is exactly what nothing else catches.
+  const half = checkSerialIntegrity({
+    ...base,
+    serials: [unit({ status: "sold" })],
+    sales: [bill("INV-6", ["u1"], 3)],
+  });
+  assert(
+    half.issues.some((i) => i.kind === "line-count-mismatch"),
+    "T47: a line crediting three units while naming one is found",
+  );
+
+  // Naming NONE is the legacy case — the item was switched on after the bill
+  // was written, and there is no way to invent units for it afterwards.
+  const legacy = checkSerialIntegrity({
+    ...base,
+    serials: [],
+    sales: [bill("INV-7", [], 3)],
+  });
+  assert(
+    legacy.issues.length === 0,
+    `T47: a bill written before the item was tracked is not a fault — ${JSON.stringify(legacy.issues)}`,
+  );
+  assert(
+    legacy.untrackedLines === 1,
+    "T47: but it is counted, because 'is my history complete' is a fair question",
+  );
+
+  // An ordinary item's line is not checked at all, whatever is on it.
+  const plain = checkSerialIntegrity({
+    ...base,
+    serials: [],
+    sales: [
+      {
+        number: "INV-8",
+        lineItems: [{ itemId: "P", qty: 5, serialIds: [] }],
+      } as unknown as Invoice,
+    ],
+  });
+  assert(
+    plain.issues.length === 0 && plain.untrackedLines === 0,
+    "T47: an item that is not tracked by serial is none of this check's business",
+  );
+
+  // Two units of the same item with the same number: one is a mis-scan.
+  const dupe = checkSerialIntegrity({
+    ...base,
+    serials: [unit({ id: "u1" }), unit({ id: "u2", serial: "sn1 " })],
+  });
+  assert(
+    dupe.issues.some((i) => i.kind === "duplicate-serial"),
+    "T47: the same number twice on one item is found, ignoring case and space",
+  );
+
+  // …but the SAME string on a DIFFERENT item is legitimate: two makers can
+  // stamp the same thing, which is why uniqueness was never global.
+  const shared = checkSerialIntegrity({
+    ...base,
+    items: [...items, { id: "B", name: "Other Adapter", trackSerials: true }] as unknown as Item[],
+    serials: [unit({ id: "u1" }), unit({ id: "u2", itemId: "B" })],
+  });
+  assert(
+    !shared.issues.some((i) => i.kind === "duplicate-serial"),
+    "T47: and the same number on two different items is not a fault",
+  );
+
+  /* Item "AB" + serial "1" and item "A" + serial "B1" both read "AB1" if the
+     two are simply glued together. Neither is a duplicate of the other, and
+     an undelimited key would call them one — which is precisely the bug a
+     stray byte in the separator produced once. */
+  const glued = checkSerialIntegrity({
+    ...base,
+    items: [
+      { id: "AB", name: "First", trackSerials: true },
+      { id: "A", name: "Second", trackSerials: true },
+    ] as unknown as Item[],
+    serials: [
+      unit({ id: "g1", itemId: "AB", serial: "1" }),
+      unit({ id: "g2", itemId: "A", serial: "B1" }),
+    ],
+  });
+  assert(
+    !glued.issues.some((i) => i.kind === "duplicate-serial"),
+    "T47: the item and the number are kept apart, so two units cannot collide by running together",
+  );
+
+  const orphan = checkSerialIntegrity({ ...base, serials: [unit({ itemId: "GONE" })] });
+  assert(orphan.issues[0]?.kind === "unknown-item", "T47: a unit of a deleted item is found");
+
+  const vendor = checkSerialIntegrity({
+    ...base,
+    serials: [unit({ status: "returned_to_vendor" })],
+  });
+  assert(
+    vendor.issues[0]?.kind === "returned-but-no-note",
+    "T47: a unit sent back with no debit note behind it is found",
+  );
+}
+
+/* ═══ TEST 48: a named unit is costed at what THAT unit cost ════════════
+   An ordinary item can only be costed on an average: twelve identical cables
+   arrived at three prices and nobody can say which one left. A serialised
+   item has no such excuse — the unit that went is named on the bill, and what
+   it cost was stamped on it the day it arrived. */
+{
+  const costs = serialCostIndex([
+    { id: "s1", cost: 1000 },
+    // 1500, not 1400: at 1400 the exact sum (2400) equals 2 x the 1200
+    // snapshot, and every assertion below would pass on either basis.
+    { id: "s2", cost: 1500 },
+    { id: "s3" },
+  ] as unknown as Serial[]);
+  assert(costs.size === 2, "T48: a unit with no recorded cost is not a unit costing zero");
+
+  const fallback = () => 1200;
+
+  const exact = lineCostBasis(
+    { itemId: "A", qty: 2, costPrice: 1200, serialIds: ["s1", "s2"] },
+    costs,
+    fallback,
+  );
+  assert(exact.exact, "T48: a line whose units are all costed is costed exactly");
+  assert(
+    exact.amount === 2500,
+    `T48: at the sum of what those two units cost, not 2 x the average of 2400 — ${exact.amount}`,
+  );
+
+  // One basis per line, never a mixture: a half-exact figure is neither, and
+  // nobody could later say which lines it applied to.
+  const partial = lineCostBasis(
+    { itemId: "A", qty: 2, costPrice: 1200, serialIds: ["s1", "s3"] },
+    costs,
+    fallback,
+  );
+  assert(!partial.exact, "T48: one uncosted unit drops the WHOLE line back to the snapshot");
+  assert(partial.amount === 2400, `T48: which is qty x the snapshot — ${partial.amount}`);
+
+  const plain = lineCostBasis({ itemId: "A", qty: 3, costPrice: 100 }, costs, fallback);
+  assert(
+    !plain.exact && plain.amount === 300,
+    "T48: a line that names no units is costed the way it always was",
+  );
+
+  const legacy = lineCostBasis({ itemId: "A", qty: 2 }, costs, fallback);
+  assert(
+    legacy.amount === 2400,
+    "T48: and one saved before costPrice existed falls back to the item's price",
+  );
+}
+
+/* ═══ TEST 49: the ledger and the P&L must cost goods the same way ══════
+   Reports → Ledger Reconciliation compares these two directly. If one moves
+   to exact serial costing and the other does not, the difference is not
+   rounding — it is a permanent gap the size of the shop's entire
+   serial-tracked margin, reported forever as a fault that cannot be fixed. */
+{
+  const items = [
+    { id: "A", name: "Adapter", trackSerials: true, purchasePrice: 1200, salePrice: 1900 },
+  ] as unknown as Item[];
+  const serials = [
+    { id: "s1", itemId: "A", serial: "X1", status: "sold", cost: 1000 },
+    { id: "s2", itemId: "A", serial: "X2", status: "sold", cost: 1500 },
+  ] as unknown as Serial[];
+  const sale = {
+    id: "S1",
+    number: "INV-1",
+    date: "2026-06-01",
+    partyId: "P1",
+    partyName: "A Customer",
+    gstEnabled: false,
+    lineItems: [
+      {
+        id: "L1",
+        itemId: "A",
+        name: "Adapter",
+        unit: "pcs",
+        qty: 2,
+        price: 1900,
+        discountPct: 0,
+        gstRate: 0,
+        costPrice: 1200,
+        amount: 3800,
+        serialIds: ["s1", "s2"],
+      },
+    ],
+    subtotal: 3800,
+    discount: 0,
+    shippingCharge: 0,
+    taxAmount: 0,
+    total: 3800,
+    paid: 3800,
+    paymentMode: "cash",
+    createdAt: "2026-06-01T09:00:00Z",
+  } as unknown as Invoice;
+
+  const appCogs = computeCogs([sale], [], items, serials);
+  assert(
+    appCogs === 2500,
+    `T49: the P&L costs the two named units at 1000 + 1500, not 2 x 1200 — ${appCogs}`,
+  );
+
+  const book = {
+    parties: [],
+    items,
+    banks: [],
+    sales: [sale],
+    purchases: [],
+    saleReturns: [],
+    purchaseReturns: [],
+    payments: [],
+    expenses: [],
+    cashAdjustments: [],
+    bankTxns: [],
+    stockAdjustments: [],
+    serials,
+  } as unknown as Book;
+  const entries = buildJournal(book);
+  const cogsPostings = entries
+    .flatMap((e) => e.lines)
+    .filter((l) => l.accountId === "cogs")
+    .reduce((s, l) => s + (l.debit ?? 0) - (l.credit ?? 0), 0);
+  assert(
+    Math.abs(cogsPostings - 2500) < 0.005,
+    `T49: and the posting ledger charges the identical figure — ${cogsPostings}`,
+  );
+  assert(
+    Math.abs(cogsPostings - appCogs) < 0.005,
+    "T49: the two bases agree, which is the only reason reconciliation can compare them",
+  );
+
+  // A sale return gives the same units back at the same cost, so a bill
+  // returned in full leaves no profit and no COGS behind it.
+  const ret = {
+    id: "R1",
+    number: "CR-1",
+    date: "2026-06-02",
+    partyId: "P1",
+    partyName: "A Customer",
+    gstEnabled: false,
+    lineItems: [
+      {
+        id: "RL1",
+        itemId: "A",
+        name: "Adapter",
+        unit: "pcs",
+        qty: 2,
+        price: 1900,
+        discountPct: 0,
+        gstRate: 0,
+        costPrice: 1200,
+        amount: 3800,
+        serialIds: ["s1", "s2"],
+      },
+    ],
+    subtotal: 3800,
+    taxAmount: 0,
+    total: 3800,
+    createdAt: "2026-06-02T09:00:00Z",
+  } as unknown as Return;
+  assert(
+    computeCogs([sale], [ret], items, serials) === 0,
+    "T49: a bill returned in full costs nothing, on the same exact basis both ways",
+  );
+
+  /* And the screen that actually compares them agrees. This is the assertion
+     that matters: reconcile() is what the shop opens to decide whether to
+     trust the ledger, and a basis mismatch would show there as a red row it
+     could never clear — the gap is structural, not a data error. */
+  const recon = reconcile(book);
+  const profitRow = recon.rows.find((r) => /profit/i.test(r.label));
+  assert(!!profitRow, "T49: reconciliation has a profit row to compare at all");
+  assert(
+    Math.abs(profitRow?.diff ?? 1) < 0.02,
+    `T49: and it reports no gap for a book of serial-tracked sales — ${JSON.stringify(profitRow)}`,
+  );
+}
+
+/* ═══ TEST 50: units cannot follow a line to a different item ═══════════
+   Changing the item on a line keeps its quantity and discount, which is the
+   point of the feature. Its SERIALS are the one thing that cannot come with
+   it: a serial belongs to the item it was stamped on, so carrying them over
+   would mark units of one item as sold on a line for another and leave the
+   shelf count for both wrong from that moment.
+
+   Asserted on the library the save path uses, because that is what turns a
+   stale id into a written record. */
+{
+  const adapter = { id: "A", name: "Adapter", trackSerials: true } as unknown as Item;
+  const cable = { id: "C", name: "Cable" } as unknown as Item;
+  const itemOf = (id: string) => (id === "A" ? adapter : id === "C" ? cable : undefined);
+
+  // A line that still carried the adapter's units after being changed to the
+  // cable: the cable is not serialised, so nothing should move at all.
+  const stale = {
+    id: "S1",
+    date: "2026-06-01",
+    partyId: "P",
+    partyName: "X",
+    lineItems: [{ itemId: "C", qty: 1, serialIds: ["u1"] }],
+  } as unknown as Invoice;
+  assert(
+    planSaleSerials(stale, null, itemOf).update.length === 0,
+    "T50: a line whose item is not serialised moves no units, whatever ids are stuck to it",
+  );
+
+  // And the reverse: ids belonging to the OLD item on a line that is now a
+  // serialised one is exactly the corruption the form must not produce.
+  const wrong = {
+    ...stale,
+    lineItems: [{ itemId: "A", qty: 1, serialIds: ["u-belongs-to-cable"] }],
+  } as unknown as Invoice;
+  assert(
+    planSaleSerials(wrong, null, itemOf).update[0]?.id === "u-belongs-to-cable",
+    "T50: which is why the FORM clears them on a change rather than the plan guessing",
   );
 }
 

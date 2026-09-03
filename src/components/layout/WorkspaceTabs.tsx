@@ -19,6 +19,7 @@ import {
   FileText,
   Settings,
   type LucideIcon,
+  ScanLine,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
@@ -166,6 +167,7 @@ function titleFromPath(path: string): string | null {
     "/expenses": "Expenses",
     "/payments": "Payments",
     "/inventory": "Inventory",
+    "/serials": "Serial Lookup",
     "/bank": "Bank",
     "/cash": "Cash",
     "/reports": "Reports",
@@ -185,6 +187,7 @@ const ICON_BY_SEGMENT: Record<string, LucideIcon> = {
   parties: Users,
   items: Package,
   inventory: Boxes,
+  serials: ScanLine,
   sales: ShoppingCart,
   purchase: Truck,
   "sale-return": CornerDownLeft,

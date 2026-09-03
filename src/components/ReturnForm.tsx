@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { stockOf } from "@/lib/serials";
 import { createPortal } from "react-dom";
 import { useNavigate } from "@tanstack/react-router";
 import { Button } from "@/components/ui/button";
@@ -12,10 +13,14 @@ import {
   nextInvoiceNumber,
   SalesRepo,
   PurchaseRepo,
+  SerialRepo,
 } from "@/repositories";
 import type { Return, LineItem, Party, Item, Invoice } from "@/types";
 import { fmtMoney, today } from "@/lib/format";
 import { toast } from "sonner";
+import { SerialEntry } from "@/components/SerialEntry";
+import { isSerialised, serialShortfalls, serialIdsOn } from "@/lib/serials";
+import { planSaleReturnSerials, planPurchaseReturnSerials } from "@/lib/serialMoves";
 import { Trash2, UserPlus, Save, X, CornerDownLeft, CornerUpLeft, Loader2 } from "lucide-react";
 import { genId, newBatch, commitBatch } from "@/repositories/base";
 import { stepBackOnBackspace, useEscapeToLeave } from "@/hooks/useFormKeys";
@@ -145,7 +150,11 @@ export function ReturnForm({ mode }: Props) {
   const showDiscCol = sawLineDiscount.current;
 
   const loadFromInvoice = (inv: Invoice) => {
-    const lines = inv.lineItems.map((l) => ({ ...l, id: genId() }));
+    /* serialIds are deliberately NOT carried over. The bill says which units
+       went out; only the counter can say which came back, and copying them
+       would pre-fill an answer nobody checked — on the commonest return of
+       all, where one unit of several has failed. */
+    const lines = inv.lineItems.map(({ serialIds: _drop, ...l }) => ({ ...l, id: genId() }));
     const gst = inv.gstEnabled !== false;
     setRet({
       ...ret,
@@ -164,6 +173,18 @@ export function ReturnForm({ mode }: Props) {
       `Loaded ${lines.length} item${lines.length > 1 ? "s" : ""} from ${inv.number} — remove items or adjust qty to what actually came back`,
     );
   };
+
+  /* The bill this note is raised against, when there is one. A credit note
+     against INV-1 that takes back a unit sold on INV-9 corrupts both, so the
+     units it will accept are capped at what that bill actually moved. */
+  const hasSerialLine = ret.lineItems.some((l) => ItemRepo.get(l.itemId)?.trackSerials);
+
+  const linkedInvoice = useMemo(() => {
+    const ref = (ret.originalRef ?? "").trim();
+    if (!ref) return null;
+    return invoiceRepo.all().find((i) => i.number.trim() === ref) ?? null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ret.originalRef, _repoV]);
 
   const partySuggests = useMemo(() => {
     // Archived parties are hidden from the picker; `allParties` stays full for
@@ -298,6 +319,9 @@ export function ReturnForm({ mode }: Props) {
 
     const finalRet: Return = {
       ...ret,
+      // See InvoiceForm: the units are stamped with this id below, and
+      // addBatched would not mint one until after that.
+      id: ret.id || genId(),
       number: (ret.number ?? "").trim(),
       partyId,
       partyName,
@@ -309,7 +333,22 @@ export function ReturnForm({ mode }: Props) {
     const stockDelta = isSaleReturn ? 1 : -1;
     for (const l of finalRet.lineItems) {
       const it = ItemRepo.get(l.itemId);
-      if (it) ItemRepo.adjustFieldBatched(batch, it.id, "stock", stockDelta * l.qty);
+      // A serialised item's stock is the count of its units, moved just
+      // below. Nudging the stored number too would leave a second figure
+      // that nothing reads and somebody eventually believes.
+      if (it && !it.trackSerials) {
+        ItemRepo.adjustFieldBatched(batch, it.id, "stock", stockDelta * l.qty);
+      }
+    }
+
+    /* Returns are created, never edited (see save()), so there is no previous
+       version to reconcile against — the plan's release list is always empty
+       here, and passing null says that rather than leaving it to be guessed. */
+    const plan = isSaleReturn
+      ? planSaleReturnSerials(finalRet, null, (id) => ItemRepo.get(id))
+      : planPurchaseReturnSerials(finalRet, null, (id) => ItemRepo.get(id));
+    for (const u of [...plan.update, ...plan.release]) {
+      SerialRepo.updateBatched(batch, u.id, u.patch as never);
     }
 
     repo.addBatched(batch, finalRet);
@@ -334,6 +373,15 @@ export function ReturnForm({ mode }: Props) {
       );
       return;
     }
+    /* The same rule as a bill: the units named must equal the quantity.
+       Without it a note could credit three adapters while moving one, and the
+       shelf count and the unit list would disagree from that moment on. */
+    const short = serialShortfalls(ret.lineItems, (id) => ItemRepo.get(id));
+    if (short.length) {
+      toast.error(`Scan the units that came back — ${short.join("; ")}`, { duration: 9000 });
+      return;
+    }
+
     const partyId = ret.partyId;
     const partyName = ret.partyName || partyQ.trim();
     if (!partyId && !partyName) {
@@ -722,6 +770,41 @@ export function ReturnForm({ mode }: Props) {
                     </td>
                   </tr>
                 ))}
+                {/* Serial rows, one under each line that needs them —
+                    matching the bill grid, and a separate pass for the same
+                    reason: two rows per line inside one map makes the keying
+                    and the hover striping fight each other. */}
+                {ret.lineItems.flatMap((l) => {
+                  const it = ItemRepo.get(l.itemId);
+                  if (!isSerialised(it) || !it) return [];
+                  return [
+                    <tr key={`${l.id}-serials`} className="border-t-0">
+                      <td />
+                      <td colSpan={99} className="px-3 pb-2">
+                        <SerialEntry
+                          item={it}
+                          // A sale return takes units back FROM a customer, so
+                          // each must currently be sold. A purchase return
+                          // sends them out to the vendor, so each must be in
+                          // stock — the opposite test, same scanner.
+                          mode={isSaleReturn ? "taking_back" : "issuing"}
+                          qty={l.qty}
+                          value={l.serialIds ?? []}
+                          onChange={(ids) => updateLine(l.id, { serialIds: ids })}
+                          usedElsewhere={serialIdsOn(ret.lineItems.filter((x) => x.id !== l.id))}
+                          restrictTo={
+                            linkedInvoice
+                              ? {
+                                  ids: serialIdsOn(linkedInvoice.lineItems),
+                                  label: linkedInvoice.number,
+                                }
+                              : undefined
+                          }
+                        />
+                      </td>
+                    </tr>,
+                  ];
+                })}
                 <ReturnItemSearchRow items={items} onAdd={addLineItem} gstOn={gstOn} />
               </tbody>
             </table>
@@ -761,6 +844,26 @@ export function ReturnForm({ mode }: Props) {
             <p className="text-[10px] text-muted-foreground pt-1">
               Stock will be {isSaleReturn ? "increased" : "decreased"} on save
             </p>
+            {/* Only offered when it can actually apply. A warranty failure is
+                the commonest sale return there is, and the default — back on
+                the shelf — would hand the broken unit to the next customer. */}
+            {isSaleReturn && hasSerialLine && (
+              <label className="flex items-start gap-2 pt-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={!!ret.unitsDamaged}
+                  onChange={(e) => setRet({ ...ret, unitsDamaged: e.target.checked })}
+                  className="accent-primary mt-0.5"
+                />
+                <span className="text-[11px] leading-snug">
+                  <span className="font-semibold">These units came back faulty</span>
+                  <span className="text-muted-foreground">
+                    {" "}
+                    — mark them damaged instead of putting them back on the shelf.
+                  </span>
+                </span>
+              </label>
+            )}
           </div>
         </div>
       </div>
@@ -901,6 +1004,7 @@ function ReturnItemSearchRow({
             <div
               style={{
                 position: "fixed",
+                pointerEvents: "auto",
                 top: dropdownRect.top,
                 left: dropdownRect.left,
                 width: dropdownRect.width,
@@ -919,7 +1023,7 @@ function ReturnItemSearchRow({
                   <div>
                     <div className="font-semibold">{it.name}</div>
                     <div className="text-[11px] text-muted-foreground">
-                      Stock: {it.stock} {it.unit}
+                      Stock: {stockOf(it)} {it.unit}
                     </div>
                   </div>
                 </div>

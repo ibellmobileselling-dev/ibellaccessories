@@ -35,6 +35,8 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { usePermissions } from "@/hooks/usePermissions";
 import { VoidDialog, VoidedBadge } from "@/components/VoidDialog";
 import { canDeleteOutright, isVoided, removalWord } from "@/lib/voiding";
+import { SerialRepo } from "@/repositories";
+import { undoSerialsOf, soldSerialsOf } from "@/lib/serialMoves";
 
 export const Route = createFileRoute("/purchase/")({ component: PurchasePage });
 
@@ -158,6 +160,11 @@ function PurchasePage() {
       );
       return;
     }
+    const blocked = blockedBySoldSerials(PurchaseRepo.get(r.id) ?? r);
+    if (blocked) {
+      toast.error(`Cannot remove ${r.number}: ${blocked}`, { duration: 8000 });
+      return;
+    }
     // Anything dated before today is cancelled, not destroyed — its month has
     // already been counted. See lib/voiding.ts.
     if (!canDeleteOutright(r.date)) {
@@ -205,10 +212,27 @@ function PurchasePage() {
    * Shared by delete and void because they owe the shop exactly the same
    * reversals. Two copies of this would drift, and the drift would be silent.
    */
+  /**
+   * Whether these units can be un-received at all.
+   *
+   * A unit in a customer's hands cannot stop having arrived. The shop's
+   * record of where it came from is the only thing that lets them claim a
+   * faulty one back from the vendor, and removing the purchase would destroy
+   * exactly that.
+   */
+  const blockedBySoldSerials = (live: Invoice): string | null => {
+    const sold = soldSerialsOf(live, SerialRepo.all());
+    if (!sold.length) return null;
+    return `${sold.map((s) => s.serial).join(", ")} — already sold to a customer`;
+  };
+
   const undoPurchaseEffects = (batch: ReturnType<typeof newBatch>, live: Invoice) => {
     for (const l of live.lineItems) {
       const it = ItemRepo.get(l.itemId);
-      if (it) ItemRepo.adjustFieldBatched(batch, it.id, "stock", -l.qty);
+      if (it && !it.trackSerials) ItemRepo.adjustFieldBatched(batch, it.id, "stock", -l.qty);
+    }
+    for (const u of undoSerialsOf(live, "purchase", (id) => ItemRepo.get(id))) {
+      SerialRepo.updateBatched(batch, u.id, u.patch as never);
     }
     for (const p of PaymentRepo.all()) {
       if (p.allocations?.some((a) => a.invoiceId === live.id)) {

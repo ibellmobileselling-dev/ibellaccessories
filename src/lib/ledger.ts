@@ -7,7 +7,9 @@ import type {
   PaymentMode,
   CashAdjustment,
   BankTxn,
+  Serial,
 } from "@/types";
+import { serialCostIndex, lineCostBasis } from "@/lib/serialCost";
 
 const r2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -1055,12 +1057,29 @@ export function valueExTax(
   );
 }
 
-/** Cost of goods sold from per-line cost snapshots, falling back to the
- * item's current purchase price for lines saved before costPrice existed. */
-export function computeCogs(sales: Invoice[], saleReturns: Return[], items: Item[]): number {
+/**
+ * Cost of goods sold.
+ *
+ * Each named unit's own cost where a line names units; otherwise the per-line
+ * snapshot, falling back to the item's current purchase price for lines saved
+ * before costPrice existed.
+ *
+ * `serials` is optional so every caller that predates serial tracking keeps
+ * working unchanged — but a caller that HAS units and does not pass them will
+ * cost them on the average while the posting ledger costs them exactly, and
+ * Reports → Ledger Reconciliation compares those two directly. See
+ * lib/serialCost.ts.
+ */
+export function computeCogs(
+  sales: Invoice[],
+  saleReturns: Return[],
+  items: Item[],
+  serials?: Serial[],
+): number {
   const cost = new Map(items.map((i) => [i.id, i.purchasePrice] as const));
-  const lineCost = (l: { itemId: string; qty: number; costPrice?: number }) =>
-    (l.costPrice ?? cost.get(l.itemId) ?? 0) * l.qty;
+  const serialCosts = serialCostIndex(serials);
+  const lineCost = (l: { itemId: string; qty: number; costPrice?: number; serialIds?: string[] }) =>
+    lineCostBasis(l, serialCosts, (id) => cost.get(id) ?? 0).amount;
   const sold = sales.reduce((s, inv) => s + inv.lineItems.reduce((a, l) => a + lineCost(l), 0), 0);
   const returned = saleReturns.reduce(
     (s, ret) => s + ret.lineItems.reduce((a, l) => a + lineCost(l), 0),

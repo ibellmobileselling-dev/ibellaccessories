@@ -16,6 +16,7 @@ import type {
   Company,
   StockAdjustment,
   CashAdjustment,
+  Serial,
   JournalEntryDoc,
   AuditEntry,
   TeamUser,
@@ -34,6 +35,13 @@ export const BankRepo = new Repository<BankAccount>("banks");
 export const BankTxnRepo = new Repository<BankTxn>("bankTxns");
 export const PaymentRepo = new Repository<Payment>("payments");
 export const StockAdjustmentRepo = new Repository<StockAdjustment>("stock-adjustments");
+/**
+ * Individual units of a serialised item. For those items this collection IS
+ * the stock figure, so it is hydrated at login and included in backups like
+ * any other book of record — a backup without it would restore a shop that
+ * knows it has twelve adapters and not which twelve.
+ */
+export const SerialRepo = new Repository<Serial>("serials");
 export const CashAdjustmentRepo = new Repository<CashAdjustment>("cash-adjustments");
 /**
  * Journal entries that no document implies — today, year-end closing entries.
@@ -347,6 +355,7 @@ export const REPO_BY_KEY: Record<string, Repository<{ id: string }>> = {
   "bz.bankTxns": BankTxnRepo as Repository<{ id: string }>,
   "bz.payments": PaymentRepo as Repository<{ id: string }>,
   "bz.stock-adjustments": StockAdjustmentRepo as Repository<{ id: string }>,
+  "bz.serials": SerialRepo as Repository<{ id: string }>,
   "bz.cash-adjustments": CashAdjustmentRepo as Repository<{ id: string }>,
   "bz.ledger-entries": LedgerEntryRepo as Repository<{ id: string }>,
 };
@@ -359,9 +368,29 @@ const ALL_REPOS = Object.values(REPO_BY_KEY);
  * its own; it only aggregates reads across the others, already covered by
  * their own module here). */
 const MODULE_REPOS: Record<ModuleKey, Repository<{ id: string }>[]> = {
-  masterData: [PartyRepo, ItemRepo, StockAdjustmentRepo] as Repository<{ id: string }>[],
-  sales: [SalesRepo, SaleReturnRepo] as Repository<{ id: string }>[],
-  purchaseExpenses: [PurchaseRepo, PurchaseReturnRepo, ExpenseRepo, PayeeRepo] as Repository<{
+  masterData: [PartyRepo, ItemRepo, StockAdjustmentRepo, SerialRepo] as Repository<{
+    id: string;
+  }>[],
+  /* SerialRepo appears under Sales and Purchase as well as Master Data, and
+     has to: billing a serial-tracked item means scanning its units, and the
+     scanner validates against this cache. A user who can sell but has Master
+     Data view off would otherwise be handed an empty cache and told "that is
+     not a unit of this item" for every scan — a refusal that blames the
+     serial for a permissions setting.
+     It also has to, for the app to agree with itself: firestore.rules lets a
+     Sales user WRITE this collection (they mark units sold when a bill
+     saves), so a rule granting a write for data the device never receives
+     was a contradiction, not a restriction.
+     hydrate() is idempotent (it returns early once subscribed), so being
+     listed under several modules costs one listener, not three. */
+  sales: [SalesRepo, SaleReturnRepo, SerialRepo] as Repository<{ id: string }>[],
+  purchaseExpenses: [
+    PurchaseRepo,
+    PurchaseReturnRepo,
+    ExpenseRepo,
+    PayeeRepo,
+    SerialRepo,
+  ] as Repository<{
     id: string;
   }>[],
   cashBank: [BankRepo, BankTxnRepo, PaymentRepo, CashAdjustmentRepo] as Repository<{

@@ -34,6 +34,18 @@ export interface Item {
   wholesalePrice?: number;
   stock: number;
   minStock?: number;
+  /**
+   * Count this item's stock in serial numbers instead of storing a number.
+   *
+   * Off by default and opt-in per item, deliberately: a ₹50 cable must never
+   * ask the counter for a serial, and a feature that slows billing is a
+   * feature staff work around. See lib/serials.ts.
+   */
+  trackSerials?: boolean;
+  /** Warranty given to the customer, in months, when a unit is sold. */
+  warrantyMonths?: number;
+  /** How long the shop can claim a faulty unit back from its vendor. */
+  vendorWarrantyMonths?: number;
   openingStock: number;
   description?: string;
   createdAt: string;
@@ -51,6 +63,14 @@ export interface LineItem {
   amount: number;
   /** Snapshot of the item's purchase price when the line was created — used for stock-based COGS in P&L */
   costPrice?: number;
+  /**
+   * Which physical units this line is, for a serialised item.
+   *
+   * Ids rather than the serial strings themselves, so correcting a mis-scan
+   * moves the line with it. Length must equal `qty` — the document will not
+   * save otherwise, which is the rule that keeps the whole thing honest.
+   */
+  serialIds?: ID[];
   /** Price in the foreign currency, before conversion — only set on
    * international purchases. `price` (INR) is auto-derived from this via
    * the parent Invoice's exchangeRate/carryCostPerUnit, but stays a normal
@@ -145,6 +165,63 @@ export interface BankAccount {
   createdAt: string;
 }
 
+/**
+ * One physical unit of an item, identified by the serial printed on it.
+ *
+ * The shop's warranty to the customer, and its own claim back against the
+ * vendor, are both written against a specific unit — so the unit has to be a
+ * record, not a note on a line. See docs/SERIALS-PLAN.md for why this is a
+ * child of the item rather than an item of its own.
+ *
+ * Voidable, like every other document: a purchase that never really happened
+ * takes its serials out of the count without destroying the record of them.
+ */
+export interface Serial extends Audited, Voidable {
+  id: ID;
+  itemId: ID;
+  /** As printed on the unit. Unique per ITEM, not globally — two makers can
+   *  legitimately stamp the same string. */
+  serial: string;
+
+  /** Only a document moves this. Nothing edits it directly. */
+  status: "in_stock" | "sold" | "returned_to_vendor" | "damaged";
+
+  /** Where it came from. Set on receipt and never changed. */
+  purchaseId?: ID;
+  purchaseDate?: string;
+  vendorId?: ID;
+  vendorName?: string;
+  /** What this specific unit cost — exact profit, not an average. */
+  cost?: number;
+
+  /** Where it went. Cleared when a sale return brings it back. */
+  saleId?: ID;
+  saleDate?: string;
+  customerId?: ID;
+  customerName?: string;
+
+  /** Copied from the item AT SALE TIME, never read live afterwards: changing
+   *  an item's policy must not rewrite a promise already made. */
+  warrantyMonths?: number;
+  warrantyEnd?: string;
+  /** The shop's own claim window against the vendor — the half most software
+   *  leaves out, and where the money is actually lost. */
+  vendorWarrantyEnd?: string;
+
+  /** The credit or debit note that last moved this unit, if one did.
+   *
+   *  A sale return does NOT erase who had the unit — the trail is the point.
+   *  It changes the status, and every reader decides what to show from that:
+   *  a unit back on the shelf has no warranty running and no current holder,
+   *  which is what warrantyState and the screens key off. Keeping the sale
+   *  fields is also what makes undoing a return a single status change with
+   *  nothing to reconstruct. */
+  returnId?: ID;
+  returnDate?: string;
+
+  createdAt: string;
+}
+
 /** Physical stock correction (damage, counting difference, samples…) */
 export interface StockAdjustment {
   id: ID;
@@ -233,6 +310,14 @@ export interface Return extends Voidable {
   number: string;
   date: string;
   originalRef?: string;
+  /** Serial-tracked units on this credit note came back faulty, so they go to
+   *  `damaged` rather than onto the sellable shelf.
+   *
+   *  Without this the commonest sale return there is — a warranty failure —
+   *  would put a broken unit back in stock for the next customer. Per note
+   *  rather than per unit because that is how they arrive: a customer brings
+   *  back the one that stopped working, not a mixed bag. */
+  unitsDamaged?: boolean;
   partyId: ID;
   partyName: string;
   partyPhone?: string;

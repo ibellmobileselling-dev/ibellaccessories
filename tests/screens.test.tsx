@@ -31,8 +31,10 @@ import { PartyDialog } from "@/routes/parties";
 import { DataTable } from "@/components/DataTable";
 import { PrintableInvoice } from "@/components/PrintableInvoice";
 import { PrintableReturn } from "@/components/PrintableReturn";
+import { ThermalReceipt } from "@/components/ThermalReceipt";
 import { fmtMoney, today, ymd } from "@/lib/format";
 import { planStockRepair } from "@/lib/dataRepair";
+import { stockOf } from "@/lib/serials";
 import { useEscapeToLeave } from "@/hooks/useFormKeys";
 import { useAppEscape } from "@/hooks/useGoBack";
 import { useWorkspace } from "@/store/workspace";
@@ -54,6 +56,7 @@ import {
   StockAdjustmentRepo,
   PurchaseReturnRepo,
   CashAdjustmentRepo,
+  SerialRepo,
 } from "@/repositories";
 
 export interface Results {
@@ -324,6 +327,84 @@ function seed() {
     amount: 1000,
     notes: "Counter cash",
   } as never);
+
+  /* A serial-tracked item and three units, each in a state the counter has
+     to be able to tell apart out loud. Warranty dates are relative to the
+     day the suite runs, because a fixed date would quietly become "expired"
+     for every unit some months after it was written and the test would still
+     pass while proving nothing. */
+  ItemRepo.add({
+    id: "I9",
+    createdAt: "2026-01-01T00:00:00Z",
+    name: "Apple 20W Adapter",
+    unit: "pcs",
+    gstRate: 18,
+    purchasePrice: 1200,
+    salePrice: 1900,
+    stock: 0,
+    trackSerials: true,
+    warrantyMonths: 12,
+  } as never);
+  const plusDays = (n: number) => ymd(new Date(Date.now() + n * 86400000));
+  SerialRepo.add({
+    id: "SN1",
+    createdAt: `${D2}T09:00:00Z`,
+    itemId: "I9",
+    serial: "F2LX9K3AAA",
+    status: "sold",
+    purchaseId: "PU1",
+    purchaseDate: D2,
+    vendorName: "Sunrise Supply",
+    cost: 1200,
+    saleId: "S1",
+    saleDate: D3,
+    customerName: "Ramesh Traders",
+    warrantyMonths: 12,
+    warrantyEnd: plusDays(200),
+    vendorWarrantyEnd: plusDays(300),
+  } as never);
+  SerialRepo.add({
+    id: "SN2",
+    createdAt: `${D2}T09:00:00Z`,
+    itemId: "I9",
+    serial: "F2LX9K3BBB",
+    status: "in_stock",
+    purchaseId: "PU1",
+    purchaseDate: D2,
+    vendorName: "Sunrise Supply",
+    cost: 1200,
+    vendorWarrantyEnd: plusDays(300),
+  } as never);
+  SerialRepo.add({
+    id: "SN3",
+    createdAt: `${D2}T09:00:00Z`,
+    itemId: "I9",
+    serial: "QQ7700ZZZ",
+    status: "sold",
+    purchaseId: "PU1",
+    purchaseDate: D2,
+    saleId: "S1",
+    saleDate: D3,
+    customerName: "Ramesh Traders",
+    warrantyMonths: 12,
+    warrantyEnd: plusDays(-40),
+    vendorWarrantyEnd: plusDays(-10),
+  } as never);
+  /* Sold, but on a different bill. A credit note against INV-SER1 must
+     refuse it: crediting a customer for a unit they never bought corrupts
+     both bills at once. */
+  SerialRepo.add({
+    id: "SN4",
+    createdAt: `${D2}T09:00:00Z`,
+    itemId: "I9",
+    serial: "WRONGBILL1",
+    status: "sold",
+    purchaseId: "PU1",
+    purchaseDate: D2,
+    saleId: "S1",
+    saleDate: D3,
+    customerName: "Ramesh Traders",
+  } as never);
 }
 
 let host: HTMLDivElement | null = null;
@@ -543,12 +624,111 @@ async function runAll(): Promise<Results> {
   has(ownerSettings, "Check Calculations", "settings (owner): the recalculation action");
   has(ownerSettings, "Team", "settings (owner): team section");
 
+  /* ── Serial Lookup: the counter's three questions ─────────────────────
+     Somebody is standing there holding an adapter. Is it ours, is it still
+     covered, and can we still claim it back from the vendor. */
+  {
+    await renderRoute("/serials");
+    const box = () => document.querySelector('input[placeholder^="Scan"]') as HTMLInputElement;
+    const lookUp = async (text: string) => {
+      setInput(box(), text);
+      const btn = Array.from(document.querySelectorAll("button")).find(
+        (b) => b.textContent?.trim() === "Look up",
+      );
+      assert(!!btn, "serial lookup: the Look up button is on screen");
+      await act(async () => {
+        btn!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      return readMounted();
+    };
+
+    const before = host?.textContent ?? "";
+    assert(
+      !before.includes("F2LX9K3AAA"),
+      "serial lookup: nothing is listed until something is actually looked up",
+    );
+    // An empty box is not a failed search. Rendering "no unit matches" before
+    // anyone has typed reads as "we do not have it" and is how a counter
+    // turns a customer away for a unit that is sitting on the shelf.
+    has(before, "Nothing looked up yet", "serial lookup: an untouched box invites a scan");
+    assert(
+      !before.includes("No unit matches"),
+      "serial lookup: and does not report a failed search nobody ran",
+    );
+
+    const sold = await lookUp("f2lx9k3aaa");
+    has(sold, "F2LX9K3AAA", "serial lookup: the unit is found from a lower-case scan");
+    has(sold, "Apple 20W Adapter", "serial lookup: and says which item it is");
+    has(sold, "Under warranty", "serial lookup: the answer the customer came for");
+    has(sold, "Ramesh Traders", "serial lookup: who bought it, for a warranty claim");
+    has(sold, "Sunrise Supply", "serial lookup: and who it was bought from");
+    has(sold, "Claimable from vendor", "serial lookup: the shop's own claim window, separately");
+    assert(
+      !sold.includes("F2LX9K3BBB"),
+      "serial lookup: an exact match does not also list its shelf-mates",
+    );
+
+    const expired = await lookUp("QQ7700ZZZ");
+    has(expired, "Warranty ended", "serial lookup: an expired warranty says so plainly");
+    has(expired, "40 days ago", "serial lookup: and says how long ago, so nobody has to count");
+    has(expired, "Vendor claim closed", "serial lookup: the vendor window closed too");
+
+    const shelf = await lookUp("F2LX9K3BBB");
+    has(shelf, "In stock", "serial lookup: an unsold unit is on the shelf");
+    has(shelf, "Not sold", "serial lookup: with no warranty running against it");
+    has(shelf, "Still on the shelf", "serial lookup: and nowhere it went");
+
+    // Read out down a phone line: the tail is all anyone can give you.
+    const partial = await lookUp("9K3AAA");
+    has(partial, "F2LX9K3AAA", "serial lookup: the last characters find the unit");
+    const tail = await lookUp("K3");
+    has(tail, "No unit matches", "serial lookup: two characters is too loose to answer");
+    has(tail, "at least 3", "serial lookup: and it says what to do instead");
+
+    const missing = await lookUp("NOSUCHUNIT");
+    has(missing, "No unit matches", "serial lookup: an unknown serial is not silently empty");
+    has(
+      missing,
+      "never received here",
+      "serial lookup: with the two reasons it can happen, so it is not a dead end",
+    );
+  }
+
+  /* ── The item page's Units panel ──────────────────────────────────────
+     The owner's question is the other way round from the counter's: not
+     "where is this unit" but "which units do I still have". */
+  {
+    const page = await renderRoute("/items/I9");
+    has(page, "Units", "item units: the panel is on a serialised item's page");
+    has(page, "F2LX9K3AAA", "item units: every unit is listed, not just the unsold ones");
+    has(page, "F2LX9K3BBB", "item units: including one still on the shelf");
+    has(page, "1 on the shelf", "item units: the shelf count is stated, not left to be counted");
+    has(page, "4 ever received", "item units: alongside how many ever came in");
+    has(page, "Ramesh Traders", "item units: who each sold unit went to");
+    has(page, "Warranty ended", "item units: and which have fallen out of warranty");
+
+    // The stock figure above the panel is COUNTED from this list, not stored
+    // — I9 was seeded with stock: 0 precisely so a stored number would show.
+    has(
+      page,
+      "1 pcs",
+      "item units: current stock is counted from the units, not read from the record",
+    );
+
+    const plain = await renderRoute("/items/I1");
+    assert(
+      !plain.includes("ever received"),
+      "item units: an ordinary item gets no units panel, because it has none",
+    );
+  }
+
   /* ── Every remaining screen must render real content, not blow up ───── */
   const pages: [string, string][] = [
     ["/", "Total Receivable"],
     ["/parties", "Ramesh Traders"],
     ["/items", "USB Cable"],
     ["/inventory", "USB Cable"],
+    ["/serials", "Serial Lookup"],
     ["/sales", "INV-0001"],
     ["/purchase", "PUR-0001"],
     ["/sale-return", "CR-0001"],
@@ -894,6 +1074,134 @@ async function runAll(): Promise<Results> {
     }
     gridRoot.unmount();
     gridHost.remove();
+  }
+
+  /* ── The customer's copy has to name the units ────────────────────────
+     The shop can always look a unit up. The customer cannot — so when they
+     come back in eight months holding an adapter and a piece of paper, the
+     paper has to say which unit it was, or the claim comes down to whether
+     the counter believes them. */
+  {
+    const printHost = document.createElement("div");
+    document.body.appendChild(printHost);
+    const printRoot = createRoot(printHost);
+
+    const serialLine = {
+      id: "SL1",
+      itemId: "I9",
+      name: "Apple 20W Adapter",
+      unit: "pcs",
+      qty: 2,
+      price: 1900,
+      discountPct: 0,
+      gstRate: 0,
+      amount: 3800,
+      serialIds: ["SN1", "SN3"],
+    };
+    const doc = (over: Record<string, unknown> = {}) =>
+      ({
+        id: "PRN1",
+        number: "INV-PRN1",
+        date: D4,
+        partyId: "P1",
+        partyName: "Ramesh Traders",
+        gstEnabled: false,
+        lineItems: [serialLine],
+        subtotal: 3800,
+        discount: 0,
+        shippingCharge: 0,
+        taxAmount: 0,
+        total: 3800,
+        paid: 3800,
+        paymentMode: "cash",
+        createdAt: `${D4}T09:00:00Z`,
+        ...over,
+      }) as never;
+
+    const render = async (el: ReactNode) => {
+      await act(async () => {
+        printRoot.render(el);
+      });
+      return printHost.textContent ?? "";
+    };
+
+    const bill = await render(
+      <PrintableInvoice inv={doc()} company={CompanyRepo.get()} mode="sale" />,
+    );
+    has(bill, "F2LX9K3AAA", "printed bill: the unit the customer walked out with is on it");
+    has(bill, "QQ7700ZZZ", "printed bill: and every other unit on that line");
+    has(bill, "S/N:", "printed bill: labelled, so nobody has to guess what the number is");
+
+    const receipt = await render(
+      <ThermalReceipt inv={doc()} company={CompanyRepo.get()} mode="sale" />,
+    );
+    has(
+      receipt,
+      "F2LX9K3AAA",
+      "thermal receipt: carries the units too — it is often the only copy",
+    );
+
+    const note = await render(
+      <PrintableReturn ret={doc()} company={CompanyRepo.get()} mode="sale-return" />,
+    );
+    has(note, "F2LX9K3AAA", "credit note: says which unit came back, not just how many");
+
+    /* An ordinary item must not grow an empty S/N line on every bill the
+       shop prints — which is most of them. */
+    const plain = await render(
+      <PrintableInvoice
+        inv={doc({
+          lineItems: [{ ...serialLine, id: "PL1", itemId: "I1", name: "USB Cable", serialIds: [] }],
+        })}
+        company={CompanyRepo.get()}
+        mode="sale"
+      />,
+    );
+    assert(
+      !plain.includes("S/N"),
+      "printed bill: an item with no units prints no serial line at all",
+    );
+
+    /* A unit whose purchase was cancelled afterwards is still one of the
+       units that was on the bill. Reprinting it with fewer units than the
+       customer was handed is the one failure this cannot have. */
+    const live = SerialRepo.get("SN1");
+    assert(!!live, "printed bill: the fixture unit exists to be voided");
+    SerialRepo.update("SN1", { voidedAt: new Date().toISOString() } as never);
+    const reprint = await render(
+      <PrintableInvoice inv={doc()} company={CompanyRepo.get()} mode="sale" />,
+    );
+    has(
+      reprint,
+      "F2LX9K3AAA",
+      "printed bill: reprinting an old bill still shows a unit whose purchase was later cancelled",
+    );
+    SerialRepo.update("SN1", { voidedAt: undefined } as never);
+
+    /* A purchase being entered holds its units as drafts until it saves, and
+       the form mounts its own print preview. Without draft resolution that
+       preview is an adapter bill with no numbers on it. */
+    const draft = await render(
+      <PrintableInvoice
+        inv={doc({
+          lineItems: [{ ...serialLine, serialIds: ["draft:NEWUNIT01", "draft:NEWUNIT02"] }],
+        })}
+        company={CompanyRepo.get()}
+        mode="purchase"
+      />,
+    );
+    has(
+      draft,
+      "NEWUNIT01",
+      "printed bill: a purchase being entered previews the units just scanned, before they exist",
+    );
+    assert(
+      !draft.includes("draft:"),
+      "printed bill: and shows the number, not the placeholder id it is held under",
+    );
+
+    printRoot.unmount();
+    printHost.remove();
   }
 
   /* ── Quick entry: one amount, settled oldest bill first ───────────────
@@ -1806,11 +2114,15 @@ async function runAll(): Promise<Results> {
   }
 
   /* ── Backspace walks back along a bill line ───────────────────────────
-     Billing runs left to right — item, qty, unit, price — and the only way
-     back was the mouse. Clearing a box and pressing Backspace again is what a
-     person already does on realising they are in the wrong one; each step
-     must land on the previous field with its contents selected, and stepping
-     back off the front of the line reopens the item picker. */
+     Billing runs left to right — item, qty, price — and Enter is the key a
+     counter actually uses. It must walk ALONG that row and only leave at the
+     end; sending Quantity straight to the next line skips Price, which is
+     the second most important number on the bill.
+
+     Backspace is a delete key and nothing else. It used to walk backwards
+     along the row, which the shop reported as unprofessional — Shift+Tab
+     already does that, everywhere, and a key that sometimes deletes and
+     sometimes navigates cannot be relied on. */
   {
     await renderRoute("/sales/new");
 
@@ -1841,7 +2153,32 @@ async function runAll(): Promise<Results> {
       const [qty, ...rest] = fields;
       const price = rest[rest.length - 1] ?? rest[0];
 
-      // From a LATER field back to an earlier one: clear it, then Backspace.
+      /* Enter walks ALONG the row. It used to send Quantity straight to the
+         next blank item row, jumping clean over Price — the commonest
+         keystroke in billing skipped the second most important number on the
+         line, every single time. */
+      await act(async () => {
+        qty.focus();
+        setInput(qty, "2");
+      });
+      await settleMs(40);
+      await act(async () => {
+        qty.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      });
+      await settleMs(60);
+      assert(document.activeElement !== qty, "row keys: Enter in Quantity moves off it");
+      assert(
+        row.contains(document.activeElement),
+        "row keys: and stays on the SAME line instead of jumping to the next row",
+      );
+      assert(
+        document.activeElement === price,
+        `row keys: landing on Price, which Enter used to skip — landed on ${(document.activeElement as HTMLInputElement)?.className?.slice(0, 40)}`,
+      );
+
+      /* Backspace is a delete key again. The shop called the
+         walk-backwards behaviour unprofessional; Shift+Tab already does it
+         the way every other application does. */
       await act(async () => {
         price.focus();
         setInput(price, "");
@@ -1850,41 +2187,26 @@ async function runAll(): Promise<Results> {
       await act(async () => {
         price.dispatchEvent(new KeyboardEvent("keydown", { key: "Backspace", bubbles: true }));
       });
-      await settleMs(40);
-      assert(document.activeElement !== price, "step back: Backspace in an empty box moves off it");
+      await settleMs(60);
       assert(
-        row.contains(document.activeElement),
-        "step back: and lands on another field in the SAME line, never another row",
+        document.activeElement === price,
+        "row keys: Backspace in an empty box stays put rather than walking backwards",
       );
 
-      // A box with something in it must still just delete a character.
+      /* Off the END of the row is where "next row" belongs. */
+      const rowFields = Array.from(row.querySelectorAll("input")) as HTMLInputElement[];
+      const last = rowFields[rowFields.length - 1];
       await act(async () => {
-        qty.focus();
-        setInput(qty, "5");
+        last.focus();
       });
       await settleMs(40);
       await act(async () => {
-        qty.dispatchEvent(new KeyboardEvent("keydown", { key: "Backspace", bubbles: true }));
-      });
-      await settleMs(40);
-      assert(
-        document.activeElement === qty,
-        "step back: Backspace with text in the box deletes, it does not navigate",
-      );
-
-      // Off the front of the line: the item picker comes back.
-      await act(async () => {
-        qty.focus();
-        setInput(qty, "");
-      });
-      await settleMs(40);
-      await act(async () => {
-        qty.dispatchEvent(new KeyboardEvent("keydown", { key: "Backspace", bubbles: true }));
+        last.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
       });
       await settleMs(80);
       assert(
-        !!row.querySelector('input[placeholder="Type to change item…"]'),
-        "step back: stepping off the front of the line reopens the item picker",
+        !row.contains(document.activeElement),
+        "row keys: Enter on the last field of the row does move on to the next one",
       );
     }
   }
@@ -2249,6 +2571,909 @@ async function runAll(): Promise<Results> {
       paid.includes(fmtMoney(0)),
       "two-sided: Make Payment shows nothing outstanding for a party who owes US",
     );
+  }
+
+  /* ── Changing a line's item leaves its units behind ───────────────────
+     A serial belongs to the item it was stamped on. Carrying the old item's
+     units across a change would mark units of one item as sold on a line for
+     another, and the shelf count for both would be wrong from that moment.
+     The line asks for its units again, which is the only honest answer. */
+  {
+    await renderRoute("/sales/new");
+    const addRow = () =>
+      document.querySelector(
+        'input[placeholder="Type item name to add…"]',
+      ) as HTMLInputElement | null;
+    await act(async () => {
+      setInput(addRow(), "Apple 20W Adapter");
+    });
+    await settleMs(140);
+    await act(async () => {
+      addRow()?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    await settleMs(180);
+
+    const scan = document.querySelector(
+      'input[placeholder="Scan the unit going out…"]',
+    ) as HTMLInputElement | null;
+    assert(!!scan, "swap clears units: a serialised line asks which unit");
+    await act(async () => {
+      setInput(scan, "F2LX9K3BBB");
+    });
+    await act(async () => {
+      scan?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    await settleMs(140);
+    has(
+      document.querySelector("tbody")?.textContent ?? "",
+      "F2LX9K3BBB",
+      "swap clears units: and the unit is on the line",
+    );
+
+    // Now change that line to an item that is not serialised.
+    const nameBtn = Array.from(document.querySelectorAll('tbody [role="button"]')).find(
+      (b) => (b.textContent ?? "").trim() === "Apple 20W Adapter",
+    );
+    assert(!!nameBtn, "swap clears units: the item name can be clicked to change it");
+    await act(async () => {
+      nameBtn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await settleMs(120);
+    const changeBox = document.querySelector(
+      'input[placeholder="Type to change item…"]',
+    ) as HTMLInputElement | null;
+    assert(!!changeBox, "swap clears units: the change-item picker opens");
+    await act(async () => {
+      setInput(changeBox, "USB Cable");
+    });
+    await settleMs(150);
+    const opt = Array.from(document.querySelectorAll("[data-opt]")).find((d) =>
+      (d.textContent ?? "").includes("USB Cable"),
+    );
+    assert(!!opt, "swap clears units: the replacement item is offered");
+    await act(async () => {
+      opt?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    });
+    await settleMs(180);
+
+    const grid = document.querySelector("tbody")?.textContent ?? "";
+    has(grid, "USB Cable", "swap clears units: the line now holds the new item");
+
+    /* The DOM cannot answer this on its own: once the line is a plain item
+       the scan row is gone, so a stale id sits on the data and shows
+       nowhere. Save it and read the record — that is where the damage would
+       actually live. */
+    const partyBox = document.querySelector(
+      'input[placeholder="Type name or search…"]',
+    ) as HTMLInputElement | null;
+    assert(!!partyBox, "swap clears units: found the customer box");
+    await act(async () => {
+      setInput(partyBox, "Ramesh Traders");
+    });
+    await settleMs(140);
+    const pOpt = Array.from(document.querySelectorAll("div")).find(
+      (d) =>
+        (d.textContent ?? "").trim() === "Ramesh Traders" &&
+        !d.querySelector("div div") &&
+        !d.querySelector("input"),
+    );
+    if (pOpt) {
+      await act(async () => {
+        pOpt.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      });
+      await settleMs(140);
+    }
+
+    const before = SalesRepo.all().length;
+    const saveBtn = Array.from(document.querySelectorAll("button")).find(
+      (b) => (b.textContent ?? "").trim() === "Save",
+    );
+    assert(!!saveBtn, "swap clears units: found the Save button");
+    await act(async () => {
+      saveBtn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await settleMs(300);
+    assert(SalesRepo.all().length === before + 1, "swap clears units: the bill saved");
+
+    const saved = SalesRepo.all()[0];
+    const carried = (saved.lineItems ?? []).flatMap((l) => l.serialIds ?? []);
+    assert(
+      carried.length === 0,
+      `swap clears units: the saved line carries NO units from the item it used to be — ${JSON.stringify(carried)}`,
+    );
+  }
+
+  /* ── An item can be deleted with a mouse ──────────────────────────────
+     Reported as "no delete option", and that was exactly right: deleting an
+     item was bound to Ctrl+Delete on a keyboard-selected row and nothing
+     else. Every other action on that row had a button; this one did not, so
+     for anyone working with a mouse the feature may as well not have
+     existed. Parties has had a delete button all along. */
+  {
+    await renderRoute("/items");
+    const rowOf = (name: string) =>
+      Array.from(document.querySelectorAll("tbody tr")).find((tr) =>
+        (tr.textContent ?? "").includes(name),
+      );
+    const cable = rowOf("USB Cable");
+    assert(!!cable, "item delete: found the item row");
+    const del = Array.from(cable?.querySelectorAll("button") ?? []).find(
+      (b) => (b.getAttribute("title") ?? "") === "Delete item",
+    );
+    assert(!!del, "item delete: the row carries a delete button, not just a keyboard shortcut");
+
+    /* And it still refuses when the item is on a bill — the guard was always
+       right, it was simply unreachable except by keyboard. */
+    const realConfirm = window.confirm;
+    let asked = false;
+    window.confirm = () => {
+      asked = true;
+      return true;
+    };
+    try {
+      await act(async () => {
+        del?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await settleMs(150);
+      assert(!asked, "item delete: an item used on bills is refused before anything is confirmed");
+      assert(!!ItemRepo.get("I1"), "item delete: and it is still there");
+    } finally {
+      window.confirm = realConfirm;
+    }
+  }
+
+  /* ── The grid adds its own column up ──────────────────────────────────
+     Asked for so a bill can be checked against the pile of goods on the
+     counter: eleven pieces there, so the bill had better say eleven. The
+     printed copy has carried this line for years; the screen where the
+     mistake actually gets made did not. */
+  {
+    await renderRoute("/sales/new");
+    const add = async (name: string) => {
+      const box = document.querySelector(
+        'input[placeholder="Type item name to add…"]',
+      ) as HTMLInputElement | null;
+      await act(async () => {
+        setInput(box, name);
+      });
+      await settleMs(120);
+      await act(async () => {
+        box?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      });
+      await settleMs(150);
+    };
+
+    const foot = () => document.querySelector("tfoot");
+    assert(!foot(), "grid total: an empty bill has nothing to total");
+
+    await add("USB Cable");
+    await add("USB Cable");
+    assert(!!foot(), "grid total: a bill with lines gets a footing");
+
+    const qtyBox = document.querySelector('[id^="qty-"]') as HTMLInputElement | null;
+    assert(!!qtyBox, "grid total: found a quantity box to change");
+    await act(async () => {
+      setInput(qtyBox, "7");
+    });
+    await settleMs(150);
+
+    const footText = foot()?.textContent ?? "";
+    has(footText, "Total", "grid total: the footing says what it is");
+    /* The QTY CELL, not the footing's text. Searching the text for "8" is
+       satisfied by any amount that happens to contain an eight — ₹800.00
+       among them — so it would pass with the quantity hard-wired to zero. */
+    const footCellsList = Array.from(foot()?.querySelectorAll("td") ?? []);
+    assert(
+      (footCellsList[2]?.textContent ?? "").trim() === "8",
+      `grid total: the quantity column adds up — 7 and 1 should read 8, cell says ${JSON.stringify(footCellsList[2]?.textContent)}`,
+    );
+
+    /* The footing must survive a column being hidden, or it slides out of
+       line with the header above it. Disc% and Unit are both off by default
+       on this build. */
+    // Both counted from the SAME table: the page holds more than one, and
+    // counting across all of them compares a header to somebody else's footing.
+    const gridTable = foot()?.closest("table");
+    const headCells = gridTable?.querySelectorAll("thead th").length ?? 0;
+    const footCells = foot()?.querySelectorAll("td").length ?? 0;
+    assert(
+      headCells === footCells,
+      `grid total: the footing spans exactly the columns the header does — ${footCells} against ${headCells}`,
+    );
+  }
+
+  /* ── A report can be searched, category included ──────────────────────
+     Asked for on the Stock report, where Category was a column you could
+     read but not search. Added to the shared table report, so every one of
+     them gains it rather than the one that was complained about. */
+  {
+    ItemRepo.update("I1", { category: "Cables & Chargers" } as never);
+    await renderRoute("/reports?r=stock");
+    const page = () => document.body.textContent ?? "";
+    has(page(), "Cables & Chargers", "report search: the category is on the stock report");
+
+    const box = document.querySelector(
+      'input[placeholder="Search this report…"]',
+    ) as HTMLInputElement | null;
+    assert(!!box, "report search: the report has a search box");
+
+    await act(async () => {
+      setInput(box, "Cables & Chargers");
+    });
+    await settleMs(150);
+    has(page(), "USB Cable", "report search: searching a category keeps the items in it");
+    has(page(), "of", "report search: and says how much of the report is being shown");
+
+    await act(async () => {
+      setInput(box, "zzz-nothing-matches-this");
+    });
+    await settleMs(150);
+    assert(
+      !(document.querySelector("tbody")?.textContent ?? "").includes("USB Cable"),
+      "report search: a search that matches nothing shows nothing, rather than everything",
+    );
+
+    ItemRepo.update("I1", { category: undefined } as never);
+  }
+
+  /* ── The same item twice is two lines ─────────────────────────────────
+     This shop sells phones, and two of the same model routinely go out at
+     different prices on one bill — a trade-in, a haggle, a damaged box.
+     Folding them into one line of quantity 2 makes that impossible to write
+     down, and loses the itemisation the customer is reading. */
+  {
+    const addOnce = async (name: string) => {
+      const box = document.querySelector(
+        'input[placeholder="Type item name to add…"]',
+      ) as HTMLInputElement | null;
+      assert(!!box, "repeat item: found the item entry row");
+      await act(async () => {
+        setInput(box, name);
+      });
+      await settleMs(120);
+      await act(async () => {
+        box?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      });
+      await settleMs(150);
+    };
+    const linesNamed = (name: string) =>
+      Array.from(document.querySelectorAll('tbody [role="button"]')).filter(
+        (b) => (b.textContent ?? "").trim() === name,
+      ).length;
+
+    await renderRoute("/sales/new");
+    await addOnce("USB Cable");
+    assert(linesNamed("USB Cable") === 1, "repeat item: the first one makes a line");
+    await addOnce("USB Cable");
+    assert(
+      linesNamed("USB Cable") === 2,
+      `repeat item: the second makes a SECOND line rather than quantity 2 — ${linesNamed("USB Cable")} line(s)`,
+    );
+    await addOnce("USB Cable");
+    assert(linesNamed("USB Cable") === 3, "repeat item: and so does the third");
+
+    /* Each line keeps its own price. That is the whole point — one handset
+       discounted and one not, on the same bill. */
+    const rows = Array.from(document.querySelectorAll("tbody tr")).filter((tr) =>
+      Array.from(tr.querySelectorAll('[role="button"]')).some(
+        (b) => (b.textContent ?? "").trim() === "USB Cable",
+      ),
+    );
+    assert(rows.length === 3, "repeat item: three separate rows to price separately");
+    const priceOf = (tr: Element) => {
+      const inputs = Array.from(tr.querySelectorAll("input")) as HTMLInputElement[];
+      return inputs[inputs.length - 1];
+    };
+    await act(async () => {
+      setInput(priceOf(rows[0]), "90");
+    });
+    await settleMs(100);
+    assert(
+      (priceOf(rows[1]) as HTMLInputElement).value !== "90",
+      "repeat item: pricing one line does not drag the others with it",
+    );
+  }
+
+  /* ── Courier cost on a purchase, the same as on a sale ────────────────
+     The shop pays courier on goods coming in just as it charges it on goods
+     going out. The box existed only on sales; the arithmetic always handled
+     both. */
+  {
+    await renderRoute("/purchase/new");
+    const labels = document.body.textContent ?? "";
+    has(labels, "Courier / Shipping", "courier: a purchase can record what the courier cost");
+
+    await renderRoute("/sales/new");
+    has(
+      document.body.textContent ?? "",
+      "Shipping Charge",
+      "courier: and the sale keeps the wording it already had",
+    );
+  }
+
+  /* ── Picking the wrong item is not a dead end ─────────────────────────
+     Reported from the shop: choose an item by mistake, type the right name
+     over it, and there was no way to create it. The blank entry row could
+     add a new item; this picker could not, so the only way out was to delete
+     the line and start it again.
+
+     The half that matters is WHERE the new item lands: replacing the line
+     that asked for it, not appended as a second line with the wrong item
+     still sitting above it. */
+  {
+    await renderRoute("/sales/new");
+    const addRow = document.querySelector(
+      'input[placeholder="Type item name to add…"]',
+    ) as HTMLInputElement | null;
+    assert(!!addRow, "change item: found the item entry row");
+    await act(async () => {
+      setInput(addRow, "USB Cable");
+    });
+    await settleMs(120);
+    await act(async () => {
+      addRow?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    await settleMs(150);
+
+    const lineCount = () =>
+      Array.from(document.querySelectorAll("tbody tr")).filter((tr) =>
+        (tr.textContent ?? "").includes("₹"),
+      ).length;
+    const before = lineCount();
+    assert(before >= 1, "change item: a line was added to work with");
+
+    // Reopen the picker the way a person does — the name is a button.
+    // A div with role="button", not a <button> — the grid styles it as a cell.
+    const nameBtn = Array.from(document.querySelectorAll('tbody [role="button"]')).find(
+      (b) => (b.textContent ?? "").trim() === "USB Cable",
+    );
+    assert(!!nameBtn, "change item: the item name is clickable to change it");
+    await act(async () => {
+      nameBtn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await settleMs(120);
+
+    const changeBox = document.querySelector(
+      'input[placeholder="Type to change item…"]',
+    ) as HTMLInputElement | null;
+    assert(!!changeBox, "change item: the change-item picker opens");
+    await act(async () => {
+      setInput(changeBox, "Braided Cable 2m");
+    });
+    await settleMs(150);
+
+    /* [data-opt], not any div: an ancestor wrapping only this row has the
+       same textContent, and it is found first in document order — dispatching
+       on it never reaches the row's own handler, so the click looks lost. */
+    const addOpt = Array.from(document.querySelectorAll("[data-opt]")).find((d) =>
+      (d.textContent ?? "").trim().startsWith("Add "),
+    );
+    assert(
+      !!addOpt,
+      "change item: it offers to create what was typed, instead of only saying No items found",
+    );
+    await act(async () => {
+      addOpt?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    });
+    await settleMs(180);
+
+    const nameField = document.querySelector(
+      'input[aria-label="Category for the new item"]',
+    ) as HTMLInputElement | null;
+    assert(!!nameField, "change item: the add-item dialog opened for it");
+
+    const dlg = nameField?.closest('[role="dialog"]') as HTMLElement | null;
+    const create = Array.from(dlg?.querySelectorAll("button") ?? []).find((b) =>
+      /^Add & Continue/i.test((b.textContent ?? "").trim()),
+    );
+    assert(!!create, "change item: found the create button");
+    await act(async () => {
+      create?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await settleMs(250);
+
+    assert(
+      lineCount() === before,
+      `change item: the new item REPLACES the line rather than adding a second — ${before} lines became ${lineCount()}`,
+    );
+    const grid = document.querySelector("tbody")?.textContent ?? "";
+    has(
+      grid,
+      "Braided Cable 2m",
+      "change item: and the line now carries the item that was created",
+    );
+    assert(
+      !grid.includes("USB Cable"),
+      "change item: with the wrong item gone, not left sitting above it",
+    );
+  }
+
+  /* ── Payment mode is one tab stop, not three ──────────────────────────
+     Reported from the shop as Tab "going to bank" after choosing Cash. It
+     did — to the Bank PILL, then the Credit pill, before reaching anything
+     that takes a number. Tab should leave the group and land on the amount;
+     moving WITHIN the group is what arrow keys are for. */
+  {
+    await renderRoute("/sales/new");
+    const pills = Array.from(document.querySelectorAll('[role="radio"]')).filter((p) =>
+      ["Cash", "Bank", "Credit"].includes((p.textContent ?? "").trim()),
+    ) as HTMLElement[];
+    assert(pills.length === 3, `mode tab: found the three payment pills — ${pills.length}`);
+
+    // Whichever mode a new bill starts on — the rule is about the group, not
+    // about one particular pill being chosen.
+    const chosen = pills.find((p) => p.getAttribute("aria-checked") === "true");
+    assert(!!chosen, "mode tab: one of the pills is selected to begin with");
+    assert(
+      chosen!.tabIndex === 0,
+      "mode tab: the chosen mode is the tab stop, so Tab still reaches the group",
+    );
+    assert(
+      pills.filter((p) => p.tabIndex === 0).length === 1,
+      `mode tab: and it is the ONLY one, so Tab leaves for the amount instead of walking the pills — ${pills.filter((p) => p.tabIndex === 0).length} are tabbable`,
+    );
+
+    // Arrow keys are how you move inside a radiogroup.
+    const startedOn = (chosen!.textContent ?? "").trim();
+    await act(async () => {
+      chosen!.focus();
+      chosen!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+    });
+    await settleMs(80);
+    const nowChosen = Array.from(document.querySelectorAll('[role="radio"]')).find(
+      (p) => p.getAttribute("aria-checked") === "true",
+    ) as HTMLElement | undefined;
+    assert(
+      (nowChosen?.textContent ?? "").trim() !== startedOn,
+      `mode tab: ArrowRight moves the choice along the group — still on ${startedOn}`,
+    );
+    assert(
+      document.activeElement === nowChosen,
+      "mode tab: and focus follows it, or Tab would leave from the wrong pill",
+    );
+  }
+
+  /* ── An item created at the counter gets a category ───────────────────
+     Reported from the shop. Adding an item from the bill form asked for
+     name, unit, GST and prices but never a category, so anything created in
+     the middle of billing — which is most of the catalogue, in practice —
+     was invisible to every category filter afterwards and had to be found
+     and re-shelved by hand later. */
+  {
+    ItemRepo.update("I1", { category: "Accessories" } as never);
+    await renderRoute("/sales/new");
+
+    const addRow = document.querySelector(
+      'input[placeholder="Type item name to add…"]',
+    ) as HTMLInputElement | null;
+    assert(!!addRow, "new item category: found the item entry row");
+    await act(async () => {
+      setInput(addRow, "Tempered Glass X99");
+    });
+    await settleMs(120);
+    await act(async () => {
+      addRow?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    await settleMs(180);
+
+    const catBox = document.querySelector(
+      'input[aria-label="Category for the new item"]',
+    ) as HTMLInputElement | null;
+    assert(!!catBox, "new item category: the add-item dialog asks for a category at all");
+
+    await act(async () => {
+      setInput(catBox, "Access");
+    });
+    await settleMs(120);
+    const opt = document.querySelector('[role="listbox"] [role="option"]') as HTMLElement | null;
+    assert(!!opt, "new item category: it suggests the categories already in use");
+    assert(
+      (opt?.textContent ?? "").trim() === "Accessories",
+      `new item category: naming the existing one rather than only offering to invent one — ${JSON.stringify(opt?.textContent)}`,
+    );
+    await act(async () => {
+      opt?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    });
+    await settleMs(120);
+
+    const before = ItemRepo.all().length;
+    /* Scoped to the dialog. Searching the whole document finds "Add Sale" in
+       the top bar first, which is a different button on a different screen
+       and quietly makes this assert nothing. */
+    const addDialog = catBox?.closest('[role="dialog"]') as HTMLElement | null;
+    assert(!!addDialog, "new item category: the add-item dialog is on screen");
+    const create = Array.from(addDialog?.querySelectorAll("button") ?? []).find((b) =>
+      /^Add & Continue/i.test((b.textContent ?? "").trim()),
+    );
+    assert(!!create, "new item category: found the button that creates it");
+    await act(async () => {
+      create?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await settleMs(200);
+
+    assert(ItemRepo.all().length === before + 1, "new item category: the item was created");
+    const made = ItemRepo.all().find((i) => i.name === "Tempered Glass X99");
+    assert(!!made, "new item category: and can be found by the name that was typed");
+    assert(
+      made?.category === "Accessories",
+      `new item category: carrying the category it was given — ${JSON.stringify(made?.category)}`,
+    );
+
+    ItemRepo.update("I1", { category: undefined } as never);
+  }
+
+  /* ── The bank list has to follow the arrow keys ───────────────────────
+     Reported from the shop: "only 3 bank account have, other nothing
+     viewable". The list held every account and could be scrolled by hand —
+     what it never did was follow the keyboard, so the fourth account onward
+     could be highlighted and never seen. */
+  {
+    for (let n = 2; n <= 9; n++) {
+      BankRepo.add({
+        id: `BSC${n}`,
+        createdAt: "2026-01-01T00:00:00Z",
+        name: `Scroll Test Bank ${n}`,
+        accountNumber: `00000${n}`,
+        openingBalance: 0,
+        balance: 0,
+      } as never);
+    }
+
+    await renderRoute("/sales/new");
+    const bankPill = Array.from(document.querySelectorAll("button")).find(
+      (b) => (b.textContent ?? "").trim() === "Bank",
+    );
+    assert(!!bankPill, "bank scroll: found the Bank payment mode");
+    await act(async () => {
+      bankPill?.click();
+    });
+    await settleMs(120);
+
+    const box = document.querySelector(
+      'input[placeholder="Search bank account…"]',
+    ) as HTMLInputElement | null;
+    assert(!!box, "bank scroll: found the bank search box");
+    await act(async () => {
+      box?.focus();
+      box?.dispatchEvent(new FocusEvent("focus", { bubbles: true }));
+    });
+    await settleMs(100);
+
+    const list = () =>
+      document.querySelector("[data-bank-opt]")?.parentElement as HTMLElement | null;
+    assert(!!list(), "bank scroll: the account list is open");
+    assert(
+      (list()?.querySelectorAll("[data-bank-opt]").length ?? 0) >= 8,
+      `bank scroll: every account is in the list, not just the first few — ${list()?.querySelectorAll("[data-bank-opt]").length}`,
+    );
+    assert(list()?.scrollTop === 0, "bank scroll: it starts at the top");
+
+    // Walk past the fold. The container is capped at max-h-56, so eight
+    // accounts cannot all be visible at once.
+    for (let n = 0; n < 8; n++) {
+      await act(async () => {
+        box?.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+      });
+    }
+    await settleMs(120);
+
+    const scroller = list();
+    assert(
+      (scroller?.scrollHeight ?? 0) > (scroller?.clientHeight ?? 0),
+      "bank scroll: the list is genuinely taller than its box, or this proves nothing",
+    );
+    assert(
+      (scroller?.scrollTop ?? 0) > 0,
+      `bank scroll: arrowing down the list scrolls it, instead of highlighting rows nobody can see — scrollTop ${scroller?.scrollTop}`,
+    );
+  }
+
+  /* ── The category picker has to answer a mouse ────────────────────────
+     Reported from the shop: in Bulk Update, the Category cell "only tab and
+     enter work" — clicking a suggestion did nothing. Driven here with a real
+     mousedown, which is the event the list actually listens for. */
+  {
+    /* An existing category to pick, so this proves SELECTING one rather than
+       creating one — the "Add …" row commits the typed text either way and
+       would pass even if picking were broken. */
+    ItemRepo.update("I1", { category: "Accessories" } as never);
+
+    const h = document.createElement("div");
+    document.body.appendChild(h);
+    const r = createRoot(h);
+    await act(async () => {
+      r.render(<BulkUpdateItemsDialog open onOpenChange={() => {}} onSaved={() => {}} />);
+    });
+    await settleMs(120);
+
+    const infoTab = Array.from(document.querySelectorAll('[role="radio"]')).find((b) =>
+      (b.textContent ?? "").trim().startsWith("Item Information"),
+    ) as HTMLButtonElement | undefined;
+    assert(!!infoTab, "category click: found the Item Information tab");
+    await act(async () => {
+      infoTab!.click();
+    });
+    await settleMs(100);
+
+    /* The grid renders a desktop TABLE and a phone card list at once, one of
+       them hidden by CSS. Taking [0] blindly can test the copy nobody is
+       looking at — and the shop is on a desktop. */
+    const allCat = Array.from(
+      document.querySelectorAll('input[placeholder="Search or add…"]'),
+    ) as HTMLInputElement[];
+    const visibleCat = allCat.filter((el) => el.getClientRects().length > 0);
+    assert(
+      visibleCat.length > 0,
+      `category click: a Category cell is actually on screen — ${allCat.length} exist, ${visibleCat.length} visible`,
+    );
+    const inDesktopTable = visibleCat.filter((el) => !!el.closest("table"));
+    assert(
+      inDesktopTable.length > 0,
+      `category click: and the desktop table is the one being tested — ${visibleCat.length} visible, ${inDesktopTable.length} in a table`,
+    );
+    const catBox = inDesktopTable[0] as HTMLInputElement | undefined;
+    assert(!!catBox, "category click: found a Category cell");
+
+    /* A real click focuses an input through the mousedown DEFAULT ACTION.
+       Anything that calls preventDefault on that mousedown leaves the box
+       unfocusable by mouse while Tab still reaches it — which is exactly the
+       symptom reported. Synthetic events cannot move focus, so the honest
+       test is whether the default survives. */
+    const md = new MouseEvent("mousedown", { bubbles: true, cancelable: true });
+    catBox!.dispatchEvent(md);
+    assert(
+      !md.defaultPrevented,
+      "category click: nothing swallows the mousedown, so a real click can focus the box",
+    );
+    const pd = new PointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerId: 1 });
+    catBox!.dispatchEvent(pd);
+    assert(!pd.defaultPrevented, "category click: nor the pointerdown before it");
+
+    /* And the box is actually the thing at its own coordinates. A cell
+       covered by something — a sticky header, a stray portal — cannot be
+       clicked at all while Tab still reaches it, which is exactly the
+       reported symptom and is invisible to every other kind of assertion. */
+    const box = catBox!.getBoundingClientRect();
+    assert(
+      box.width > 0 && box.height > 0,
+      `category click: the box has a size to click — ${JSON.stringify(box)}`,
+    );
+    const atCentre = document.elementFromPoint(
+      Math.round(box.left + box.width / 2),
+      Math.round(box.top + box.height / 2),
+    );
+    assert(
+      atCentre === catBox || catBox!.contains(atCentre),
+      `category click: nothing is sitting on top of it — a click there would land on ${
+        atCentre
+          ? `<${atCentre.tagName.toLowerCase()} class="${(atCentre.className || "").toString().slice(0, 60)}">`
+          : "nothing"
+      }`,
+    );
+
+    // Focus it the way a mouse does, then type enough to bring up the list.
+    await act(async () => {
+      catBox!.focus();
+      catBox!.dispatchEvent(new FocusEvent("focus", { bubbles: true }));
+    });
+    await settleMs(80);
+    await act(async () => {
+      setInput(catBox, "Access");
+    });
+    await settleMs(120);
+
+    const listbox = document.querySelector('[role="listbox"]');
+    assert(!!listbox, "category click: typing opens the suggestion list");
+
+    /* THE ONE THAT MATTERS. A modal Radix dialog sets pointer-events:none on
+       document.body while it is open, and this list is portalled to body —
+       so it inherits that and becomes unclickable, while the keyboard, which
+       does not care about pointer-events, keeps working perfectly.
+
+       dispatchEvent ignores pointer-events too, which is why every earlier
+       assertion here passed against broken code. elementFromPoint does NOT
+       ignore it: it is the only probe in this file that answers the question
+       a mouse actually asks. */
+    const firstOpt = listbox?.querySelector('[role="option"]') as HTMLElement | null;
+    assert(!!firstOpt, "category click: the list has an option to aim at");
+    const ob = firstOpt!.getBoundingClientRect();
+    const underPointer = document.elementFromPoint(
+      Math.round(ob.left + ob.width / 2),
+      Math.round(ob.top + ob.height / 2),
+    );
+    assert(
+      underPointer === firstOpt || firstOpt!.contains(underPointer),
+      `category click: the option is what a mouse would hit — instead the pointer finds ${
+        underPointer
+          ? `<${underPointer.tagName.toLowerCase()}> (body pointer-events: ${getComputedStyle(document.body).pointerEvents})`
+          : "nothing"
+      }`,
+    );
+    const option = listbox?.querySelector('[role="option"]') as HTMLElement | null;
+    assert(!!option, "category click: the list has something to pick");
+    const optionText = (option?.textContent ?? "").trim();
+
+    /* A real click fires pointerdown FIRST, and that is the event Radix's
+       dialog watches to decide something outside it was touched. The list is
+       portalled to document.body, so it IS outside the dialog's DOM — firing
+       only mousedown skips the whole interaction this bug lives in. */
+    await act(async () => {
+      option?.dispatchEvent(
+        new PointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerId: 1 }),
+      );
+      option?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      option?.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+      option?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    await settleMs(150);
+
+    assert(
+      optionText === "Accessories",
+      `category click: the existing category is offered, not just "Add" — ${JSON.stringify(optionText)}`,
+    );
+    assert(
+      catBox!.value === "Accessories",
+      `category click: and clicking it fills the cell with the whole name — ${JSON.stringify(catBox!.value)}`,
+    );
+
+    /* Arriving by click must leave the box in the same state as arriving by
+       Tab. Tab selects the contents; a click drops the caret where the
+       pointer landed, so the next keystroke inserts into the middle of the
+       existing category instead of replacing it — which is what "clicking
+       does nothing, only Tab works" actually looks like from the counter. */
+    {
+      const other = document.querySelector(
+        'input[placeholder="Search items…"]',
+      ) as HTMLInputElement | null;
+      assert(!!other, "category focus: found another box to come from");
+      await act(async () => {
+        other?.focus();
+      });
+      await settleMs(40);
+      await act(async () => {
+        catBox!.focus();
+      });
+      await settleMs(80);
+      assert(
+        document.activeElement === catBox,
+        "category focus: focus really moved to the category box",
+      );
+      assert(
+        catBox!.selectionStart === 0 && catBox!.selectionEnd === catBox!.value.length,
+        `category focus: and its contents are selected, so typing replaces the category rather than inserting into it — selection ${catBox!.selectionStart}..${catBox!.selectionEnd} of ${JSON.stringify(catBox!.value)}`,
+      );
+    }
+
+    r.unmount();
+    h.remove();
+    ItemRepo.update("I1", { category: undefined } as never);
+  }
+
+  /* ── One party, one outstanding figure, on every screen ───────────────
+     Reported from the shop with these exact numbers. JAY MOBILE is both a
+     customer and a supplier: ₹27,400 of unpaid sales, and ₹9,850 owed to
+     them on a purchase. Their statement said ₹17,550. Receive Payment said
+     ₹27,400, mentioned the difference nowhere, and offered "Full" at the
+     gross — so collecting "everything owed" over-collects by exactly what the
+     shop owes them back.
+
+     Both figures were defensible on their own, which is why nothing caught
+     it: the bug was that neither screen admitted the other existed. */
+  {
+    PartyRepo.add({
+      id: "JM1",
+      createdAt: "2026-01-01T00:00:00Z",
+      name: "Jay Mobile Dabholi",
+      type: "both",
+      openingBalance: 0,
+    } as never);
+    const sale = (id: string, number: string, day: string, total: number, paid = 0) =>
+      ({
+        id,
+        createdAt: `${day}T09:00:00Z`,
+        number,
+        date: day,
+        partyId: "JM1",
+        partyName: "Jay Mobile Dabholi",
+        gstEnabled: false,
+        lineItems: [
+          {
+            id: `${id}L`,
+            itemId: "I1",
+            name: "USB Cable",
+            unit: "pcs",
+            qty: 1,
+            price: total,
+            discountPct: 0,
+            gstRate: 0,
+            costPrice: 0,
+            amount: total,
+          },
+        ],
+        subtotal: total,
+        discount: 0,
+        shippingCharge: 0,
+        taxAmount: 0,
+        total,
+        paid,
+        paymentMode: paid ? "cash" : "credit",
+      }) as never;
+    // 11,000 billed with 1,100 already received leaves 9,900 — the first row
+    // in the shop's screenshot.
+    SalesRepo.add(sale("JMS1", "JM-0002", D2, 11000, 1100));
+    SalesRepo.add(sale("JMS2", "JM-0032", D3, 3000));
+    SalesRepo.add(sale("JMS3", "JM-0051", D4, 6000));
+    SalesRepo.add(sale("JMS4", "JM-0131", D5, 8500));
+    PurchaseRepo.add({
+      id: "JMP1",
+      createdAt: `${D2}T08:00:00Z`,
+      number: "JMP-1",
+      date: D2,
+      partyId: "JM1",
+      partyName: "Jay Mobile Dabholi",
+      gstEnabled: false,
+      lineItems: [
+        {
+          id: "JMP1L",
+          itemId: "I1",
+          name: "USB Cable",
+          unit: "pcs",
+          qty: 1,
+          price: 9850,
+          discountPct: 0,
+          gstRate: 0,
+          costPrice: 9850,
+          amount: 9850,
+        },
+      ],
+      subtotal: 9850,
+      discount: 0,
+      shippingCharge: 0,
+      taxAmount: 0,
+      total: 9850,
+      paid: 0,
+      paymentMode: "credit",
+    } as never);
+
+    await renderRoute("/payments");
+    const recv = findButton(/Receive Payment/);
+    assert(!!recv, "one figure: found the Receive Payment button");
+    await act(async () => {
+      recv?.click();
+    });
+    await settleMs(120);
+    const box = document.querySelector(
+      'input[placeholder="Type to search party…"]',
+    ) as HTMLInputElement | null;
+    assert(!!box, "one figure: found the party box");
+    await act(async () => {
+      setInput(box, "Jay Mobile");
+    });
+    await settleMs(100);
+    const option = Array.from(document.querySelectorAll("div"))
+      .filter((d) => d.textContent === "Jay Mobile Dabholi")
+      .pop();
+    assert(!!option, "one figure: the party is suggested");
+    await act(async () => {
+      option?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    });
+    await settleMs(150);
+    const dialog = currentDialog().textContent ?? "";
+
+    has(dialog, fmtMoney(17550), "one figure: Receive Payment shows what the party actually owes");
+    // The gross is still shown — as the explanation, not as the answer.
+    has(dialog, fmtMoney(27400), "one figure: with the open-bill total named");
+    has(dialog, fmtMoney(9850), "one figure: and the amount the shop owes them named too");
+    has(
+      dialog,
+      "you owe them",
+      "one figure: said in words, so nobody has to work out why the two differ",
+    );
+
+    /* The assertion that matters: the statement and the dialog agree. Either
+       number alone was arguable; disagreeing was not. */
+    const statement = await renderRoute("/parties/JM1");
+    has(statement, fmtMoney(17550), "one figure: and the party's own statement says the same");
   }
 
   /* ── Opening balance: the side is a choice, not the sign of a number ──
@@ -2950,6 +4175,366 @@ async function runAll(): Promise<Results> {
     );
   }
 
+  /* ── A credit note has to say WHICH units came back ───────────────────
+     The document created here rather than in the shared fixture: a sale added
+     there moves the revenue, COGS and cash figures eight earlier tests assert,
+     and those tests are right to assert them. */
+  {
+    SalesRepo.add({
+      id: "S9",
+      createdAt: `${D3}T09:00:00Z`,
+      number: "INV-SER1",
+      date: D3,
+      partyId: "P1",
+      partyName: "Ramesh Traders",
+      gstEnabled: false,
+      lineItems: [
+        {
+          id: "L9",
+          itemId: "I9",
+          name: "Apple 20W Adapter",
+          unit: "pcs",
+          qty: 2,
+          price: 1900,
+          discountPct: 0,
+          gstRate: 0,
+          costPrice: 1200,
+          amount: 3800,
+          serialIds: ["SN1", "SN3"],
+        },
+      ],
+      subtotal: 3800,
+      discount: 0,
+      shippingCharge: 0,
+      taxAmount: 0,
+      total: 3800,
+      paid: 3800,
+      paymentMode: "cash",
+    } as never);
+
+    /* SN4 is the "sold on a different bill" case, so a different bill has to
+       actually exist — otherwise it is a unit claiming a customer no document
+       supports, which is a genuine fault and the integrity check later in
+       this run rightly says so. */
+    SalesRepo.add({
+      id: "S10",
+      createdAt: `${D3}T10:00:00Z`,
+      number: "INV-OTHER",
+      date: D3,
+      partyId: "P1",
+      partyName: "Ramesh Traders",
+      gstEnabled: false,
+      lineItems: [
+        {
+          id: "L10",
+          itemId: "I9",
+          name: "Apple 20W Adapter",
+          unit: "pcs",
+          qty: 1,
+          price: 1900,
+          discountPct: 0,
+          gstRate: 0,
+          costPrice: 1200,
+          amount: 1900,
+          serialIds: ["SN4"],
+        },
+      ],
+      subtotal: 1900,
+      discount: 0,
+      shippingCharge: 0,
+      taxAmount: 0,
+      total: 1900,
+      paid: 1900,
+      paymentMode: "cash",
+    } as never);
+    SerialRepo.update("SN4", { saleId: "S10" } as never);
+
+    await renderRoute("/sale-return/new");
+    const invBox = Array.from(document.querySelectorAll("input")).find((i) =>
+      /auto-load items/i.test(i.getAttribute("placeholder") ?? ""),
+    ) as HTMLInputElement | undefined;
+    assert(!!invBox, "return serials: found the original-bill box");
+    await act(async () => {
+      setInput(invBox, "INV-SER1");
+    });
+    await settleMs(150);
+    const option = Array.from(document.querySelectorAll("div")).find(
+      (el) =>
+        (el.textContent ?? "").includes("INV-SER1") &&
+        el.querySelector("span.font-mono") &&
+        !el.querySelector("div div"),
+    );
+    assert(!!option, "return serials: the bill is offered");
+    await act(async () => {
+      option?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    });
+    await settleMs(250);
+
+    const scanBox = () =>
+      Array.from(document.querySelectorAll("input")).find((i) =>
+        /coming back/i.test(i.getAttribute("placeholder") ?? ""),
+      ) as HTMLInputElement | undefined;
+    assert(!!scanBox(), "return serials: a serialised line asks which units came back");
+
+    // The bill says which went out; only the counter can say which came back.
+    const loaded = await readMounted();
+    assert(
+      !loaded.includes("F2LX9K3AAA"),
+      "return serials: the units are NOT pre-filled from the bill — that would answer for the counter",
+    );
+    has(loaded, "2 more to pick", "return serials: it says how many are still to be scanned");
+
+    const scan = async (text: string) => {
+      setInput(scanBox(), text);
+      await act(async () => {
+        scanBox()?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      });
+      return readMounted();
+    };
+
+    // In stock, so it was never sold — the exact opposite of what a credit
+    // note needs, and the reverse of the test the sale form applies.
+    const notSold = await scan("F2LX9K3BBB");
+    has(
+      notSold,
+      "was not sold",
+      "return serials: a unit still on the shelf cannot come back from a customer",
+    );
+
+    // Sold, but on a different bill: crediting this customer for it would
+    // corrupt both bills at once.
+    const wrongBill = await scan("WRONGBILL1");
+    has(
+      wrongBill,
+      "is not on INV-SER1",
+      "return serials: a unit sold on another bill is refused, and the bill is named",
+    );
+
+    const good = await scan("F2LX9K3AAA");
+    has(good, "F2LX9K3AAA", "return serials: a unit that really went out on this bill is accepted");
+    has(good, "1 more to pick", "return serials: and the counter comes down");
+
+    // A warranty failure is the commonest sale return there is.
+    has(
+      good,
+      "came back faulty",
+      "return serials: the note can say these are faulty rather than resellable",
+    );
+
+    /* The refusal and the movement are both asserted by OUTCOME, not by the
+       toast: sonner's Toaster lives in the root component, which this harness
+       replaces with a bare Outlet. */
+    const saveBtn = () =>
+      Array.from(document.querySelectorAll("button")).find((b) =>
+        /^Save/.test((b.textContent ?? "").trim()),
+      );
+    assert(!!saveBtn(), "return serials: the Save button is on screen");
+    const clickSave = async () => {
+      await act(async () => {
+        saveBtn()?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await settleMs(150);
+    };
+
+    const before = SaleReturnRepo.all().length;
+    await clickSave();
+    assert(
+      SaleReturnRepo.all().length === before,
+      "return serials: a note naming fewer units than it credits will not save",
+    );
+    assert(
+      SerialRepo.get("SN1")?.status === "sold",
+      "return serials: and nothing moved while it was refused",
+    );
+
+    // Scan the second unit the bill actually carried, and it goes through.
+    await scan("QQ7700ZZZ");
+    await clickSave();
+    assert(SaleReturnRepo.all().length === before + 1, "return serials: a complete note saves");
+    assert(
+      SerialRepo.get("SN1")?.status === "in_stock",
+      "return serials: the units that came back are on the shelf again",
+    );
+    assert(
+      SerialRepo.get("SN1")?.customerName === "Ramesh Traders",
+      "return serials: with who had them still on the record — a return is not a denial of the sale",
+    );
+    assert(
+      !!SerialRepo.get("SN1")?.returnId,
+      "return serials: and the note that brought them back named on the unit",
+    );
+    // Stock is COUNTED from the units, so it moved without anyone writing it.
+    assert(
+      stockOf(ItemRepo.get("I9")!) === 3,
+      `return serials: the shelf count follows the units, not a stored number — got ${stockOf(ItemRepo.get("I9")!)}`,
+    );
+    /* And the stored field was left alone. stockOf() ignores it entirely for
+       these items, so a bogus number written here is invisible to every
+       assertion above — which is exactly why it has to be checked directly.
+       A figure nothing reads is a figure somebody eventually believes. */
+    assert(
+      (ItemRepo.get("I9") as { stock?: number }).stock === 0,
+      `return serials: and the stored stock number was not nudged as well — got ${JSON.stringify((ItemRepo.get("I9") as { stock?: number }).stock)}`,
+    );
+  }
+
+  /* ── A sold unit must point at the bill that sold it ──────────────────
+     Driven through the form rather than seeded, because the bug this catches
+     lives in the save path and no seeded fixture can reach it: the draft
+     carries an empty id until addBatched mints one, which happens AFTER the
+     units have been stamped with it. Every seeded serial in this file already
+     has a saleId, so nothing else here would ever notice. */
+  {
+    await renderRoute("/sales/new");
+
+    const partyBox = document.querySelector(
+      'input[placeholder="Type name or search…"]',
+    ) as HTMLInputElement | null;
+    assert(!!partyBox, "sale serials: found the customer box");
+    await act(async () => {
+      setInput(partyBox, "Ramesh Traders");
+    });
+    await settleMs(120);
+    const partyOption = Array.from(document.querySelectorAll("div")).find(
+      (el) =>
+        (el.textContent ?? "").includes("Ramesh Traders") &&
+        !el.querySelector("div div") &&
+        !el.querySelector("input"),
+    );
+    if (partyOption) {
+      await act(async () => {
+        partyOption.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      });
+      await settleMs(120);
+    }
+
+    const addRow = document.querySelector(
+      'input[placeholder="Type item name to add…"]',
+    ) as HTMLInputElement | null;
+    assert(!!addRow, "sale serials: found the item entry row");
+    await act(async () => {
+      setInput(addRow, "Apple 20W Adapter");
+    });
+    await settleMs(120);
+    await act(async () => {
+      addRow?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    await settleMs(150);
+
+    const outBox = Array.from(document.querySelectorAll("input")).find((i) =>
+      /going out/i.test(i.getAttribute("placeholder") ?? ""),
+    ) as HTMLInputElement | undefined;
+    assert(!!outBox, "sale serials: a serialised line asks which unit is going out");
+    await act(async () => {
+      setInput(outBox, "F2LX9K3BBB");
+    });
+    await act(async () => {
+      outBox?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    await settleMs(120);
+
+    const before = SalesRepo.all().length;
+    const saveBtn = Array.from(document.querySelectorAll("button")).find((b) =>
+      /^Save/.test((b.textContent ?? "").trim()),
+    );
+    assert(!!saveBtn, "sale serials: the Save button is on screen");
+    await act(async () => {
+      saveBtn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await settleMs(250);
+
+    assert(SalesRepo.all().length === before + 1, "sale serials: the bill saved");
+    const unit = SerialRepo.get("SN2");
+    assert(unit?.status === "sold", "sale serials: the unit that was scanned is sold");
+    assert(
+      !!unit?.saleId,
+      "sale serials: and carries the id of the bill that sold it, not an empty string",
+    );
+    assert(
+      !!SalesRepo.get(unit?.saleId ?? ""),
+      `sale serials: an id that actually resolves to that bill — got ${JSON.stringify(unit?.saleId)}`,
+    );
+    // Same rule as the return path: the stored figure is not touched, and
+    // nothing but a direct look at it would notice if it were.
+    assert(
+      (ItemRepo.get("I9") as { stock?: number }).stock === 0,
+      `sale serials: selling a tracked unit does not nudge the stored stock number — got ${JSON.stringify((ItemRepo.get("I9") as { stock?: number }).stock)}`,
+    );
+    assert(
+      stockOf(ItemRepo.get("I9")!) === 2,
+      `sale serials: the shelf count came down by one, counted from the units — got ${stockOf(ItemRepo.get("I9")!)}`,
+    );
+  }
+
+  /* ── The serial check, driven from the screen it lives on ─────────────
+     The library is proved in audit.test.ts. What this proves is that the
+     button exists, is owner-only like the rest of that section, reports what
+     it found in words the shop can act on, and — the part a library test
+     cannot reach — that it reads LIVE documents, so a cancelled bill stops
+     counting as evidence. */
+  {
+    const wasOwner = globalThis.__TEST_IS_OWNER__;
+    globalThis.__TEST_IS_OWNER__ = true;
+    try {
+      /* SN2 was sold through the form earlier in this run and never returned,
+         so the books are in order. Break them the way a missed move does:
+         put the unit back on the shelf while its bill still stands. */
+      await renderRoute("/settings");
+      const button = () =>
+        Array.from(document.querySelectorAll("button")).find(
+          (b) => (b.textContent ?? "").trim() === "Check Serial Numbers",
+        );
+      assert(!!button(), "serial check: the button is on the Fix Calculations section");
+
+      const press = async () => {
+        await act(async () => {
+          button()?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        });
+        return readMounted();
+      };
+
+      const clean = await press();
+      /* "that moved them", not "agree with the documents": the FINDINGS
+         heading reads "Units that disagree with the documents", which
+         contains the shorter phrase — so the shorter assertion passed even
+         when the clean panel was gone entirely. */
+      has(clean, "that moved them", "serial check: a shop in order is told so plainly");
+
+      SerialRepo.update("SN2", { status: "in_stock" } as never);
+      const broken = await press();
+      has(
+        broken,
+        "counted as on the shelf",
+        "serial check: a unit put back while its bill still stands is reported",
+      );
+      has(
+        broken,
+        "one over",
+        "serial check: and says which way the shelf count is wrong, not just that it is",
+      );
+
+      /* Cancel the bill that sold it. The unit is now legitimately on the
+         shelf, and the same data must stop being a fault — a library test
+         cannot show this, because live-only is the SCREEN's choice of which
+         documents to pass in. */
+      const soldOn = SalesRepo.all().find((s) =>
+        s.lineItems.some((l) => (l.serialIds ?? []).includes("SN2")),
+      );
+      assert(!!soldOn, "serial check: found the bill that sold that unit");
+      SalesRepo.update(soldOn!.id, { voidedAt: new Date().toISOString() } as never);
+      const afterVoid = await press();
+      assert(
+        !afterVoid.includes("counted as on the shelf"),
+        "serial check: a cancelled bill stops being evidence, so the unit is fine again",
+      );
+
+      SalesRepo.update(soldOn!.id, { voidedAt: undefined } as never);
+      SerialRepo.update("SN2", { status: "sold" } as never);
+    } finally {
+      globalThis.__TEST_IS_OWNER__ = wasOwner;
+    }
+  }
+
   /* ── One date format across every section's table ─────────────────────
      Cash and Payments read 22-08-26; every other list read "22 Aug 2026".
      Two formats in one application is a small thing that makes a screen feel
@@ -2982,7 +4567,11 @@ async function runAll(): Promise<Results> {
        correct date that an exact match would reject. The negative check below
        is what stops the long form creeping back. */
     const SHORT = /^\d{2}-\d{2}-\d{2}(?!\d)/; // 22-08-26
-    const LONG = /^\d{1,2} [A-Za-z]{3} \d{4}$/; // 22 Aug 2026
+    /* {3,4}, not {3}: fmtDate asks Intl for a "short" month, and September
+       comes back as "Sept" — the one four-letter abbreviation in English. A
+       {3} here made this suite fail every September, and, worse, made the
+       negative assertion below blind to a long date for that whole month. */
+    const LONG = /^\d{1,2} [A-Za-z]{3,4}\.? \d{4}$/; // 22 Aug 2026 / 02 Sept 2026
 
     let checked = 0;
     for (const [route, label] of [
@@ -3033,7 +4622,8 @@ async function runAll(): Promise<Results> {
       .filter((t) => /\d/.test(t));
     assert(rows.length > 0, "date format: the party statement has rows");
     assert(
-      rows.some((c) => /^\d{1,2} [A-Za-z]{3} \d{4}$/.test(c)),
+      // Same four-letter September case as LONG above.
+      rows.some((c) => /^\d{1,2} [A-Za-z]{3,4}\.? \d{4}$/.test(c)),
       `date format: a party statement still reads the long way — it is a document handed to a customer, not a list to scan — ${JSON.stringify(rows.slice(0, 3))}`,
     );
     assert(

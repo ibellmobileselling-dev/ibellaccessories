@@ -27,6 +27,7 @@ import { GROUP_ORDER, NORMAL_BALANCE, accountsFor, bankAccountId } from "@/lib/a
 import type { Book, JournalEntry } from "@/lib/posting";
 import { buildJournal, liveOnly, unbalancedEntries } from "@/lib/posting";
 import { profitAndLoss } from "@/lib/financials";
+import { inStockCounts, stockOf } from "@/lib/serials";
 import {
   bankFlows,
   cashFlows,
@@ -400,8 +401,13 @@ export function reconcile(book: Book): Reconciliation {
         What WOULD be an error is the quantities disagreeing, and that has
         its own check: Settings → Fix Calculations rebuilds stock from the
         documents. This row is about value, not count. */
+  /* Serialised items are counted in serials, not in the stored number —
+     and for those the comparison is sharper than it is anywhere else,
+     because the shelf count is exact rather than a running total that can
+     drift. */
+  const serialCounts = inStockCounts(app.serials ?? []);
   const stockAtCurrentCost = r2(
-    app.items.reduce((s, i) => s + (Number(i.stock) || 0) * (i.purchasePrice || 0), 0),
+    app.items.reduce((s, i) => s + stockOf(i, serialCounts) * (i.purchasePrice || 0), 0),
   );
   add(
     "inventory",
@@ -427,7 +433,10 @@ export function reconcile(book: Book): Reconciliation {
   const appProfit = r2(
     valueExTax(app.sales) -
       valueExTax(app.saleReturns) -
-      computeCogs(app.sales, app.saleReturns, app.items) -
+      // app.serials, so this side costs serial-tracked units exactly the way
+      // the posting ledger above does. Omit it and the two disagree by the
+      // shop's whole serial margin, and THIS function is what reports that.
+      computeCogs(app.sales, app.saleReturns, app.items, app.serials) -
       app.expenses.reduce((s, e) => s + (e.amount || 0), 0) -
       totalSettlementDiscount(app.payments.filter((p) => p.type === "in")) +
       totalSettlementDiscount(app.payments.filter((p) => p.type === "out")),

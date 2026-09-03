@@ -1,4 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { stockOf, inStockCounts } from "@/lib/serials";
 import { matchesQuery } from "@/lib/search";
 import { useEffect, useRef, useState } from "react";
 import { PageHeader } from "@/components/PageHeader";
@@ -12,6 +13,7 @@ import {
   SaleReturnRepo,
   PurchaseReturnRepo,
   StockAdjustmentRepo,
+  SerialRepo,
 } from "@/repositories";
 import { useRepoData } from "@/hooks/useRepoData";
 import { useStickyState } from "@/hooks/useStickySearch";
@@ -60,6 +62,9 @@ function InventoryPage() {
     map.set(a.itemId, (map.get(a.itemId) ?? 0) + a.qty);
   });
 
+  // One pass over the serials, shared by every row and every total below.
+  const counts = inStockCounts(SerialRepo.all());
+
   const columns: Column<Item>[] = [
     {
       key: "name",
@@ -105,14 +110,15 @@ function InventoryPage() {
         // stand out even when no threshold is configured at all — this is
         // the one genuine alert on this page, so it's the one place color
         // stays (same rule Items follows for its own low-stock warning).
-        const low = (r.minStock != null && r.stock <= r.minStock) || r.stock < 0;
+        const s = stockOf(r, counts);
+        const low = (r.minStock != null && s <= r.minStock) || s < 0;
         return (
           <span className={low ? "text-warning font-medium" : ""}>
-            {r.stock} {r.unit}
+            {stockOf(r, counts)} {r.unit}
           </span>
         );
       },
-      sortValue: (r) => r.stock,
+      sortValue: (r) => stockOf(r, counts),
     },
     { key: "min", label: "Min", align: "right", width: "70px", render: (r) => r.minStock ?? "—" },
     {
@@ -120,21 +126,25 @@ function InventoryPage() {
       label: "Stock Value",
       align: "right",
       width: "120px",
-      render: (r) => fmtMoney(r.stock * r.purchasePrice),
-      sortValue: (r) => r.stock * r.purchasePrice,
+      render: (r) => fmtMoney(stockOf(r, counts) * r.purchasePrice),
+      sortValue: (r) => stockOf(r, counts) * r.purchasePrice,
     },
   ];
 
   const filtered = rows.filter((r) => {
     const s = q.toLowerCase();
-    return matchesQuery(s, r.name, r.sku);
+    // Category too: "show me all the chargers" is how a shop thinks about
+    // its shelves, and it was the one field on this screen you could read
+    // but not search.
+    return matchesQuery(s, r.name, r.sku, r.category);
   });
 
   // Footer totals cover the filtered rows the table actually shows
-  const totalValue = filtered.reduce((s, r) => s + r.stock * r.purchasePrice, 0);
-  const lowCount = filtered.filter(
-    (r) => (r.minStock != null && r.stock <= r.minStock) || r.stock < 0,
-  ).length;
+  const totalValue = filtered.reduce((s, r) => s + stockOf(r, counts) * r.purchasePrice, 0);
+  const lowCount = filtered.filter((r) => {
+    const s = stockOf(r, counts);
+    return (r.minStock != null && s <= r.minStock) || s < 0;
+  }).length;
 
   const pg = usePagination(filtered, "inventory");
 
@@ -173,7 +183,8 @@ function InventoryPage() {
               // be treated as unset), and negative/oversold stock should always
               // stand out even when no threshold is configured at all — same
               // rule the desktop "Current" column uses.
-              const low = (r.minStock != null && r.stock <= r.minStock) || r.stock < 0;
+              const s = stockOf(r, counts);
+              const low = (r.minStock != null && s <= r.minStock) || s < 0;
               return (
                 <div key={r.id} className="bg-white p-4">
                   <div className="flex items-start justify-between gap-3 mb-1.5">
@@ -186,7 +197,7 @@ function InventoryPage() {
                     <p
                       className={`font-bold tabular-nums shrink-0 ${low ? "text-warning" : "text-gray-800"}`}
                     >
-                      {r.stock} {r.unit}
+                      {stockOf(r, counts)} {r.unit}
                     </p>
                   </div>
                   <div className="flex items-center gap-3 text-xs text-gray-500">
@@ -194,7 +205,7 @@ function InventoryPage() {
                     <span>-{salesQty.get(r.id) ?? 0} out</span>
                     <span>Min {r.minStock ?? "—"}</span>
                     <span className="ml-auto tabular-nums">
-                      {fmtMoney(r.stock * r.purchasePrice)}
+                      {fmtMoney(stockOf(r, counts) * r.purchasePrice)}
                     </span>
                   </div>
                 </div>

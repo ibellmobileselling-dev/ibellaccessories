@@ -4,6 +4,64 @@ import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 /** Controls a person types into. Anything else is not "a field". */
 const FIELD_SELECTOR = "input, select, textarea";
 
+/**
+ * The usable fields inside a scope, in the order a person meets them.
+ *
+ * Shared by every key that moves focus, so forwards and backwards can never
+ * disagree about what the row contains — a column hidden today (Unit, Disc%)
+ * simply is not there, and nothing has to be told about it.
+ */
+function fieldsIn(scope: HTMLElement): HTMLElement[] {
+  return Array.from(scope.querySelectorAll<HTMLElement>(FIELD_SELECTOR)).filter(
+    (f) =>
+      !f.hasAttribute("disabled") &&
+      f.tabIndex !== -1 &&
+      // Skip anything hidden by a responsive layout — the bill grid renders a
+      // desktop table and a phone card list at once, and stepping into the
+      // copy nobody can see would look like the focus vanished.
+      f.getClientRects().length > 0,
+  );
+}
+
+/**
+ * Enter moves to the next box along the row, and only leaves at the end.
+ *
+ * The bill grid used to send Enter from Quantity straight to the next blank
+ * item row, jumping clean over Price — so the commonest keystroke in billing
+ * skipped the second most important number on the line, and the counter had
+ * to reach for the mouse to correct it every single time.
+ *
+ * Worked out from the row itself rather than from a list of field names: the
+ * grid shows or hides Unit, Disc%, GST and the foreign-currency price
+ * depending on the bill, and any hard-coded order would be wrong for some
+ * combination of those and right for others.
+ *
+ * onEnd fires at the last field — that is where "next row" belongs.
+ */
+export function enterMovesAlongRow(
+  e: ReactKeyboardEvent<HTMLElement>,
+  opts?: { onEnd?: () => void },
+) {
+  if (e.key !== "Enter" || e.defaultPrevented) return;
+  const el = e.target as HTMLElement;
+  const scope = e.currentTarget;
+  const fields = fieldsIn(scope);
+  const i = fields.indexOf(el);
+  if (i < 0) return;
+
+  e.preventDefault();
+  const next = fields[i + 1] as HTMLInputElement | undefined;
+  if (!next) {
+    opts?.onEnd?.();
+    return;
+  }
+  next.focus();
+  // Select what is there, so typing replaces rather than appends. Same rule
+  // as stepping back: arriving in a box you mean to fill should not need a
+  // Ctrl+A first.
+  next.select?.();
+}
+
 function isTextEntry(el: EventTarget | null): el is HTMLInputElement | HTMLTextAreaElement {
   const node = el as HTMLElement | null;
   if (!node) return false;
@@ -47,16 +105,7 @@ export function stepBackOnBackspace(
   if (!isTextEntry(el)) return;
   if (el.value !== "") return;
 
-  const scope = e.currentTarget;
-  const fields = Array.from(scope.querySelectorAll<HTMLElement>(FIELD_SELECTOR)).filter(
-    (f) =>
-      !f.hasAttribute("disabled") &&
-      f.tabIndex !== -1 &&
-      // Skip anything hidden by a responsive layout — the bill grid renders a
-      // desktop table and a phone card list at once, and stepping into the
-      // copy nobody can see would look like the focus vanished.
-      f.getClientRects().length > 0,
-  );
+  const fields = fieldsIn(e.currentTarget);
   const i = fields.indexOf(el);
   if (i < 0) return;
 

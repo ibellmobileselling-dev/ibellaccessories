@@ -24,6 +24,7 @@ import {
   ChevronRight,
   LogOut,
   UserSquare2,
+  ScanLine,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useWorkspace } from "@/store/workspace";
@@ -59,6 +60,7 @@ const groups: NavGroup[] = [
       { path: "/parties", label: "Parties", icon: Users, key: "2" },
       { path: "/items", label: "Items", icon: Package, key: "3" },
       { path: "/inventory", label: "Inventory", icon: Boxes },
+      { path: "/serials", label: "Serial Lookup", icon: ScanLine },
     ],
   },
   {

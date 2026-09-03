@@ -1,4 +1,11 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import {
+  stockOf,
+  isSerialised,
+  serialsOf,
+  warrantyState,
+  SERIAL_STATUS_LABEL,
+} from "@/lib/serials";
 import { useGoBack } from "@/hooks/useGoBack";
 import { useEffect, useMemo, useState } from "react";
 import {
@@ -8,6 +15,7 @@ import {
   SaleReturnRepo,
   PurchaseReturnRepo,
   StockAdjustmentRepo,
+  SerialRepo,
 } from "@/repositories";
 import { fmtDate, fmtDateShort, fmtMoney, today } from "@/lib/format";
 import { newBatch, commitBatch } from "@/repositories/base";
@@ -29,11 +37,107 @@ import {
   ArrowDownLeft,
   ArrowUpRight,
   Undo2,
+  ScanLine,
 } from "lucide-react";
 
 export const Route = createFileRoute("/items_/$id")({ component: ItemDetailPage });
 
 const r2 = (n: number) => Math.round(n * 100) / 100;
+
+/**
+ * Every unit of a serialised item, and where each one is.
+ *
+ * For these items the shelf is this list — the stock figure above is counted
+ * from it, not stored. Shown here rather than only on the lookup screen
+ * because the owner's question is the other way round from the counter's:
+ * not "where is this unit" but "which units do I still have, and which are
+ * about to fall out of warranty on me".
+ */
+function UnitsPanel({ item }: { item: Item }) {
+  const _repoV = useRepoData();
+  const now = today();
+  const units = useRepoMemo(() => serialsOf(item.id, SerialRepo.all()), [item.id, _repoV]);
+  const pg = usePagination(units, "item-units");
+  const shown = pg.paged;
+  const inStock = units.filter((u) => u.status === "in_stock").length;
+
+  return (
+    <div className="px-5 pt-5">
+      <div className="bg-white border rounded-lg shadow-sm overflow-hidden max-w-5xl mx-auto">
+        <div className="px-5 py-3 border-b flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 font-medium">
+            <ScanLine className="h-4 w-4 text-gray-500" />
+            Units
+          </div>
+          {/* Stated rather than left to be counted: the number above is
+              derived from exactly this, and showing both makes that visible
+              instead of asking anyone to trust it. */}
+          <div className="text-sm text-gray-500">
+            {inStock} on the shelf · {units.length} ever received
+          </div>
+        </div>
+        {units.length === 0 ? (
+          <div className="px-5 py-8 text-center text-sm text-gray-500">
+            No units received yet. They are added when a purchase bill for this item is saved.
+          </div>
+        ) : (
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-gray-50 text-left text-xs uppercase tracking-wide text-gray-500">
+                  <tr>
+                    <th className="px-5 py-2 font-medium">Serial</th>
+                    <th className="px-5 py-2 font-medium">Status</th>
+                    <th className="px-5 py-2 font-medium">Received</th>
+                    <th className="px-5 py-2 font-medium">Sold to</th>
+                    <th className="px-5 py-2 font-medium">Warranty</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {shown.map((u) => {
+                    const w = warrantyState(u, now);
+                    return (
+                      <tr key={u.id} className="border-t">
+                        <td className="px-5 py-2 font-mono">{u.serial}</td>
+                        <td className="px-5 py-2">{SERIAL_STATUS_LABEL[u.status]}</td>
+                        <td className="px-5 py-2 text-gray-600">
+                          {u.purchaseDate ? fmtDateShort(u.purchaseDate) : "—"}
+                        </td>
+                        <td className="px-5 py-2 text-gray-600">{u.customerName || "—"}</td>
+                        <td
+                          className={
+                            "px-5 py-2 " +
+                            (w.tone === "expired"
+                              ? "text-rose-600"
+                              : w.tone === "expiring"
+                                ? "text-amber-600"
+                                : w.tone === "ok"
+                                  ? "text-emerald-600"
+                                  : "text-gray-500")
+                          }
+                        >
+                          {w.label}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <PaginationBar
+              page={pg.page}
+              totalPages={pg.totalPages}
+              pageSize={pg.pageSize}
+              total={pg.total}
+              onPage={pg.setPage}
+              onPageSize={pg.setPageSize}
+            />
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
 
 interface HistoryRow {
   date: string;
@@ -250,10 +354,10 @@ function ItemDetailPage() {
       <div className="hidden lg:grid grid-cols-6 bg-white border-b">
         <Stat
           label="Current Stock"
-          value={`${item.stock} ${item.unit}`}
-          color={item.stock < 0 ? "text-rose-600" : "text-gray-800"}
+          value={`${stockOf(item)} ${item.unit}`}
+          color={stockOf(item) < 0 ? "text-rose-600" : "text-gray-800"}
         />
-        <Stat label="Stock Value" value={fmtMoney(r2(item.stock * item.purchasePrice))} />
+        <Stat label="Stock Value" value={fmtMoney(r2(stockOf(item) * item.purchasePrice))} />
         <Stat label="Purchase Price" value={fmtMoney(item.purchasePrice)} />
         <Stat label="Sale Price" value={fmtMoney(item.salePrice)} />
         <Stat label="Total Sold" value={`${soldQty} ${item.unit}`} />
@@ -274,12 +378,12 @@ function ItemDetailPage() {
         <div className="flex gap-2.5 overflow-x-auto px-4 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
           <MobileStatCard
             label="Current Stock"
-            value={`${item.stock} ${item.unit}`}
-            color={item.stock < 0 ? "text-rose-600" : "text-gray-800"}
+            value={`${stockOf(item)} ${item.unit}`}
+            color={stockOf(item) < 0 ? "text-rose-600" : "text-gray-800"}
           />
           <MobileStatCard
             label="Stock Value"
-            value={fmtMoney(r2(item.stock * item.purchasePrice))}
+            value={fmtMoney(r2(stockOf(item) * item.purchasePrice))}
           />
           <MobileStatCard label="Purchase Price" value={fmtMoney(item.purchasePrice)} />
           <MobileStatCard label="Sale Price" value={fmtMoney(item.salePrice)} />
@@ -292,6 +396,8 @@ function ItemDetailPage() {
           />
         </div>
       </div>
+
+      {isSerialised(item) && <UnitsPanel item={item} />}
 
       {/* History */}
       <div className="flex-1 overflow-auto p-5">

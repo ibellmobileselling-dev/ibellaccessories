@@ -1,4 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { stockOf, inStockCounts, isSerialised } from "@/lib/serials";
 import { matchesQuery } from "@/lib/search";
 import { useEffect, useRef, useState } from "react";
 import { PageHeader } from "@/components/PageHeader";
@@ -13,6 +14,7 @@ import {
   PurchaseRepo,
   SaleReturnRepo,
   PurchaseReturnRepo,
+  SerialRepo,
 } from "@/repositories";
 import { useRepoData, useRepoMemo } from "@/hooks/useRepoData";
 import { useStickyState } from "@/hooks/useStickySearch";
@@ -31,6 +33,7 @@ import {
   Plus,
   Search,
   ArrowUpDown,
+  Trash2,
   Pencil,
   History,
   Download,
@@ -69,7 +72,7 @@ function itemToBulkRow(it: Item): string[] {
     it.wholesalePrice != null ? String(it.wholesalePrice) : "",
     it.minStock != null ? String(it.minStock) : "",
     String(it.openingStock ?? 0),
-    String(it.stock ?? 0),
+    String(stockOf(it)),
   ];
 }
 
@@ -109,12 +112,59 @@ function ItemsPage() {
     return () => window.removeEventListener("keydown", h);
   }, [adjustItem]);
 
+  // One pass over the serials, shared by every row below. Recomputed only
+  // when repository data changes, like every other derived list here.
+  const counts = useRepoMemo(() => inStockCounts(SerialRepo.all()));
+
   const filtered = rows.filter((r) => {
     const s = q.toLowerCase();
     return !s || matchesQuery(s, r.name, r.sku) || r.barcode?.includes(s);
   });
 
   const pg = usePagination(filtered, "items");
+
+  /**
+   * Deleting an item, with the guard that makes it safe.
+   *
+   * Lifted out of the table's onDelete because it was reachable ONLY from
+   * there — bound to Ctrl+Delete on a keyboard-selected row and nothing else.
+   * There was no button anywhere on this screen, which is why the shop
+   * reported items as having no delete option: they were right, for every
+   * way of working that involves a mouse.
+   */
+  const deleteItem = (r: Item) => {
+    if (!deleteAllowed) {
+      toast.error("You don't have permission to delete items");
+      return;
+    }
+    // An item that still appears on any bill/return can't be safely
+    // removed: its stock movements would orphan (Inventory & Stock
+    // reports drop it silently), its history page would 404, and
+    // editing/deleting one of those old bills later would skip the
+    // stock reversal for it entirely. Block it — same protection
+    // parties and payees already have.
+    const onDoc =
+      // allWithVoided: a cancelled bill still names this item, and its cost is
+      // still what the ledger reversed. Deleting the item would break the
+      // stock and profit history of those records — which is exactly what
+      // this guard exists to prevent. StockAdjustment is not voidable.
+      SalesRepo.allWithVoided().some((i) => i.lineItems.some((l) => l.itemId === r.id)) ||
+      PurchaseRepo.allWithVoided().some((i) => i.lineItems.some((l) => l.itemId === r.id)) ||
+      SaleReturnRepo.allWithVoided().some((i) => i.lineItems.some((l) => l.itemId === r.id)) ||
+      PurchaseReturnRepo.allWithVoided().some((i) => i.lineItems.some((l) => l.itemId === r.id)) ||
+      StockAdjustmentRepo.all().some((a) => a.itemId === r.id);
+    if (onDoc) {
+      toast.error(
+        `Can't delete "${r.name}" — it's used on bills, returns or stock adjustments. Deleting it would break stock and profit reports for those records.`,
+      );
+      return;
+    }
+    if (confirm(`Delete ${r.name}?`)) {
+      ItemRepo.remove(r.id);
+      refresh();
+      toast.success("Item deleted");
+    }
+  };
 
   const columns: Column<Item>[] = [
     {
@@ -147,14 +197,15 @@ function ItemsPage() {
       render: (r) => {
         // minStock=0 is a valid "alert exactly at zero" threshold — must not
         // be treated the same as "no threshold set" (which `&&` would do).
-        const low = (r.minStock != null && r.stock <= r.minStock) || r.stock < 0;
+        const s = stockOf(r, counts);
+        const low = (r.minStock != null && s <= r.minStock) || s < 0;
         return (
           <span className={low ? "text-warning font-medium" : ""}>
-            {r.stock} {r.unit}
+            {stockOf(r, counts)} {r.unit}
           </span>
         );
       },
-      sortValue: (r) => r.stock,
+      sortValue: (r) => stockOf(r, counts),
     },
     {
       key: "adjust",
@@ -196,6 +247,18 @@ function ItemsPage() {
               title="Adjust stock (damage, counting correction…)"
             >
               <ArrowUpDown className="h-3.5 w-3.5" />
+            </button>
+          )}
+          {deleteAllowed && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                deleteItem(r);
+              }}
+              className="h-7 w-7 inline-flex items-center justify-center rounded-md border border-transparent text-gray-400 transition hover:bg-destructive/10 hover:text-destructive hover:border-destructive/25"
+              title="Delete item"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
             </button>
           )}
         </span>
@@ -284,7 +347,8 @@ function ItemsPage() {
         ) : (
           <div className="divide-y divide-gray-100">
             {pg.paged.map((r) => {
-              const low = (r.minStock != null && r.stock <= r.minStock) || r.stock < 0;
+              const s = stockOf(r, counts);
+              const low = (r.minStock != null && s <= r.minStock) || s < 0;
               return (
                 <div
                   key={r.id}
@@ -306,7 +370,7 @@ function ItemsPage() {
                     <span
                       className={`text-xs font-semibold ${low ? "text-warning" : "text-gray-500"}`}
                     >
-                      {r.stock} {r.unit} in stock
+                      {stockOf(r, counts)} {r.unit} in stock
                     </span>
                     <div className="flex items-center gap-1">
                       <button
@@ -362,45 +426,7 @@ function ItemsPage() {
           rowKey={(r) => r.id}
           activateOnClick
           onRowActivate={(r) => navigate({ to: "/items/$id", params: { id: r.id } })}
-          onDelete={(r) => {
-            if (!deleteAllowed) {
-              toast.error("You don't have permission to delete items");
-              return;
-            }
-            // An item that still appears on any bill/return can't be safely
-            // removed: its stock movements would orphan (Inventory & Stock
-            // reports drop it silently), its history page would 404, and
-            // editing/deleting one of those old bills later would skip the
-            // stock reversal for it entirely. Block it — same protection
-            // parties and payees already have.
-            const onDoc =
-              // allWithVoided: a cancelled bill still names this item, and
-              // its cost is still what the ledger reversed. Deleting the item
-              // would break the stock and profit history of those records —
-              // which is exactly what this guard exists to prevent.
-              SalesRepo.allWithVoided().some((i) => i.lineItems.some((l) => l.itemId === r.id)) ||
-              PurchaseRepo.allWithVoided().some((i) =>
-                i.lineItems.some((l) => l.itemId === r.id),
-              ) ||
-              SaleReturnRepo.allWithVoided().some((i) =>
-                i.lineItems.some((l) => l.itemId === r.id),
-              ) ||
-              PurchaseReturnRepo.allWithVoided().some((i) =>
-                i.lineItems.some((l) => l.itemId === r.id),
-              ) ||
-              StockAdjustmentRepo.all().some((a) => a.itemId === r.id);
-            if (onDoc) {
-              toast.error(
-                `Can't delete "${r.name}" — it's used on bills, returns or stock adjustments. Deleting it would break stock and profit reports for those records.`,
-              );
-              return;
-            }
-            if (confirm(`Delete ${r.name}?`)) {
-              ItemRepo.remove(r.id);
-              refresh();
-              toast.success("Item deleted");
-            }
-          }}
+          onDelete={deleteItem}
         />
       </div>
       <ItemDialog open={open} onOpenChange={setOpen} item={edit} onSaved={refresh} />
@@ -449,13 +475,24 @@ export function StockAdjustDialog({
 
   if (!item) return null;
   const n = qty;
-  const newStock = Math.round((item.stock + (type === "add" ? n : -n)) * 100) / 100;
+  const newStock = Math.round((stockOf(item) + (type === "add" ? n : -n)) * 100) / 100;
 
   const save = (e: React.FormEvent) => {
     e.preventDefault();
     if (savingRef.current) return;
     if (n <= 0) {
       toast.error("Enter quantity to adjust");
+      return;
+    }
+    /* A serialised item's shelf is its list of units, so there is no stock
+       number here to nudge. Writing one would put a figure nothing reads
+       into the record — which looks like it worked, and is not. Correcting
+       these means naming units. */
+    if (isSerialised(item)) {
+      toast.error(
+        `${item.name} is tracked by serial number — its stock is the units on the shelf. Receive units on a purchase, or void the document that was wrong.`,
+        { duration: 8000 },
+      );
       return;
     }
     if (!canPost(date)) return;
@@ -492,7 +529,7 @@ export function StockAdjustDialog({
           <p className="text-sm text-muted-foreground">
             Current stock:{" "}
             <span className="font-bold text-foreground">
-              {item.stock} {item.unit}
+              {stockOf(item)} {item.unit}
             </span>
           </p>
           <div className="flex gap-2">
@@ -691,7 +728,7 @@ export function ItemDialog({
                   <div key={x.id} className="px-3 py-2 text-sm flex items-center justify-between">
                     <span className="font-medium">{x.name}</span>
                     <span className="text-[11px] text-muted-foreground">
-                      Stock: {x.stock} {x.unit}
+                      Stock: {stockOf(x)} {x.unit}
                     </span>
                   </div>
                 ))}
@@ -754,6 +791,58 @@ export function ItemDialog({
               setF({ ...f, minStock: v === "" ? undefined : Math.max(0, parseFloat(v) || 0) });
             }}
           />
+          {/* Serial tracking. Its own block, spanning the row, because
+              turning it on changes what "stock" means for this item and that
+              deserves more than a checkbox squeezed between two number
+              boxes. */}
+          <div className="sm:col-span-3 rounded-md border bg-muted/30 px-3 py-2.5">
+            <label className="flex items-start gap-2.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={!!f.trackSerials}
+                onChange={(e) => setF({ ...f, trackSerials: e.target.checked })}
+                className="mt-0.5 h-4 w-4 accent-primary"
+              />
+              <span>
+                <span className="text-[13px] font-semibold text-foreground block">
+                  Track serial numbers
+                </span>
+                <span className="text-[11px] text-muted-foreground block mt-0.5">
+                  For units with a warranty against the individual piece. Every purchase and sale of
+                  this item will ask which units — and its stock becomes the count of units on the
+                  shelf, rather than a number anyone can type. Leave off for anything sold by the
+                  handful.
+                </span>
+              </span>
+            </label>
+            {f.trackSerials && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-2.5 pl-6">
+                <Field
+                  label="Customer warranty (months)"
+                  type="text"
+                  inputMode="numeric"
+                  value={f.warrantyMonths ?? ""}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (!/^\d*$/.test(v)) return;
+                    setF({ ...f, warrantyMonths: v === "" ? undefined : parseInt(v, 10) });
+                  }}
+                />
+                <Field
+                  label="Vendor warranty (months)"
+                  type="text"
+                  inputMode="numeric"
+                  value={f.vendorWarrantyMonths ?? ""}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (!/^\d*$/.test(v)) return;
+                    setF({ ...f, vendorWarrantyMonths: v === "" ? undefined : parseInt(v, 10) });
+                  }}
+                />
+              </div>
+            )}
+          </div>
+
           <div className="sm:col-span-3 flex justify-end gap-2 mt-2">
             <Button
               type="button"

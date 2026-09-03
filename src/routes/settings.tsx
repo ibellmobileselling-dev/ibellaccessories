@@ -15,9 +15,11 @@ import {
   PurchaseReturnRepo,
   StockAdjustmentRepo,
   AuditLogRepo,
+  SerialRepo,
 } from "@/repositories";
 import { newBatch, commitBatch } from "@/repositories/base";
 import { planDataRepair, type DataRepairPlan, type DataRepairData } from "@/lib/dataRepair";
+import { checkSerialIntegrity, type SerialAuditResult } from "@/lib/serialAudit";
 import { useRepoData, useRepoMemo } from "@/hooks/useRepoData";
 import { Field } from "@/components/Field";
 import { Button } from "@/components/ui/button";
@@ -161,6 +163,31 @@ function SettingsPage() {
   const teamRef = useRef<HTMLDivElement>(null);
   const whatsappRef = useRef<HTMLDivElement>(null);
   const bankRef = useRef<HTMLDivElement>(null);
+  const [serialAudit, setSerialAudit] = useState<SerialAuditResult | null>(null);
+
+  /**
+   * Reports; never repairs.
+   *
+   * Every finding here has two possible fixes — move the unit, or correct the
+   * document — and which is right depends on what physically happened in the
+   * shop. An "Apply Corrections" button would have to guess, turning a
+   * visible disagreement into an invisible wrong answer.
+   *
+   * Live documents only: a cancelled bill has stopped counting, so a unit it
+   * names is not evidence of anything.
+   */
+  const runSerialCheck = () => {
+    setSerialAudit(
+      checkSerialIntegrity({
+        serials: SerialRepo.all(),
+        items: ItemRepo.all(),
+        sales: SalesRepo.all(),
+        purchases: PurchaseRepo.all(),
+        saleReturns: SaleReturnRepo.all(),
+        purchaseReturns: PurchaseReturnRepo.all(),
+      }),
+    );
+  };
   const booksRef = useRef<HTMLDivElement>(null);
   const dataRef = useRef<HTMLDivElement>(null);
   const shortcutsRef = useRef<HTMLDivElement>(null);
@@ -596,6 +623,68 @@ function SettingsPage() {
                       >
                         {busy ? "Correcting…" : "Apply Corrections"}
                       </Button>
+                    )}
+                  </div>
+
+                  {/* Serial-tracked items have no stored total to rebuild —
+                      their stock IS the unit list — so what can go wrong for
+                      them is a different question, asked separately. */}
+                  <div className="mt-5 pt-4 border-t border-gray-100">
+                    <p className="text-xs text-gray-500 mb-3">
+                      Items tracked by <span className="font-semibold">serial number</span> have no
+                      stored total to rebuild — their stock is the list of units itself. What can go
+                      wrong there is a unit and a document disagreeing, which this checks for. It
+                      only ever reports: fixing one means either moving the unit or correcting the
+                      document, and only you know which actually happened.
+                    </p>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={runSerialCheck}
+                      className="w-full sm:w-auto"
+                    >
+                      <ShieldCheck className="h-3.5 w-3.5" />
+                      Check Serial Numbers
+                    </Button>
+
+                    {serialAudit && !serialAudit.issues.length && (
+                      <div className="mt-4 flex items-start gap-2 text-xs bg-emerald-50/60 border border-emerald-100 rounded-md px-3 py-2.5">
+                        <ShieldCheck className="h-4 w-4 text-emerald-600 shrink-0 mt-0.5" />
+                        <p className="text-gray-700">
+                          All {serialAudit.checked} unit{serialAudit.checked === 1 ? "" : "s"} agree
+                          with the documents that moved them.
+                          {serialAudit.untrackedLines > 0 && (
+                            <>
+                              {" "}
+                              {serialAudit.untrackedLines} older bill line
+                              {serialAudit.untrackedLines === 1 ? "" : "s"} carr
+                              {serialAudit.untrackedLines === 1 ? "ies" : "y"} no units, from before
+                              those items were switched on — expected, and nothing to fix.
+                            </>
+                          )}
+                        </p>
+                      </div>
+                    )}
+
+                    {serialAudit && serialAudit.issues.length > 0 && (
+                      <div className="mt-4">
+                        <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-1.5">
+                          Units that disagree with the documents ({serialAudit.issues.length})
+                        </p>
+                        <div className="border border-gray-100 rounded-md overflow-hidden max-h-64 overflow-y-auto">
+                          {serialAudit.issues.map((iss, n) => (
+                            <div
+                              key={`${iss.kind}-${iss.serial ?? n}`}
+                              className="px-3 py-2 text-xs border-b border-gray-100 last:border-b-0"
+                            >
+                              <span className="text-gray-800">{iss.message}</span>
+                              {iss.itemName && (
+                                <span className="text-gray-500"> · {iss.itemName}</span>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
                     )}
                   </div>
 

@@ -57,6 +57,17 @@ export function planStockRepair(data: {
 
   const out: StockCorrection[] = [];
   for (const it of data.items) {
+    /* A serialised item's stock is the count of its serials, not a stored
+       number this can rebuild — so there is nothing here to repair, and
+       "repairing" it would write a documents-derived figure over a shelf
+       count that is already right. What CAN go wrong for those items is the
+       serials themselves, which has its own check.
+
+       Note this is the opposite answer to the delete guards, which had to
+       start counting voided documents. The two questions look alike and are
+       not: that one asks "is this still referenced", this one asks "what
+       should the number be". */
+    if (it.trackSerials) continue;
     const correct = r2(num(it.openingStock) + (movement.get(it.id) ?? 0));
     // A stock that is not actually a NUMBER always needs rebuilding, even when
     // it reads as the right figure. Firestore will happily hold "5", every

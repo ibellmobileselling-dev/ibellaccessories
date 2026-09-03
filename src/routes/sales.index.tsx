@@ -36,6 +36,8 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { usePermissions } from "@/hooks/usePermissions";
 import { VoidDialog, VoidedBadge } from "@/components/VoidDialog";
 import { canDeleteOutright, isVoided, removalWord } from "@/lib/voiding";
+import { SerialRepo } from "@/repositories";
+import { undoSerialsOf } from "@/lib/serialMoves";
 
 export const Route = createFileRoute("/sales/")({ component: SalesPage });
 
@@ -214,7 +216,13 @@ function SalesPage() {
   const undoSaleEffects = (batch: ReturnType<typeof newBatch>, live: Invoice) => {
     for (const l of live.lineItems) {
       const it = ItemRepo.get(l.itemId);
-      if (it) ItemRepo.adjustFieldBatched(batch, it.id, "stock", l.qty);
+      // A serialised item's stock is its serials, moved just below — nudging
+      // the stored number as well would leave a second figure that nothing
+      // reads and somebody eventually believes.
+      if (it && !it.trackSerials) ItemRepo.adjustFieldBatched(batch, it.id, "stock", l.qty);
+    }
+    for (const u of undoSerialsOf(live, "sale", (id) => ItemRepo.get(id))) {
+      SerialRepo.updateBatched(batch, u.id, u.patch as never);
     }
     // Payments applied to this invoice: unlink them so the money stays
     // counted as an advance instead of silently disappearing.

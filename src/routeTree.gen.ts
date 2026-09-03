@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as SettingsRouteImport } from './routes/settings'
+import { Route as SerialsRouteImport } from './routes/serials'
 import { Route as ReportsRouteImport } from './routes/reports'
 import { Route as PaymentsRouteImport } from './routes/payments'
 import { Route as PayeesRouteImport } from './routes/payees'
@@ -45,6 +46,11 @@ import { Route as PurchaseEditIdRouteImport } from './routes/purchase.edit.$id'
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SerialsRoute = SerialsRouteImport.update({
+  id: '/serials',
+  path: '/serials',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ReportsRoute = ReportsRouteImport.update({
@@ -217,6 +223,7 @@ export interface FileRoutesByFullPath {
   '/payees': typeof PayeesRoute
   '/payments': typeof PaymentsRoute
   '/reports': typeof ReportsRoute
+  '/serials': typeof SerialsRoute
   '/settings': typeof SettingsRoute
   '/bank/$id': typeof BankIdRoute
   '/items/$id': typeof ItemsIdRoute
@@ -251,6 +258,7 @@ export interface FileRoutesByTo {
   '/payees': typeof PayeesRoute
   '/payments': typeof PaymentsRoute
   '/reports': typeof ReportsRoute
+  '/serials': typeof SerialsRoute
   '/settings': typeof SettingsRoute
   '/bank/$id': typeof BankIdRoute
   '/items/$id': typeof ItemsIdRoute
@@ -286,6 +294,7 @@ export interface FileRoutesById {
   '/payees': typeof PayeesRoute
   '/payments': typeof PaymentsRoute
   '/reports': typeof ReportsRoute
+  '/serials': typeof SerialsRoute
   '/settings': typeof SettingsRoute
   '/bank_/$id': typeof BankIdRoute
   '/items_/$id': typeof ItemsIdRoute
@@ -322,6 +331,7 @@ export interface FileRouteTypes {
     | '/payees'
     | '/payments'
     | '/reports'
+    | '/serials'
     | '/settings'
     | '/bank/$id'
     | '/items/$id'
@@ -356,6 +366,7 @@ export interface FileRouteTypes {
     | '/payees'
     | '/payments'
     | '/reports'
+    | '/serials'
     | '/settings'
     | '/bank/$id'
     | '/items/$id'
@@ -390,6 +401,7 @@ export interface FileRouteTypes {
     | '/payees'
     | '/payments'
     | '/reports'
+    | '/serials'
     | '/settings'
     | '/bank_/$id'
     | '/items_/$id'
@@ -425,6 +437,7 @@ export interface RootRouteChildren {
   PayeesRoute: typeof PayeesRoute
   PaymentsRoute: typeof PaymentsRoute
   ReportsRoute: typeof ReportsRoute
+  SerialsRoute: typeof SerialsRoute
   SettingsRoute: typeof SettingsRoute
   BankIdRoute: typeof BankIdRoute
   ItemsIdRoute: typeof ItemsIdRoute
@@ -453,6 +466,13 @@ declare module '@tanstack/react-router' {
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/serials': {
+      id: '/serials'
+      path: '/serials'
+      fullPath: '/serials'
+      preLoaderRoute: typeof SerialsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/reports': {
@@ -689,6 +709,7 @@ const rootRouteChildren: RootRouteChildren = {
   PayeesRoute: PayeesRoute,
   PaymentsRoute: PaymentsRoute,
   ReportsRoute: ReportsRoute,
+  SerialsRoute: SerialsRoute,
   SettingsRoute: SettingsRoute,
   BankIdRoute: BankIdRoute,
   ItemsIdRoute: ItemsIdRoute,

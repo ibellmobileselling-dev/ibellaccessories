@@ -1,5 +1,7 @@
 import type { Return, Company } from "@/types";
 import { fmtMoney, fmtDate } from "@/lib/format";
+import { serialTextIndex } from "@/lib/serials";
+import { PrintedSerials } from "@/components/PrintedSerials";
 
 interface Props {
   ret: Return;
@@ -15,6 +17,8 @@ interface Props {
 export function PrintableReturn({ ret, company, mode, className = "print-area" }: Props) {
   const isSaleReturn = mode === "sale-return";
   const gstOn = ret.gstEnabled !== false;
+  // One pass over the units for the whole document — see serialTextIndex.
+  const serialIndex = serialTextIndex();
   const title = isSaleReturn ? "CREDIT NOTE" : "DEBIT NOTE";
 
   const gstBuckets: Record<string, { taxable: number; tax: number }> = {};
@@ -131,7 +135,10 @@ export function PrintableReturn({ ret, company, mode, className = "print-area" }
             return (
               <tr key={l.id}>
                 <td style={{ ...cellStyle, textAlign: "center" }}>{i + 1}</td>
-                <td style={cellStyle}>{l.name}</td>
+                <td style={cellStyle}>
+                  {l.name}
+                  <PrintedSerials line={l} index={serialIndex} />
+                </td>
                 <td style={{ ...cellStyle, textAlign: "right" }}>{l.qty}</td>
                 <td style={cellStyle}>{l.unit}</td>
                 <td style={{ ...cellStyle, textAlign: "right" }}>{fmtMoney(l.price)}</td>

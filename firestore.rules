@@ -1,12 +1,18 @@
 rules_version = '2';
 
-// Deploy this to the NAMED database this app actually uses
-// ("ibellaccessory", see DATABASE_ID in src/lib/firebase.ts) — not
+// Deploy this to the NAMED database this app actually uses (see
+// DATABASE_ID in src/lib/firebase.ts and VITE_FIRESTORE_DB in .env — the
+// two deployments of this app point at different databases) — not
 // necessarily the "(default)" database, if your project has more than one.
 // Via Firebase Console: Firestore Database → select that database → Rules
 // tab → paste this in → Publish. Via CLI: `firebase deploy --only
-// firestore:rules --database=ibellaccessory` (adjust flag to match your
+// firestore:rules --database=<that database>` (adjust flag to match your
 // Firebase CLI/firebase.json setup).
+//
+// EVERY collection the app writes must appear below: the file ends with
+// Firestore's default deny, so a collection that is merely forgotten fails
+// at runtime in production and nowhere else. tests/run-screens.cjs checks
+// this list against REPO_BY_KEY on every run for exactly that reason.
 //
 // STRONGLY RECOMMENDED before publishing to production: test against the
 // Firebase Emulator Suite first, seeded with 100+ documents in at least one
@@ -75,6 +81,24 @@ service cloud.firestore {
         || hasPerm('purchaseExpenses', 'edit');
       allow delete: if hasPerm('masterData', 'delete');
     }
+    // Individual units of a serial-tracked item. Written from EVERY document
+    // that moves stock, for the same reason items are just above: receiving
+    // stamps them on a purchase, selling marks them sold, both returns move
+    // them, and cancelling any of those puts them back — each inside the one
+    // atomic batch that saves the document. A Sales-only user finishing a
+    // perfectly permitted sale must not fail opaquely on this collection.
+    //
+    // Never deleted: a unit that turns out not to have arrived is marked
+    // voided, so the record of it survives being corrected. Nothing in the
+    // app calls remove() on this collection, and the rule says so rather
+    // than leaving a door open that nothing walks through.
+    match /serials/{id} {
+      allow read: if hasPerm('masterData', 'view');
+      allow create, update: if hasPerm('masterData', 'edit')
+        || hasPerm('sales', 'edit')
+        || hasPerm('purchaseExpenses', 'edit');
+      allow delete: if false;
+    }
 
     // ---- Sales, Sale Return ----
     match /sales/{id} {
@@ -141,10 +165,41 @@ service cloud.firestore {
       allow delete: if hasPerm('cashBank', 'delete');
     }
 
-    // Note: Reports/Daybook/GST have no collection of their own — they
-    // aggregate reads across the collections above, already governed by
-    // their own rules. There's nothing to add a rule for here; "reports"
-    // permission is enforced entirely in the UI (see src/routes/__root.tsx).
+    // Note: Daybook/GST have no collection of their own — they aggregate
+    // reads across the collections above, already governed by their own
+    // rules. Reports owns exactly one collection, below.
+
+    // ---- Reports ----
+    // Closing entries: the one journal no document implies, so it has to be
+    // stored (see JournalEntryDoc in src/types). Written by the year close
+    // and read by the balance sheet, both of which live in Reports.
+    //
+    // Never deleted: reopening a year REVERSES its closing entry rather than
+    // removing it, so the decision to close and the decision to reopen are
+    // both on the record. See LedgerReports.tsx.
+    match /ledger-entries/{id} {
+      allow read: if hasPerm('reports', 'view');
+      allow create, update: if hasPerm('reports', 'edit');
+      allow delete: if false;
+    }
+
+    // ---- Deletion log ----
+    // Written as a side effect of EVERY delete and void, on the caller's own
+    // batch so the log and the deletion succeed or fail together (see
+    // setDeletionRecorder in src/repositories/index.ts). That coupling is
+    // why this needs a create rule for every module that can delete
+    // anything: without one, the denied log write takes the whole batch down
+    // with it and the delete itself fails — not just the audit trail.
+    //
+    // Read is owner-only, matching the Settings screen that shows it; it
+    // holds a full snapshot of every deleted record, so it is the one
+    // collection that reveals data a restricted user was never shown.
+    // Immutable once written, which is the entire point of a log.
+    match /audit-log/{id} {
+      allow read: if isOwner();
+      allow create: if isActiveUser();
+      allow update, delete: if false;
+    }
 
     // ---- Company settings ----
     // Read is universal for any active user (invoice numbering, GST calc,

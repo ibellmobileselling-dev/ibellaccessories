@@ -14,6 +14,8 @@ import { usePeriodLock } from "@/hooks/usePeriodLock";
 import { usePermissions } from "@/hooks/usePermissions";
 import { VoidDialog, VoidedBadge } from "@/components/VoidDialog";
 import { canDeleteOutright, isVoided, removalWord } from "@/lib/voiding";
+import { SerialRepo } from "@/repositories";
+import { undoSerialsOf } from "@/lib/serialMoves";
 import { Ban } from "lucide-react";
 
 export const Route = createFileRoute("/purchase-return/")({ component: PurchaseReturnPage });
@@ -74,7 +76,16 @@ function PurchaseReturnPage() {
    *  they owe the shop the same reversal, and two copies would drift. */
   const undoReturnEffects = (batch: ReturnType<typeof newBatch>, live: Return) => {
     for (const l of live.lineItems) {
-      if (ItemRepo.get(l.itemId)) ItemRepo.adjustFieldBatched(batch, l.itemId, "stock", l.qty);
+      const it = ItemRepo.get(l.itemId);
+      // A serialised item's stock is its units, moved just below. Nudging the
+      // stored number as well would leave a second figure that nothing reads
+      // and somebody eventually believes.
+      if (it && !it.trackSerials) {
+        ItemRepo.adjustFieldBatched(batch, l.itemId, "stock", l.qty);
+      }
+    }
+    for (const u of undoSerialsOf(live, "purchase-return", (id) => ItemRepo.get(id))) {
+      SerialRepo.updateBatched(batch, u.id, u.patch as never);
     }
   };
 

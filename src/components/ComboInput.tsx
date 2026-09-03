@@ -102,7 +102,19 @@ export function ComboInput({
           setOpen(true);
           setIdx(0);
         }}
-        onFocus={() => setOpen(true)}
+        /* Select what is there, so arriving by CLICK behaves the way
+           arriving by Tab already did.
+           Reported from the shop as "clicking the category does nothing, only
+           Tab works". Both focus the box; the difference is that Tab selects
+           the contents and a click drops the caret wherever the pointer
+           landed. Typing then inserts into the middle of the existing
+           category — "Chaacrger" — the list matches nothing, and the box
+           looks broken. Every other focus move in this app already selects
+           (see useFormKeys); this one did not. */
+        onFocus={(e) => {
+          setOpen(true);
+          e.currentTarget.select();
+        }}
         // A click on a row must land before the blur closes the list, which
         // is what the delay buys; the rows also use mousedown for the same
         // reason.
@@ -132,9 +144,28 @@ export function ComboInput({
         rect &&
         rows.length > 0 &&
         createPortal(
+          /* pointerEvents: "auto" below is not decoration.
+             A modal Radix dialog sets pointer-events:none on <body> while it
+             is open, and this list is portalled to <body> — so it inherits
+             that and becomes unclickable, while the keyboard, which does not
+             consult pointer-events at all, keeps working perfectly. That is
+             the exact shape of the bug the shop reported twice: "clicking a
+             category does nothing, only Tab works".
+             It also hid from every test here, because dispatchEvent ignores
+             pointer-events too. Only elementFromPoint asks the question a
+             mouse actually asks, and that is what the test now uses. */
           <div
             role="listbox"
-            style={{ position: "fixed", top: rect.top, left: rect.left, width: rect.width }}
+            style={{
+              position: "fixed",
+              top: rect.top,
+              left: rect.left,
+              width: rect.width,
+              // See the note in ComboInput: a modal Radix dialog switches
+              // pointer events off on <body>, and anything portalled there
+              // goes with it unless it says otherwise.
+              pointerEvents: "auto",
+            }}
             className="z-50 border rounded-md bg-popover shadow-elevated max-h-56 overflow-auto"
           >
             {rows.map((opt, i) => (

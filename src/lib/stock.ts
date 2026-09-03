@@ -1,5 +1,6 @@
 import { ItemRepo } from "@/repositories";
 import type { LineItem } from "@/types";
+import { stockOf } from "@/lib/serials";
 
 /**
  * Aggregates quantity needed per item across `lines` and checks it against
@@ -18,7 +19,9 @@ export function stockShortfalls(lines: LineItem[], reverseLines: LineItem[] = []
   for (const [itemId, qty] of needed) {
     const it = ItemRepo.get(itemId);
     if (!it) continue;
-    const available = it.stock + (reversed.get(itemId) ?? 0);
+    // stockOf, not it.stock: for a serialised item the shelf is the serial
+    // count, and the stored number is not maintained at all.
+    const available = stockOf(it) + (reversed.get(itemId) ?? 0);
     if (available - qty < 0) {
       out.push(`${it.name} (have ${available} ${it.unit}, need ${qty})`);
     }

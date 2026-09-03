@@ -1,6 +1,8 @@
 import type { Invoice, Company } from "@/types";
 import { fmtMoney, fmtDate } from "@/lib/format";
 import { fmtMode } from "@/lib/paymentMode";
+import { serialTextIndex } from "@/lib/serials";
+import { PrintedSerials } from "@/components/PrintedSerials";
 
 const r2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -19,6 +21,8 @@ export function ThermalReceipt({
   width: 80 | 58;
 }) {
   const gstOn = inv.gstEnabled !== false;
+  // One pass over the units for the whole document — see serialTextIndex.
+  const serialIndex = serialTextIndex();
   const paperMm = width === 80 ? 72 : 48; // printable width inside the roll
   // The roll is wider than the printable content (a real physical margin
   // thermal paper has) — split that leftover evenly so it reads as a
@@ -91,6 +95,9 @@ export function ThermalReceipt({
           <div style={{ fontWeight: 700 }}>
             {i + 1}. {l.name}
           </div>
+          {/* 8pt on a 58mm roll: small enough not to push the money column
+              onto its own line, large enough to still be read back. */}
+          <PrintedSerials line={l} index={serialIndex} size={8} />
           <div style={{ display: "flex", justifyContent: "space-between" }}>
             <span>
               {l.qty} {l.unit} × {fmtMoney(l.price)}

@@ -840,9 +840,29 @@ function ReceivePaymentDialog({
   // Portion of the true balance not already represented by an open invoice
   // row above (e.g. opening balance, or a manual ledger correction).
   const unlinkedBalance = Math.max(0, r2(partyTrueBalance - totalOutstanding));
-  /** Everything this party owes — open bills PLUS anything carried outside
-   *  them, such as an opening balance. What "pay in full" has to mean. */
-  const totalDue = r2(totalOutstanding + unlinkedBalance);
+  /**
+   * Everything this party owes, NET — the same figure their own statement
+   * prints, and deliberately the same.
+   *
+   * Two screens naming a different "outstanding" for one party is how a
+   * shopkeeper collects the wrong amount, and this is the number the customer
+   * argues about on the phone.
+   *
+   * partyTrueBalance is the whole truth already: netPartyPositions folds in
+   * the opening balance, both kinds of bill, both kinds of return and every
+   * payment. The old formula reached the same answer only in ONE direction —
+   * a balance carried outside any invoice, which it added on. The other
+   * direction it could not express: a party who is customer AND supplier owes
+   * LESS than their open invoices, because what the shop owes them offsets
+   * it, and Math.max(0, …) above quietly clamped that to nothing. So the
+   * dialog showed ₹27,400 of open bills while the statement showed the
+   * ₹17,550 actually due, and neither screen mentioned the other.
+   */
+  const totalDue = r2(partyTrueBalance);
+  /** What the shop owes this party, when that is what makes the two figures
+   *  differ. Shown rather than netted away silently: "they owe me 27,400" and
+   *  "I owe them 9,850" are both true, and the customer knows both. */
+  const offsettingBalance = Math.max(0, r2(totalOutstanding - totalDue));
   const totalApplied = r2(applyRows.reduce((s, r) => s + r.apply, 0));
   const totalDiscount = r2(applyRows.reduce((s, r) => s + r.discount, 0));
   // Advance / general payment whenever nothing is actually applied to an
@@ -1180,8 +1200,14 @@ function ReceivePaymentDialog({
                   <p
                     className={`text-[22px] font-bold tabular-nums mt-0.5 ${isIn ? "text-emerald-700" : "text-rose-700"}`}
                   >
-                    {fmtMoney(totalOutstanding + unlinkedBalance)}
+                    {fmtMoney(totalDue)}
                   </p>
+                  {offsettingBalance > 0.01 && (
+                    <p className="text-[11px] text-gray-600 mt-1 leading-snug">
+                      {fmtMoney(totalOutstanding)} on open {isIn ? "bills" : "purchases"}, less{" "}
+                      {fmtMoney(offsettingBalance)} {isIn ? "you owe them" : "they owe you"}
+                    </p>
+                  )}
                 </div>
                 {applyRows.length > 0 && allocMode === "manual" && (
                   <div className="flex gap-2 shrink-0">

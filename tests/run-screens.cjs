@@ -69,18 +69,6 @@ const stubs = {
 };
 
 /**
- * PERIOD-LOCK COVERAGE — a source check, not a behaviour test.
- *
- * A partial lock is worse than none, because it looks complete: the owner
- * closes July, and one screen quietly keeps writing into it. Behaviour tests
- * can only cover the screens somebody thought to test, and the failure mode
- * here is forgetting a screen — so this asserts the shape of the code instead.
- *
- * Any module that writes a DATED business document must also ask the lock.
- * Add a new write path without a guard and this fails by name, on the next
- * run, before it reaches anyone's books.
- */
-/**
  * Every screen that destroys a transaction document must also be able to
  * cancel one.
  *
@@ -148,6 +136,25 @@ function checkBackupKeepsVoided() {
  * screen is the failure that costs the shop a day's takings, so the wiring is
  * checked here instead.
  */
+function checkTestBannerMounted() {
+  const src = fs.readFileSync(path.resolve(__dirname, "../src/routes/__root.tsx"), "utf8");
+  const mounted = /<TestDataBanner\s*\/>/.test(src);
+  // And production must be the fallback, so a deployment that forgets its
+  // configuration lands on the shop's own books rather than on a stranger's.
+  const fb = fs.readFileSync(path.resolve(__dirname, "../src/lib/firebase.ts"), "utf8");
+  const defaultsToProduction =
+    /export const DATABASE_ID =[\s\S]{0,200}?PRODUCTION_DATABASE_ID;/.test(fb);
+  if (mounted && defaultsToProduction) {
+    console.log("  Test-data warning is mounted, and production is the default database.");
+    return true;
+  }
+  if (!mounted) console.log("\n  TEST BANNER: __root.tsx does not mount <TestDataBanner />.");
+  if (!defaultsToProduction)
+    console.log("\n  TEST BANNER: DATABASE_ID does not fall back to the production database.");
+  console.log("");
+  return false;
+}
+
 /**
  * "Is this master record still referenced?" must count cancelled documents.
  *
@@ -182,25 +189,62 @@ function checkDeleteGuardsSeeVoided() {
   return true;
 }
 
-function checkTestBannerMounted() {
-  const src = fs.readFileSync(path.resolve(__dirname, "../src/routes/__root.tsx"), "utf8");
-  const mounted = /<TestDataBanner\s*\/>/.test(src);
-  // And production must be the fallback, so a deployment that forgets its
-  // configuration lands on the shop's own books rather than on a stranger's.
-  const fb = fs.readFileSync(path.resolve(__dirname, "../src/lib/firebase.ts"), "utf8");
-  const defaultsToProduction =
-    /export const DATABASE_ID =[\s\S]{0,200}?PRODUCTION_DATABASE_ID;/.test(fb);
-  if (mounted && defaultsToProduction) {
-    console.log("  Test-data warning is mounted, and production is the default database.");
-    return true;
+/**
+ * Every path that moves stock must know about serialised items.
+ *
+ * For those items the shelf is the list of units, so a path that nudges
+ * item.stock and stops there writes a figure nothing reads — which looks like
+ * it worked. Some paths move the serials instead; some refuse and say why.
+ * Either is fine. Silence is not, and silence is what a rendered test cannot
+ * see: nothing fails, a number is simply written into a void.
+ */
+function checkStockPathsKnowSerials() {
+  const MOVES_STOCK = /adjustField(Batched)?\([^)]*"stock"/;
+  const KNOWS = /trackSerials|isSerialised|undoSerialsOf|planSaleSerials|planPurchaseSerials/;
+  const EXEMPT = new Set([
+    // Rebuilds stored totals from documents and skips serialised items in the
+    // library itself (lib/dataRepair.ts), which is asserted by the unit suite.
+    "src/routes/settings.tsx",
+    // Reverses a stock adjustment, which serialised items cannot have — the
+    // adjust dialog refuses them before one can exist.
+    "src/routes/items_.$id.tsx",
+  ]);
+
+  const offenders = [];
+  for (const root of ["src/components", "src/routes"]) {
+    const dir = path.resolve(__dirname, "..", root);
+    if (!fs.existsSync(dir)) continue;
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.endsWith(".tsx") && !name.endsWith(".ts")) continue;
+      const rel = `${root}/${name}`;
+      if (EXEMPT.has(rel)) continue;
+      const src = fs.readFileSync(path.join(dir, name), "utf8");
+      if (MOVES_STOCK.test(src) && !KNOWS.test(src)) offenders.push(rel);
+    }
   }
-  if (!mounted) console.log("\n  TEST BANNER: __root.tsx does not mount <TestDataBanner />.");
-  if (!defaultsToProduction)
-    console.log("\n  TEST BANNER: DATABASE_ID does not fall back to the production database.");
-  console.log("");
-  return false;
+  if (offenders.length) {
+    console.log("\n  SERIALS: these move stock but never ask whether the item is tracked by");
+    console.log("  serial — for those items the number they write is read by nothing:");
+    offenders.forEach((f) => console.log("    x " + f));
+    console.log("");
+    return false;
+  }
+  console.log("  Stock paths all know about serialised items.");
+  return true;
 }
 
+/**
+ * PERIOD-LOCK COVERAGE — a source check, not a behaviour test.
+ *
+ * A partial lock is worse than none, because it looks complete: the owner
+ * closes July, and one screen quietly keeps writing into it. Behaviour tests
+ * can only cover the screens somebody thought to test, and the failure mode
+ * here is forgetting a screen — so this asserts the shape of the code instead.
+ *
+ * Any module that writes a DATED business document must also ask the lock.
+ * Add a new write path without a guard and this fails by name, on the next
+ * run, before it reaches anyone's books.
+ */
 function checkPeriodLockCoverage() {
   const roots = ["src/components", "src/routes"];
   // Writes that create or move money/stock with a date on them. Reads,
@@ -238,12 +282,58 @@ function checkPeriodLockCoverage() {
   return true;
 }
 
+/**
+ * Every collection the app talks to must have a rule written for it.
+ *
+ * firestore.rules ends with Firestore's default deny, so a collection that
+ * is simply forgotten does not fail here, or in any test, or in any build —
+ * it fails at the counter, in production, the first time somebody uses the
+ * feature it belongs to. That is the worst possible place to find out, and
+ * nothing else in this repo was looking.
+ *
+ * Matched on the collection name the Repository is constructed with, which
+ * is the string Firestore actually sees — not on the export name, which
+ * could drift from it without anybody noticing.
+ */
+function checkEveryCollectionHasRules() {
+  const repos = fs.readFileSync(path.resolve(__dirname, "../src/repositories/index.ts"), "utf8");
+  const rules = fs.readFileSync(path.resolve(__dirname, "../firestore.rules"), "utf8");
+  const names = [...repos.matchAll(/new Repository<[^>]*>\(\s*"([^"]+)"/g)].map((m) => m[1]);
+  /* A parser that finds SOME of the declarations is more dangerous than one
+     that finds none: it reports a comfortable pass while covering less than
+     it did yesterday. So the number of names read has to equal the number of
+     construction sites, and a mismatch fails rather than quietly shortening
+     the list. */
+  const sites = (repos.match(/new Repository\b/g) ?? []).length;
+  if (!names.length || names.length !== sites) {
+    console.log(
+      `\n  RULES: found ${sites} Repository constructions but could read ${names.length}`,
+    );
+    console.log("  collection names out of them. Until those agree this check covers less than");
+    console.log("  it claims — fix the pattern in run-screens.cjs.\n");
+    return false;
+  }
+  const missing = names.filter((n) => !new RegExp(`match /${n}/`).test(rules));
+  if (missing.length) {
+    console.log("\n  RULES: these collections are written by the app but have no rule, so every");
+    console.log("  read and write to them is denied in production:");
+    missing.forEach((n) => console.log("    x " + n));
+    console.log("  The file ends with a default deny — a forgotten collection fails nowhere");
+    console.log("  but at the counter.\n");
+    return false;
+  }
+  console.log(`  Firestore rules cover all ${names.length} collections the app writes.`);
+  return true;
+}
+
 async function main() {
   const lockOk = checkPeriodLockCoverage();
   const voidOk = checkVoidCoverage();
   const bannerOk = checkTestBannerMounted();
   const guardsOk = checkDeleteGuardsSeeVoided();
+  const serialsOk = checkStockPathsKnowSerials();
   const backupOk = checkBackupKeepsVoided();
+  const rulesOk = checkEveryCollectionHasRules();
   fs.mkdirSync(OUT_DIR, { recursive: true });
 
   fs.writeFileSync(
@@ -390,7 +480,14 @@ run().then((r) => { (window as any).__RESULT__ = r; })
   }
   console.log("══════════════════════════════════════\n");
   process.exit(
-    result.failed || pageErrors.length || !lockOk || !voidOk || !backupOk || !bannerOk || !guardsOk
+    result.failed ||
+      pageErrors.length ||
+      !lockOk ||
+      !voidOk ||
+      !backupOk ||
+      !bannerOk ||
+      !guardsOk ||
+      !serialsOk
       ? 1
       : 0,
   );

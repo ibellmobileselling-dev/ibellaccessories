@@ -55,11 +55,13 @@ import type {
   Payment,
   PaymentMode,
   Return,
+  Serial,
   StockAdjustment,
 } from "@/types";
 import { bankAccountId, expenseAccountId } from "@/lib/accounts";
 import { paidViaPayments } from "@/lib/ledger";
 import { transferLegsFor } from "@/lib/transferLegs";
+import { serialCostIndex, lineCostBasis } from "@/lib/serialCost";
 
 const r2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -102,6 +104,8 @@ export interface Book {
   cashAdjustments: CashAdjustment[];
   bankTxns: BankTxn[];
   stockAdjustments: StockAdjustment[];
+  /** Individual units of serialised items. Absent on books that have none. */
+  serials?: Serial[];
   /**
    * Entries that were written rather than derived — year-end closings.
    *
@@ -178,15 +182,24 @@ function settlementAccount(mode: PaymentMode | undefined, bankId?: string): stri
 const taxOf = (d: { taxAmount?: number; gstEnabled?: boolean }) =>
   d.gstEnabled === false ? 0 : r2(d.taxAmount || 0);
 
-/** What a line's goods cost, from the snapshot taken when it was billed —
- *  the same basis `computeCogs` uses, so COGS in the ledger and COGS in the
- *  P&L cannot be two different numbers. */
-function lineCost(l: LineItem, costs: Map<string, number>): number {
-  return r2((l.costPrice ?? costs.get(l.itemId) ?? 0) * (l.qty || 0));
+/** What a line's goods cost — each named unit's own cost where the line
+ *  names units, and the snapshot taken when it was billed otherwise. The same
+ *  basis `computeCogs` uses, so COGS in the ledger and COGS in the P&L cannot
+ *  be two different numbers; Ledger Reconciliation compares them directly and
+ *  would report the difference as a permanent gap. */
+function lineCost(
+  l: LineItem,
+  costs: Map<string, number>,
+  serialCosts: Map<string, number>,
+): number {
+  return lineCostBasis(l, serialCosts, (id) => costs.get(id) ?? 0).amount;
 }
 
-const goodsCost = (lines: LineItem[], costs: Map<string, number>) =>
-  r2(lines.reduce((s, l) => s + lineCost(l, costs), 0));
+const goodsCost = (
+  lines: LineItem[],
+  costs: Map<string, number>,
+  serialCosts: Map<string, number>,
+) => r2(lines.reduce((s, l) => s + lineCost(l, costs, serialCosts), 0));
 
 /** The reason account behind a manual cash movement. Purpose keys are mapped
  *  here rather than in lib/cashPurpose.ts so the chart of accounts stays the
@@ -219,7 +232,12 @@ function cashPurposeAccount(purpose: string | undefined): string {
  * payments settled against it — the same subtraction `modeFlows` makes, so
  * cash cannot be counted twice.
  */
-function postSale(inv: Invoice, direct: number, costs: Map<string, number>): JournalEntry {
+function postSale(
+  inv: Invoice,
+  direct: number,
+  costs: Map<string, number>,
+  serialCosts: Map<string, number>,
+): JournalEntry {
   const tax = taxOf(inv);
   const shipping = r2(inv.shippingCharge || 0);
   const roundOff = r2(inv.roundOff || 0);
@@ -227,7 +245,7 @@ function postSale(inv: Invoice, direct: number, costs: Map<string, number>): Jou
   // By subtraction, not by re-adding the lines: the bill's own total is the
   // fact, and everything else has to fit inside it exactly.
   const taxable = r2(total - tax - shipping - roundOff);
-  const cogs = goodsCost(inv.lineItems ?? [], costs);
+  const cogs = goodsCost(inv.lineItems ?? [], costs, serialCosts);
 
   return {
     id: `je-sale-${inv.id}`,
@@ -288,11 +306,15 @@ function postPurchase(inv: Invoice, direct: number): JournalEntry {
 }
 
 /** A sale return: the sale undone, and the goods back on the shelf at cost. */
-function postSaleReturn(ret: Return, costs: Map<string, number>): JournalEntry {
+function postSaleReturn(
+  ret: Return,
+  costs: Map<string, number>,
+  serialCosts: Map<string, number>,
+): JournalEntry {
   const tax = taxOf(ret);
   const total = r2(ret.total || 0);
   const taxable = r2(total - tax);
-  const cogs = goodsCost(ret.lineItems ?? [], costs);
+  const cogs = goodsCost(ret.lineItems ?? [], costs, serialCosts);
 
   return {
     id: `je-sale-return-${ret.id}`,
@@ -578,6 +600,9 @@ function postOpenings(book: Book, costs: Map<string, number>): JournalEntry[] {
  */
 export function buildJournal(book: Book): JournalEntry[] {
   const costs = new Map(book.items.map((i) => [i.id, i.purchasePrice ?? 0] as const));
+  // Built once for the whole book: a shop with a year of bills would
+  // otherwise walk the units on every line of every one of them.
+  const serialCosts = serialCostIndex(book.serials);
   const applied = paidViaPayments(book.payments);
   /** What a bill collected itself, as opposed to what payments settled on it. */
   const directOf = (inv: Invoice) => Math.max(0, r2((inv.paid || 0) - (applied.get(inv.id) ?? 0)));
@@ -591,7 +616,7 @@ export function buildJournal(book: Book): JournalEntry[] {
   const entries: JournalEntry[] = [...postOpenings(book, costs)];
 
   for (const s of book.sales) {
-    entries.push(postSale(s, directOf(s), costs));
+    entries.push(postSale(s, directOf(s), costs, serialCosts));
     noteVoid(s.id, s);
   }
   for (const p of book.purchases) {
@@ -599,7 +624,7 @@ export function buildJournal(book: Book): JournalEntry[] {
     noteVoid(p.id, p);
   }
   for (const r of book.saleReturns) {
-    entries.push(postSaleReturn(r, costs));
+    entries.push(postSaleReturn(r, costs, serialCosts));
     noteVoid(r.id, r);
   }
   for (const r of book.purchaseReturns) {

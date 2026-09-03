@@ -219,6 +219,9 @@ export function BulkUpdateItemsDialog({
       // than letting a big catalogue silently blow the limit.
       const CHUNK = 200;
       let itemCount = 0;
+      // Named in the result, so a skipped item is a thing the user is told
+      // about rather than a change that quietly did not happen.
+      const skippedSerialised: string[] = [];
       let stockCount = 0;
       let allCommitted = true;
 
@@ -236,6 +239,14 @@ export function BulkUpdateItemsDialog({
             }
           }
 
+          /* A serialised item has no stock number to bulk-edit — its shelf
+             is the list of units. Skipped rather than silently written,
+             because a figure accepted and not applied is worse than one
+             refused: the user believes it took. */
+          if (it.trackSerials && isDirty(it, "stock")) {
+            skippedSerialised.push(it.name);
+            continue;
+          }
           const stockDelta = isDirty(it, "stock")
             ? Math.round((Number(valueOf(it, "stock") ?? 0) - Number(it.stock ?? 0)) * 100) / 100
             : 0;
@@ -283,6 +294,14 @@ export function BulkUpdateItemsDialog({
             ? ` · ${stockCount} stock adjustment${stockCount === 1 ? "" : "s"} recorded`
             : ""),
       );
+      if (skippedSerialised.length) {
+        // Said out loud. A stock figure typed for a serialised item cannot be
+        // applied, and a user who is not told assumes it was.
+        toast.warning(
+          `Stock not changed for ${skippedSerialised.join(", ")} — tracked by serial number, so the shelf is the units themselves`,
+          { duration: 9000 },
+        );
+      }
       onSaved();
       onOpenChange(false);
     } catch (err) {

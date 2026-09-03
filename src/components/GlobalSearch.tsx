@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { stockOf } from "@/lib/serials";
 import { useWorkspace } from "@/store/workspace";
 import { useNavigate } from "@tanstack/react-router";
 import {
@@ -161,7 +162,7 @@ export function GlobalSearch() {
                 >
                   <Package className="h-3.5 w-3.5" />
                   {i.name}
-                  <span className="ml-auto text-xs text-muted-foreground">Stock: {i.stock}</span>
+                  <span className="ml-auto text-xs text-muted-foreground">Stock: {stockOf(i)}</span>
                 </CommandItem>
               ))}
               {more(limit, items.length)}
