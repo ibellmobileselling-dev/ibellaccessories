@@ -42,7 +42,7 @@ function ExpensesPage() {
   const editAllowed = isOwner || canEdit("purchaseExpenses");
   const deleteAllowed = isOwner || canDelete("purchaseExpenses");
   const [rows, setRows] = useState<Expense[]>([]);
-  const { canPost } = usePeriodLock();
+  const { canPost, lockedUpto } = usePeriodLock();
   const [open, setOpen] = useState(false);
   const [edit, setEdit] = useState<Expense | null>(null);
   // Cancelled expenses stay on file; this only decides whether they are in
@@ -138,8 +138,8 @@ function ExpensesPage() {
    *  card all come through here, so the rule cannot be bypassed by whichever
    *  one somebody forgets. */
   const openEdit = (r: Expense) => {
-    if (!canEditInPlace(r.date)) {
-      toast.error(editRefusalMessage("expense"), { duration: 7000 });
+    if (!canEditInPlace(r.date, lockedUpto)) {
+      toast.error(editRefusalMessage("expense", lockedUpto), { duration: 7000 });
       return;
     }
     setEdit(r);
@@ -202,7 +202,11 @@ function ExpensesPage() {
                 openEdit(r);
               }}
               className="h-7 w-7 inline-flex items-center justify-center rounded-md border border-transparent text-gray-400 transition hover:bg-primary-soft hover:text-primary hover:border-primary/25"
-              title={canEditInPlace(r.date) ? "Edit expense" : editRefusalMessage("expense")}
+              title={
+                canEditInPlace(r.date, lockedUpto)
+                  ? "Edit expense"
+                  : editRefusalMessage("expense", lockedUpto)
+              }
             >
               <Pencil className="h-3.5 w-3.5" />
             </button>
@@ -383,7 +387,7 @@ function ExpenseDialog({
   onSaved: () => void;
 }) {
   const firstRef = useRef<HTMLButtonElement>(null);
-  const { canPost } = usePeriodLock();
+  const { canPost, lockedUpto } = usePeriodLock();
   const [f, setF] = useState<Partial<Expense>>({});
   const [saving, setSaving] = useState(false);
   // Synchronous double-submit guard — prevents a same-tick double Enter from

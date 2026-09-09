@@ -17,6 +17,7 @@
  */
 
 import { today } from "@/lib/format";
+import { isLocked } from "@/lib/periodLock";
 
 /** True while a document may still be deleted outright. */
 export function canDeleteOutright(date: string, now: string = today()): boolean {
@@ -33,23 +34,36 @@ export function removalWord(date: string, now: string = today()): "Delete" | "Vo
 /**
  * Whether a document may still be CHANGED in place.
  *
- * The same line, for the same reason. Stopping a filed month's bill from
- * being deleted while leaving it freely editable closes half a door: change
- * the total on a three-month-old invoice and that month quietly becomes a
- * different month, which is the exact outcome voiding exists to prevent —
- * only now with no record at all that anything happened, because an edit
- * leaves none.
+ * Governed by the period lock the owner sets, NOT by whether it is today.
  *
- * Corrections to an older document are made by voiding it and issuing a new
- * one. Two rows, both explicable, which is what a record is for.
+ * This used to be the same "today only" line as deletion, and the reasoning
+ * was that an edit leaves no record of itself. That stopped being true when
+ * the audit trail landed: every record now carries who changed it and when.
+ * What remained was a rule that refused to let a shop fix a rate they typed
+ * wrongly yesterday — with no way to say "yes, but this month is not filed
+ * yet" — and the honest answer to that is not "void it and re-issue", it is
+ * that the shop, not the calendar, knows which months are closed.
+ *
+ * So: closed months are protected exactly as before, by Settings → Books
+ * locked upto. Everything after that line can be corrected, and the change is
+ * attributable. A shop that files GST monthly locks the month when it files
+ * and gets the old behaviour; a shop that has not locked anything can work.
+ *
+ * Deletion is deliberately NOT relaxed with it. An edit is recorded; a
+ * deletion removes the record, so anything older than today is still voided
+ * rather than destroyed.
  */
-export function canEditInPlace(date: string, now: string = today()): boolean {
-  return canDeleteOutright(date, now);
+export function canEditInPlace(date: string, lockedUpto?: string): boolean {
+  return !!date && !isLocked(date, lockedUpto);
 }
 
-/** Why an older document cannot be edited, in the words to show the shop. */
-export function editRefusalMessage(what: string): string {
-  return `This ${what} is from an earlier day, so it can no longer be changed — its month has already been counted. Void it and issue a new one instead; both stay on record.`;
+/** Why a document cannot be edited, in the words to show the shop. Only ever
+ *  reachable when a lock is set, since that is now the only thing that
+ *  refuses. */
+export function editRefusalMessage(what: string, lockedUpto?: string): string {
+  return lockedUpto
+    ? `The books are closed up to ${lockedUpto}, so this ${what} can no longer be changed. Void it and issue a new one instead — both stay on record.`
+    : `This ${what} can no longer be changed.`;
 }
 
 /** Whether a record has been cancelled. Written as a function so the check

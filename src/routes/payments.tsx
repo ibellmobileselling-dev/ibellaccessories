@@ -102,7 +102,7 @@ function PaymentsPage() {
   const [formType, setFormType] = useState<"in" | "out">("in");
   const [editing, setEditing] = useState<Payment | null>(null);
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
-  const { canPost } = usePeriodLock();
+  const { canPost, lockedUpto } = usePeriodLock();
 
   // Cancelled payments stay on file; this only decides whether they are in
   // the way.
@@ -141,8 +141,8 @@ function PaymentsPage() {
   const openEdit = (r: Payment) => {
     // One door for the pencil AND for clicking the row. Guarding the button
     // alone would leave the row itself wide open.
-    if (!canEditInPlace(r.date)) {
-      toast.error(editRefusalMessage("payment"), { duration: 7000 });
+    if (!canEditInPlace(r.date, lockedUpto)) {
+      toast.error(editRefusalMessage("payment", lockedUpto), { duration: 7000 });
       return;
     }
     setFormType(r.type);
@@ -311,7 +311,11 @@ function PaymentsPage() {
                 openEdit(r);
               }}
               className="h-7 w-7 inline-flex items-center justify-center rounded-md border border-transparent text-gray-400 transition hover:bg-primary-soft hover:text-primary hover:border-primary/25"
-              title={canEditInPlace(r.date) ? "Edit payment" : editRefusalMessage("payment")}
+              title={
+                canEditInPlace(r.date, lockedUpto)
+                  ? "Edit payment"
+                  : editRefusalMessage("payment", lockedUpto)
+              }
             >
               <Pencil className="h-3.5 w-3.5" />
             </button>
@@ -532,7 +536,9 @@ function PaymentsPage() {
                           }}
                           className="p-1.5 rounded hover:bg-blue-50 text-gray-300 hover:text-blue-600 transition"
                           title={
-                            canEditInPlace(r.date) ? "Edit payment" : editRefusalMessage("payment")
+                            canEditInPlace(r.date, lockedUpto)
+                              ? "Edit payment"
+                              : editRefusalMessage("payment", lockedUpto)
                           }
                         >
                           <Pencil className="h-3.5 w-3.5" />
@@ -666,7 +672,7 @@ function ReceivePaymentDialog({
   const [manualAmount, setManualAmount] = useState(0);
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
-  const { canPost } = usePeriodLock();
+  const { canPost, lockedUpto } = usePeriodLock();
 
   /* Quick entry vs bill-by-bill.
    *

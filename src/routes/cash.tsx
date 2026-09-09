@@ -82,7 +82,7 @@ function CashPage() {
   const [transferOpen, setTransferOpen] = useState(false);
   const [editAdj, setEditAdj] = useState<CashAdjustment | null>(null);
   const [editTransfer, setEditTransfer] = useState<CashAdjustment | null>(null);
-  const { canPost } = usePeriodLock();
+  const { canPost, lockedUpto } = usePeriodLock();
   const [q, setQ] = useState("");
   // Cancelled entries stay on file; this only decides whether they are in
   // the way. Off by default, and they never count towards a total.
@@ -535,8 +535,8 @@ function CashPage() {
                 <CashRowActions
                   row={e}
                   onEdit={(adj) => {
-                    if (!canEditInPlace(adj.date)) {
-                      toast.error(editRefusalMessage("entry"), { duration: 7000 });
+                    if (!canEditInPlace(adj.date, lockedUpto)) {
+                      toast.error(editRefusalMessage("entry", lockedUpto), { duration: 7000 });
                       return;
                     }
                     if (transferLegsFor(adj, BankTxnRepo.all()).length > 0) setEditTransfer(adj);
@@ -613,6 +613,10 @@ function CashRowActions({
   onDelete: (row: FlowEntry) => void;
 }) {
   const navigate = useNavigate();
+  // Its own read rather than a prop: this renders once per row, and threading
+  // the lock down through the table would be a prop that exists only to be
+  // passed on.
+  const { lockedUpto } = usePeriodLock();
   const src = row.source;
   if (!src) return <span className="text-gray-300">—</span>;
 
@@ -637,8 +641,8 @@ function CashRowActions({
           onClick={() => adj && onEdit(adj)}
           disabled={!adj}
           title={
-            !canEditInPlace(row.date)
-              ? editRefusalMessage("entry")
+            !canEditInPlace(row.date, lockedUpto)
+              ? editRefusalMessage("entry", lockedUpto)
               : isTransfer
                 ? "Edit this transfer (both accounts)"
                 : "Edit entry"
@@ -711,7 +715,7 @@ function CashAdjustDialog({
   const [purpose, setPurpose] = useState<CashPurpose | "">("");
   const chosenPurpose = purposeSpec(purpose || undefined);
   const [saving, setSaving] = useState(false);
-  const { canPost } = usePeriodLock();
+  const { canPost, lockedUpto } = usePeriodLock();
 
   // Editing is the same form, opened over an existing row.
   const isOpen = open || !!editing;

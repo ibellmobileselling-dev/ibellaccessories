@@ -3686,32 +3686,34 @@ async function runAll(): Promise<Results> {
       !manual?.querySelector('[title="Delete entry"]'),
       "cash rows: and does NOT offer to delete something that has been counted",
     );
-    /* Nor to edit it. Voiding an older entry while leaving it editable would
-       be a door and a way round the door: change the amount instead and the
-       month changes with no record that anything happened. */
+    /* But it CAN still be corrected. Voiding is about destroying the record;
+       correcting an amount is not, and the audit trail records who did it.
+       Refusing both left a shop unable to fix yesterday's typo at all, which
+       is what the period lock is for — see the edit-lock block below. */
     assert(
-      !manual?.querySelector('[title="Edit entry"]'),
-      "cash rows: and does NOT offer to edit it either — that is the same door",
-    );
-    assert(
-      !!manual?.querySelector('[title*="can no longer be changed"]'),
-      `cash rows: the pencil says why instead — ${Array.from(
+      !!manual?.querySelector('[title="Edit entry"]'),
+      `cash rows: an older entry can still be corrected — ${Array.from(
         manual?.querySelectorAll("[title]") ?? [],
       )
         .map((el) => el.getAttribute("title"))
         .join(" / ")}`,
     );
-    /* And pressing it does nothing. The tooltip is a courtesy; the guard is
-       what happens on the click, and a test that only reads hover text would
-       pass with the rule switched off entirely. */
+    /* And pressing it opens the editor rather than nothing. A tooltip that
+       says "edit" over a button that does nothing is worse than either. */
     await act(async () => {
-      (manual?.querySelector('[title*="can no longer be changed"]') as HTMLElement)?.click();
+      (manual?.querySelector('[title="Edit entry"]') as HTMLElement)?.click();
     });
-    await settleMs(150);
-    assert(
-      !document.querySelector('[role="dialog"]'),
-      "cash rows: pressing the pencil on an older entry opens nothing — the tooltip is a courtesy, this is the guard",
-    );
+    await settleMs(180);
+    const editor = document.querySelector('[role="dialog"]');
+    assert(!!editor, "cash rows: and pressing it actually opens the entry");
+    await act(async () => {
+      (
+        Array.from(editor?.querySelectorAll("button") ?? []).find(
+          (b) => (b.textContent ?? "").trim() === "Cancel",
+        ) as HTMLElement | undefined
+      )?.click();
+    });
+    await settleMs(140);
 
     const derived = Array.from(table?.querySelectorAll("tbody tr") ?? []).find((tr) =>
       (tr.textContent ?? "").includes("INV-0001"),
@@ -5911,16 +5913,16 @@ async function runAll(): Promise<Results> {
     }
   }
 
-  /* ── An older bill cannot be rewritten ────────────────────────────────
-     The other half of the same door. Stopping last month's bill being
-     deleted while leaving it freely editable is not a rule — change the total
-     instead and the month changes just the same, and an edit leaves even less
-     trace than a delete does, because the audit log at least keeps a snapshot
-     of what was removed.
+  /* ── An older bill can be corrected; a CLOSED one cannot ──────────────
+     This used to refuse any bill dated before today, and the shop hit it
+     immediately: a rate typed wrongly yesterday, no way to fix it, and no way
+     to say "this month is not filed yet". The calendar does not know which
+     months are closed — the owner does, and says so in Settings.
 
-     Checked on the ROUTE, not on the button that leads to it: a typed URL or
-     an old bookmark reaches the edit form too, and a guard on the button
-     would be a lock on the front door of a building with no back wall. */
+     So the refusal now comes from the period lock. Checked on the ROUTE, not
+     on the button that leads to it: a typed URL or an old bookmark reaches
+     the edit form too, and a guard on the button would be a lock on the front
+     door of a building with no back wall. */
   {
     SalesRepo.add({
       id: "EDITOLD",
@@ -5939,34 +5941,53 @@ async function runAll(): Promise<Results> {
       paymentMode: "credit",
     } as never);
 
-    const page = await renderRoute("/sales/edit/EDITOLD");
+    /* Nothing closed — the state the shop was actually in. An older bill
+       opens, because there is no reason on earth it should not. */
+    const co = CompanyRepo.get();
+    CompanyRepo.save({ ...co, booksLockedUpto: undefined } as never);
+    const open = await renderRoute("/sales/edit/EDITOLD");
     assert(
-      page.includes("can no longer be changed"),
-      `void edit: an older bill cannot be opened for editing — ${JSON.stringify(page.slice(0, 140))}`,
+      !open.includes("can no longer be changed"),
+      `edit lock: an older bill opens when no month has been closed — ${JSON.stringify(open.slice(0, 140))}`,
     );
-    assert(page.includes("INV-EDITOLD"), "void edit: and the notice names the bill it is refusing");
+    assert(
+      !!document.querySelector('input[placeholder="Type item name to add…"]'),
+      "edit lock: and the real form is there, not a notice",
+    );
+
+    /* Closed up to and including that bill's day — now it is refused, and the
+       protection the old rule was reaching for is still here. */
+    CompanyRepo.save({ ...co, booksLockedUpto: D2 } as never);
+    const shut = await renderRoute("/sales/edit/EDITOLD");
+    assert(
+      shut.includes("can no longer be changed"),
+      `edit lock: a bill inside closed books is refused — ${JSON.stringify(shut.slice(0, 140))}`,
+    );
+    assert(shut.includes("INV-EDITOLD"), "edit lock: and the notice names the bill it is refusing");
     /* A screen that only refuses gets worked around. This one says what to do
        instead, in the same words the toast on the list screens uses. */
     assert(
-      page.includes("void this invoice and issue a new one"),
-      `void edit: it says what to do instead — ${JSON.stringify(page.slice(0, 400))}`,
+      shut.includes("void this invoice and issue a new one"),
+      `edit lock: it says what to do instead — ${JSON.stringify(shut.slice(0, 400))}`,
     );
     // And the form itself must not be there — a disabled-looking form that is
     // actually live is worse than no guard at all.
     assert(
-      !document.querySelector('input[placeholder*="Search item"]') &&
+      !document.querySelector('input[placeholder="Type item name to add…"]') &&
         !Array.from(document.querySelectorAll("button")).some((b) =>
           /^(Save|Update)/.test((b.textContent ?? "").trim()),
         ),
-      "void edit: the edit form is not rendered at all, not merely hidden",
+      "edit lock: the edit form is not rendered at all, not merely hidden",
     );
 
-    // Today's bill still opens normally — the rule is a date, not a ban.
-    const todayPage = await renderRoute("/sales/edit/VNEW");
+    // A day after the lock is open again — the line is the lock, not a ban.
+    CompanyRepo.save({ ...co, booksLockedUpto: "2020-01-01" } as never);
+    const after = await renderRoute("/sales/edit/EDITOLD");
     assert(
-      !todayPage.includes("can no longer be changed"),
-      "void edit: today's bill still opens for editing",
+      !after.includes("can no longer be changed"),
+      "edit lock: a bill after the closed period opens for editing",
     );
+    CompanyRepo.save({ ...co, booksLockedUpto: undefined } as never);
   }
 
   /* ── A figure you can open ────────────────────────────────────────────

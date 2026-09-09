@@ -4,6 +4,7 @@ import { PurchaseRepo } from "@/repositories";
 import { InvoiceForm } from "@/components/InvoiceForm";
 import { useRepoData } from "@/hooks/useRepoData";
 import { canEditInPlace } from "@/lib/voiding";
+import { usePeriodLock } from "@/hooks/usePeriodLock";
 import { OlderDocumentNotice } from "@/components/OlderDocumentNotice";
 import type { Invoice } from "@/types";
 import { AlertCircle } from "lucide-react";
@@ -13,6 +14,7 @@ export const Route = createFileRoute("/purchase/edit/$id")({ component: EditPurc
 function EditPurchasePage() {
   const _repoV = useRepoData();
   const { id } = Route.useParams();
+  const { lockedUpto } = usePeriodLock();
   const navigate = useNavigate();
   const [inv, setInv] = useState<Invoice | null | undefined>(undefined);
 
@@ -35,10 +37,12 @@ function EditPurchasePage() {
       </div>
     );
   }
-  // A document from an earlier day is corrected by voiding and re-issuing,
-  // not by being rewritten. Checked HERE rather than only on the button that
-  // leads here, because a typed URL or an old bookmark reaches this page too.
-  if (!canEditInPlace(inv.date)) {
+  /* A document inside CLOSED books is corrected by voiding and re-issuing,
+     not by being rewritten. Checked HERE rather than only on the button that
+     leads here, because a typed URL or an old bookmark reaches this page too.
+     Being merely older than today is no longer enough to refuse: the shop
+     knows which months are filed, the calendar does not. */
+  if (!canEditInPlace(inv.date, lockedUpto)) {
     return (
       <OlderDocumentNotice
         what="bill"

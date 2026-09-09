@@ -3549,38 +3549,57 @@ console.log(`\n═════════════════════�
 }
 
 /* ═══ TEST 30: the other half of the door ═══════════════════════════════
-   Phase 4 stopped an older document being deleted. It said nothing about
-   editing one, which left the rule half-applied: you could not remove last
-   month's bill, but you could open it and change the total to anything, and
-   that month became a different month with no record that anything had
-   happened. An edit leaves less trace than a deletion does — the audit log at
-   least keeps a snapshot of what was deleted.
+   Phase 4 stopped an older document being deleted, then extended the same
+   line to editing, reasoning that an edit leaves no trace of itself.
 
-   So the same line governs both, and corrections to an older document are
-   made by voiding it and issuing a new one. */
+   That reasoning expired. The audit trail records who changed what and when,
+   so an edit IS attributable — and what the rule actually did in the shop was
+   refuse to let anyone fix a rate they had typed wrongly the previous day,
+   with no way to say "this month is not filed yet". The calendar does not
+   know which months are closed. The owner does, and already says so in
+   Settings.
+
+   So editing is governed by the period lock, and deletion is deliberately NOT
+   relaxed with it: an edit is recorded, a deletion removes the record. */
 {
   const now = "2026-08-26";
-  assert(canEditInPlace("2026-08-26", now), "T30: today's document can still be edited");
+
+  /* No lock — the state most shops are in, and the one that was unusable.
+     Every date is editable, including months old. */
+  assert(canEditInPlace("2026-08-26"), "T30: today's document can be edited");
   assert(
-    canEditInPlace("2026-09-01", now),
-    "T30: and a future-dated one — nothing has been counted yet either way",
+    canEditInPlace("2026-05-11"),
+    "T30: and so can one from months ago, when the shop has closed nothing",
   );
-  assert(!canEditInPlace("2026-08-25", now), "T30: yesterday's cannot — its day has been counted");
-  assert(!canEditInPlace("", now), "T30: and neither can one with no date at all");
+  assert(!canEditInPlace(""), "T30: a document with no date at all cannot");
 
-  /* The same line as deletion, deliberately. Two rules a day apart would be
-     a bill that cannot be deleted but can be edited to zero, which is the
-     same outcome by a quieter route. */
-  for (const d of ["2026-08-24", "2026-08-25", "2026-08-26", "2026-08-27", ""]) {
-    assert(
-      canEditInPlace(d, now) === canDeleteOutright(d, now),
-      `T30: editing and deleting are allowed on exactly the same days — ${JSON.stringify(d)}`,
-    );
-  }
+  /* Locked — the protection, now under the owner's control rather than the
+     calendar's. */
+  const lock = "2026-07-31";
+  assert(!canEditInPlace("2026-07-31", lock), "T30: the last closed day is closed");
+  assert(!canEditInPlace("2026-06-02", lock), "T30: and everything before it");
+  assert(
+    canEditInPlace("2026-08-01", lock),
+    "T30: while the day after the lock is open for correction",
+  );
+  assert(canEditInPlace(now, lock), "T30: as is today");
+
+  /* Editing and deleting NO LONGER move together, and that is the point. A
+     three-month-old bill can be corrected — the change is attributable — but
+     removing it destroys the record, so it is still voided rather than
+     deleted. */
+  assert(
+    canEditInPlace("2026-05-11") && !canDeleteOutright("2026-05-11", now),
+    "T30: an old bill can be corrected but still cannot be destroyed — it is voided",
+  );
 
   assert(
-    editRefusalMessage("invoice").includes("Void it and issue a new one"),
-    "T30: and the refusal says what to do instead — a screen that only refuses gets worked around",
+    editRefusalMessage("invoice", lock).includes("Void it and issue a new one"),
+    "T30: the refusal says what to do instead — a screen that only refuses gets worked around",
+  );
+  assert(
+    editRefusalMessage("invoice", lock).includes(lock),
+    "T30: and names the date the books are closed to, so it can be argued with",
   );
 }
 
