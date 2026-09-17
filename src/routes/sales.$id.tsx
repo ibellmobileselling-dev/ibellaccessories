@@ -1,9 +1,10 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useGoBack } from "@/hooks/useGoBack";
 import { useEffect, useRef, useState } from "react";
-import { SalesRepo, CompanyRepo } from "@/repositories";
+import { SalesRepo, CompanyRepo, BankRepo } from "@/repositories";
 import type { Invoice, Company, PrintFormat } from "@/types";
 import { fmtMoney } from "@/lib/format";
+import { describePayment } from "@/lib/paymentSplit";
 import { printWithName, printOrEscapeStandalone, isStandalone } from "@/lib/print";
 import { downloadElementAsPdf } from "@/lib/pdf";
 import { useShareablePdf } from "@/hooks/useShareablePdf";
@@ -27,6 +28,10 @@ import {
   MessageCircle,
   Loader2,
 } from "lucide-react";
+
+/** An account's name for display. The word "Bank" three times over is
+ *  exactly what a split is meant to stop being ambiguous. */
+const bankName = (id: string) => BankRepo.get(id)?.name;
 
 export const Route = createFileRoute("/sales/$id")({
   component: InvoiceDetailPage,
@@ -143,17 +148,30 @@ function InvoiceDetailPage() {
     if (!inv || !printRef.current || pdfBusy) return;
     setPdfBusy("whatsapp");
     try {
-      await sendElementViaWhatsApp({
+      const outcome = await sendElementViaWhatsApp({
         el: printRef.current,
         phone: inv.partyPhone,
         message:
           `Hi ${inv.partyName}, here's your invoice ${inv.number}` +
           `${co ? ` from ${co.name}` : ""} — Total ${fmtMoney(inv.total)}. Thank you!`,
         fileName: inv.number,
+        label: inv.number,
         orientation: fmt === "a4-2up" ? "landscape" : "portrait",
         pageWidthMm: thermalWidthMm,
       });
-      toast.success("Invoice sent on WhatsApp");
+      /* "Queued" is not a failure and must not be dressed as one — but it is
+         not a success either, so it does not get the green tick that tells
+         the counter the customer has their bill. */
+      if (outcome.status === "sent") {
+        /* "Sent" only when WhatsApp itself confirmed it. Otherwise the bill
+           has been handed over and is on its way, which is true and is not
+           the same thing — the green tick over an unconfirmed message is
+           what the shop reported as the app telling them it had gone. */
+        if (outcome.deduped) toast.success(`Invoice ${inv.number} had already been sent`);
+        else if (outcome.acknowledged) toast.success("Invoice sent on WhatsApp");
+        else toast.info("Invoice handed to WhatsApp — not confirmed delivered yet");
+      } else if (outcome.kind === "offline") toast.info(outcome.message, { duration: 8000 });
+      else toast.warning(outcome.message, { duration: 10000 });
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Could not send via WhatsApp");
     } finally {
@@ -208,7 +226,7 @@ function InvoiceDetailPage() {
               )}
             </h1>
             <p className="text-[12px] text-gray-400 truncate">
-              {inv.partyName} · {fmtMoney(inv.total)} · {fmtMode(inv.paymentMode)}
+              {inv.partyName} · {fmtMoney(inv.total)} · {describePayment(inv, bankName)}
             </p>
           </div>
         </div>

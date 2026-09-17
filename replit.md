@@ -1,4 +1,4 @@
-# IBELL — Billing & Inventory ERP
+# IBELL  — Billing & Inventory ERP
 
 A keyboard-first desktop billing, inventory, and accounting ERP web application built with TanStack Start, React 19, and Tailwind CSS v4.
 

@@ -21,6 +21,7 @@ import { toast } from "sonner";
 import { SerialEntry } from "@/components/SerialEntry";
 import { isSerialised, serialShortfalls, serialIdsOn } from "@/lib/serials";
 import { planSaleReturnSerials, planPurchaseReturnSerials } from "@/lib/serialMoves";
+import { useHighlightScroll } from "@/hooks/useHighlightScroll";
 import { Trash2, UserPlus, Save, X, CornerDownLeft, CornerUpLeft, Loader2 } from "lucide-react";
 import { genId, newBatch, commitBatch } from "@/repositories/base";
 import { stepBackOnBackspace, useEscapeToLeave } from "@/hooks/useFormKeys";
@@ -98,6 +99,9 @@ export function ReturnForm({ mode }: Props) {
   const [partyQ, setPartyQ] = useState("");
   const [partyOpen, setPartyOpen] = useState(false);
   const [partyIdx, setPartyIdx] = useState(0);
+  /** Arrowing past the bottom edge used to move the highlight invisibly. */
+  const partyListRef = useRef<HTMLDivElement>(null);
+  useHighlightScroll(partyListRef, partyIdx, partyOpen);
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
   const { canPost } = usePeriodLock();
@@ -110,6 +114,8 @@ export function ReturnForm({ mode }: Props) {
   const [invQ, setInvQ] = useState("");
   const [invOpen, setInvOpen] = useState(false);
   const [invIdx, setInvIdx] = useState(0);
+  const invListRef = useRef<HTMLDivElement>(null);
+  useHighlightScroll(invListRef, invIdx, invOpen);
   const invoiceRepo = isSaleReturn ? SalesRepo : PurchaseRepo;
 
   const invSuggests = useRepoMemo(() => {
@@ -592,10 +598,14 @@ export function ReturnForm({ mode }: Props) {
                 />
               </label>
               {partyOpen && partySuggests.length > 0 && (
-                <div className="absolute z-20 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-lg max-h-48 overflow-auto">
+                <div
+                  ref={partyListRef}
+                  className="absolute z-20 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-lg max-h-48 overflow-auto"
+                >
                   {partySuggests.map((p, i) => (
                     <div
                       key={p.id}
+                      data-opt={i}
                       onMouseDown={(e) => {
                         e.preventDefault();
                         selectParty(p);
@@ -650,10 +660,14 @@ export function ReturnForm({ mode }: Props) {
                 />
               </label>
               {invOpen && invSuggests.length > 0 && (
-                <div className="absolute z-30 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-lg max-h-56 overflow-auto">
+                <div
+                  ref={invListRef}
+                  className="absolute z-30 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-lg max-h-56 overflow-auto"
+                >
                   {invSuggests.map((i, idx) => (
                     <div
                       key={i.id}
+                      data-opt={idx}
                       onMouseDown={(e) => {
                         e.preventDefault();
                         loadFromInvoice(i);
@@ -918,6 +932,9 @@ function ReturnItemSearchRow({
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(false);
   const [idx, setIdx] = useState(0);
+  /** Arrowing past the bottom edge used to move the highlight invisibly. */
+  const itemListRef = useRef<HTMLDivElement>(null);
+  useHighlightScroll(itemListRef, idx, open);
   const inputRef = useRef<HTMLInputElement>(null);
   const [dropdownRect, setDropdownRect] = useState<{
     top: number;
@@ -1009,11 +1026,13 @@ function ReturnItemSearchRow({
                 left: dropdownRect.left,
                 width: dropdownRect.width,
               }}
+              ref={itemListRef}
               className="z-50 border rounded-md bg-popover shadow-elevated max-h-72 overflow-auto"
             >
               {suggests.map((it, i) => (
                 <div
                   key={it.id}
+                  data-opt={i}
                   onMouseDown={(e) => {
                     e.preventDefault();
                     pick(it);

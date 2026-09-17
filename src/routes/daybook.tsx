@@ -25,6 +25,7 @@ import { PaginationBar } from "@/components/Pagination";
 import { usePagination } from "@/hooks/usePagination";
 import { downloadCsv } from "@/lib/csv";
 import { fmtMode } from "@/lib/paymentMode";
+import { splitsOf, cashPart, bankParts, unassignedPart } from "@/lib/paymentSplit";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import {
   BookOpen,
@@ -74,6 +75,15 @@ interface DayRow {
   bankId?: string;
   amount: number; // full invoice/txn value, signed — drives the Total column and Sales/Purchase totals
   cash: number; // actual money that changed hands on this date, signed — drives Money In/Out and cash reconciliation. A credit sale has amount > 0 but cash = 0.
+  /* Where that money went, signed like `cash` and summing to it.
+     One document can now be part cash and part bank, so a single `mode`
+     cannot answer "how much of today's takings is in the drawer". It stays
+     ONE row per document — `amount` drives the Sales and Purchase totals and
+     splitting the row would count the bill twice — and carries the
+     breakdown instead. */
+  cashPart: number;
+  bankPart: number;
+  unassignedPart: number;
   docId?: string;
   docKind?: "sale" | "purchase" | "sale-return" | "purchase-return";
 }
@@ -99,6 +109,16 @@ function DaybookPage() {
 
   const rows = useRepoMemo<DayRow[]>(() => {
     const list: DayRow[] = [];
+    /** The breakdown of one document's own money, signed. `sign` is -1 for
+     *  anything leaving the shop. */
+    const parts = (doc: Parameters<typeof splitsOf>[0], sign: 1 | -1, settled = 0) => {
+      const bank = [...bankParts(doc, settled).values()].reduce((n, v) => n + v, 0);
+      return {
+        cashPart: sign * cashPart(doc, settled),
+        bankPart: sign * bank,
+        unassignedPart: sign * unassignedPart(doc, settled),
+      };
+    };
     // invoice.paid already folds in amounts later applied via Payment
     // records (see ledger.ts) — if we used it as-is here, a payment
     // collected after billing would count twice: once inside the Sale row's
@@ -114,6 +134,7 @@ function DaybookPage() {
         bankId: s.bankId,
         amount: s.total,
         cash: Math.max(0, (s.paid || 0) - (applied.get(s.id) ?? 0)),
+        ...parts(s, 1, applied.get(s.id) ?? 0),
         docId: s.id,
         docKind: "sale",
       });
@@ -127,6 +148,7 @@ function DaybookPage() {
         bankId: p.bankId,
         amount: -p.total,
         cash: -Math.max(0, (p.paid || 0) - (applied.get(p.id) ?? 0)),
+        ...parts(p, -1, applied.get(p.id) ?? 0),
         docId: p.id,
         docKind: "purchase",
       });
@@ -139,6 +161,15 @@ function DaybookPage() {
         mode: "—",
         amount: -r.total,
         cash: -r.total,
+        /* Returns carry no payment fields at all — money against a note is
+           a Payment, which appears as its own row. Zeroes here reproduce
+           exactly what mode "—" did before: counted in the day's net, and in
+           neither the cash nor the unassigned bucket. Whether that is right
+           is a pre-existing question about how returns reconcile, and not
+           one this change should answer quietly. */
+        cashPart: 0,
+        bankPart: 0,
+        unassignedPart: 0,
         docId: r.id,
         docKind: "sale-return",
       });
@@ -151,6 +182,15 @@ function DaybookPage() {
         mode: "—",
         amount: r.total,
         cash: r.total,
+        /* Returns carry no payment fields at all — money against a note is
+           a Payment, which appears as its own row. Zeroes here reproduce
+           exactly what mode "—" did before: counted in the day's net, and in
+           neither the cash nor the unassigned bucket. Whether that is right
+           is a pre-existing question about how returns reconcile, and not
+           one this change should answer quietly. */
+        cashPart: 0,
+        bankPart: 0,
+        unassignedPart: 0,
         docId: r.id,
         docKind: "purchase-return",
       });
@@ -164,6 +204,7 @@ function DaybookPage() {
         bankId: p.bankId,
         amount: p.type === "in" ? p.amount : -p.amount,
         cash: p.type === "in" ? p.amount : -p.amount,
+        ...parts(p, p.type === "in" ? 1 : -1),
       });
     for (const e of ExpenseRepo.all().filter((x) => x.date === date))
       list.push({
@@ -172,8 +213,10 @@ function DaybookPage() {
         ref: e.category,
         party: "—",
         mode: e.paymentMode,
+        bankId: e.bankId,
         amount: -e.amount,
         cash: -e.amount,
+        ...parts(e, -1),
       });
     for (const a of CashAdjustmentRepo.all().filter((x) => x.date === date))
       list.push({
@@ -184,6 +227,9 @@ function DaybookPage() {
         mode: "cash",
         amount: a.type === "add" ? a.amount : -a.amount,
         cash: a.type === "add" ? a.amount : -a.amount,
+        cashPart: a.type === "add" ? a.amount : -a.amount,
+        bankPart: 0,
+        unassignedPart: 0,
       });
     for (const t of BankTxnRepo.all().filter((x) => x.date === date))
       list.push({
@@ -195,6 +241,10 @@ function DaybookPage() {
         bankId: t.bankId,
         amount: t.type === "deposit" ? t.amount : -t.amount,
         cash: t.type === "deposit" ? t.amount : -t.amount,
+        cashPart: 0,
+        // A deposit or withdrawal always names its account.
+        bankPart: t.type === "deposit" ? t.amount : -t.amount,
+        unassignedPart: 0,
       });
     list.sort((a, b) => (a.created ?? "").localeCompare(b.created ?? ""));
     return list;
@@ -245,12 +295,10 @@ function DaybookPage() {
   // `amount` (invoice value) — a credit or partly-paid sale shouldn't count
   // as cash in just because it happened today.
   const net = rows.reduce((s, r) => s + r.cash, 0);
-  const cashIn = rows
-    .filter((r) => r.mode === "cash" && r.cash > 0)
-    .reduce((s, r) => s + r.cash, 0);
-  const cashOut = Math.abs(
-    rows.filter((r) => r.mode === "cash" && r.cash < 0).reduce((s, r) => s + r.cash, 0),
-  );
+  // Off the breakdown, not the row's single mode: a part-cash bill puts only
+  // its cash share in the drawer, and its bank share belongs to the account.
+  const cashIn = rows.filter((r) => r.cashPart > 0).reduce((s, r) => s + r.cashPart, 0);
+  const cashOut = Math.abs(rows.filter((r) => r.cashPart < 0).reduce((s, r) => s + r.cashPart, 0));
   // Bank-mode entries with no bankId (older records saved before bank
   // selection was required) and legacy upi/cheque modes aren't tied to any
   // real account — bucket them so the summary always reconciles with the

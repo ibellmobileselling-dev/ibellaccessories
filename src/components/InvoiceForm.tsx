@@ -4,7 +4,8 @@ import { SerialEntry } from "@/components/SerialEntry";
 import { planPurchaseSerials, planSaleSerials, soldSerialsOf } from "@/lib/serialMoves";
 import { SerialRepo } from "@/repositories";
 import { createPortal } from "react-dom";
-import { useNavigate } from "@tanstack/react-router";
+import { useNavigate, useRouterState } from "@tanstack/react-router";
+import { useHighlightScroll } from "@/hooks/useHighlightScroll";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Field } from "@/components/Field";
@@ -24,15 +25,26 @@ import {
 import { partyBalances } from "@/lib/ledger";
 import { correctBankPaidAmount } from "@/lib/bankRepair";
 import { matchesQuery, byRelevance } from "@/lib/search";
+import { popupRect, currentViewport, watchViewport, type PopupPlacement } from "@/lib/popupRect";
 
 /** Rendering guard for the search dropdowns, NOT a search limit: every match
  * is found and ranked, this only bounds how many rows go into the DOM at once
  * so a large catalogue can't make the list janky. Anything beyond it is
  * reported by a "+N more" footer. */
 const MAX_SUGGESTIONS = 200;
-import type { Invoice, LineItem, Party, Item, PaymentMode, BankAccount } from "@/types";
+import type {
+  Invoice,
+  LineItem,
+  Party,
+  Item,
+  PaymentMode,
+  BankAccount,
+  PaymentSplit,
+} from "@/types";
 import { fmtMoney, fmtDate, today } from "@/lib/format";
 import { toast } from "sonner";
+import { bankParts, splitProblems, largestSplitMode } from "@/lib/paymentSplit";
+import { SplitPaymentRows } from "@/components/SplitPaymentRows";
 import {
   Trash2,
   Plus,
@@ -60,6 +72,71 @@ import { useRepoData, useRepoMemo } from "@/hooks/useRepoData";
 interface Props {
   mode: "sale" | "purchase";
   existing?: Invoice | null;
+}
+
+/**
+ * Which of a pair of twins is the one on screen.
+ *
+ * The bill's item lines are rendered twice — a table for a desk and a card
+ * list for a phone — and CSS hides one of them. So "the Qty box for this
+ * line" is a question with two answers, and the right one is whichever is
+ * not inside a display:none subtree. offsetParent answers exactly that.
+ */
+function visibleOf<T extends HTMLElement>(...els: (T | null | undefined)[]): T | null {
+  return els.find((el) => el && el.offsetParent !== null) ?? els.find(Boolean) ?? null;
+}
+
+/** Phone-sized control. 16px is not a taste: below it, iOS zooms the whole
+ *  page the moment the box is focused, and the bill jumps out from under the
+ *  person filling it in. */
+const PHONE_NUM =
+  "w-full h-11 rounded-lg border bg-background px-3 text-right text-[16px] tabular-nums outline-none focus:border-primary focus:ring-2 focus:ring-ring/20";
+
+/** One labelled box in a phone line-item card. */
+function PhoneField({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label className="block">
+      <span className="mb-1 block text-[10.5px] font-semibold uppercase tracking-wider text-muted-foreground">
+        {label}
+      </span>
+      {children}
+    </label>
+  );
+}
+
+/** Whether a recomputed placement actually differs. The scroll listeners
+ *  below run with capture:true, so they also fire for scrolls INSIDE the
+ *  panel; writing a fresh object there re-rendered a 200-row list on every
+ *  frame and threw it back to the top. */
+function samePlacement(a: PopupPlacement | null, b: PopupPlacement): boolean {
+  return (
+    !!a &&
+    a.left === b.left &&
+    a.width === b.width &&
+    a.top === b.top &&
+    a.bottom === b.bottom &&
+    a.maxHeight === b.maxHeight
+  );
+}
+
+/**
+ * Turn a placement into the style a portalled panel is positioned with.
+ *
+ * `cap` is the panel's own maximum, kept separate from the room it happens to
+ * have: a dropdown on a tall desk monitor should still be a dropdown, not a
+ * 500px wall of options. The available room is a ceiling, never a target.
+ */
+function placementStyle(p: PopupPlacement, cap?: number): React.CSSProperties {
+  return {
+    position: "fixed",
+    left: p.left,
+    width: p.width,
+    ...(p.top !== undefined ? { top: p.top } : { bottom: p.bottom }),
+    maxHeight: cap ? Math.min(p.maxHeight, cap) : p.maxHeight,
+    // A modal Radix dialog switches pointer events off on <body>, and
+    // anything portalled there goes with it unless it says otherwise.
+    pointerEvents: "auto",
+  };
 }
 
 export function InvoiceForm({ mode, existing }: Props) {
@@ -103,6 +180,9 @@ export function InvoiceForm({ mode, existing }: Props) {
         taxAmount: 0,
         total: 0,
         paid: 0,
+        /* What an unchosen bill IS. No pill is lit until the counter picks
+           one (see modeChosen), and a bill saved without picking is a bill
+           nobody paid — which is exactly what credit means. */
         paymentMode: "credit",
         createdAt: "",
         notes: "",
@@ -177,14 +257,21 @@ export function InvoiceForm({ mode, existing }: Props) {
   const { canPost } = usePeriodLock();
   useEffect(() => {
     if (focusQtyId.current) {
-      const el = document.getElementById(`qty-${focusQtyId.current}`) as HTMLInputElement | null;
+      const el = visibleOf(
+        document.getElementById(`qty-${focusQtyId.current}`) as HTMLInputElement | null,
+        document.getElementById(`qty-m-${focusQtyId.current}`) as HTMLInputElement | null,
+      );
       el?.focus();
       el?.select();
       focusQtyId.current = null;
     }
   }, [inv.lineItems]);
   const focusFirstPendingRow = () => {
-    pendingInputRefs.current[pendingRowIds[0]]?.focus();
+    const id = pendingRowIds[0];
+    visibleOf(
+      pendingInputRefs.current[`row:${id}`],
+      pendingInputRefs.current[`card:${id}`],
+    )?.focus();
   };
   // A party or item typed at the counter that doesn't exist yet is no longer
   // silently created with blank/zero defaults — these open a quick-add
@@ -200,6 +287,12 @@ export function InvoiceForm({ mode, existing }: Props) {
    *  existing line whose item is being swapped. Exactly one is set: creating
    *  an item from the change-item picker must REPLACE what is on that line,
    *  not append a second one and leave the wrong item behind. */
+  /** Rows, once somebody says the money came in more than one way. null is
+   *  the ordinary single-mode bill, which is most of them and stays exactly
+   *  as it was. */
+  const [splitRows, setSplitRows] = useState<PaymentSplit[] | null>(
+    () => existing?.paidSplits ?? null,
+  );
   const [quickAddItem, setQuickAddItem] = useState<{
     name: string;
     rowId: string | null;
@@ -211,6 +304,9 @@ export function InvoiceForm({ mode, existing }: Props) {
   const [phoneQ, setPhoneQ] = useState(existing?.partyPhone ?? "");
   const [partyOpen, setPartyOpen] = useState(false);
   const [partyIdx, setPartyIdx] = useState(0);
+  /** Arrowing past the bottom edge used to move the highlight invisibly. */
+  const partyListRef = useRef<HTMLDivElement>(null);
+  useHighlightScroll(partyListRef, partyIdx, partyOpen);
   const [numberEditing, setNumberEditing] = useState(false);
   const numberRef = useRef<HTMLInputElement>(null);
   // The opening number was computed at mount from repo.all(), which on a cold
@@ -230,6 +326,19 @@ export function InvoiceForm({ mode, existing }: Props) {
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
   const bankSelectRef = useRef<HTMLInputElement>(null);
+  /**
+   * Has anyone actually picked a payment mode on this bill?
+   *
+   * A new bill starts with NOTHING lit, so Tab walks the three pills and
+   * Enter picks one; from then on the group is a single Tab stop and Tab
+   * goes to the amount. An existing bill was obviously decided already.
+   *
+   * Kept beside paymentMode rather than making that field optional: it is
+   * required on the stored document, thirteen places in this file read it,
+   * and "no answer yet" is a fact about the FORM rather than about the bill.
+   */
+  const [modeChosen, setModeChosen] = useState(!!existing);
+
   const prevPaymentMode = useRef(inv.paymentMode);
   useEffect(() => {
     // Only jump focus on an actual switch to "bank" — not on mount, or an
@@ -263,6 +372,16 @@ export function InvoiceForm({ mode, existing }: Props) {
      back to the top, which feels exactly like a list that cannot be
      scrolled. */
   const bankOptionsRef = useRef<HTMLDivElement>(null);
+  /** The received/paid box — where the keyboard goes once a mode is chosen. */
+  const amountRef = useRef<HTMLInputElement>(null);
+  /** The form's own scrolling region — reset to the top whenever a different
+   *  bill is put into it. */
+  const scrollRef = useRef<HTMLDivElement>(null);
+  /** Where the router thinks we are. A workspace tab keeps its component
+   *  mounted, so this is what tells the form it is being opened again. */
+  const formPathname = useRouterState({ select: (st) => st.location.pathname });
+  /** Set when a mode is picked, consumed by the effect below. */
+  const focusAfterMode = useRef<PaymentMode | null>(null);
   const prevBankIdx = useRef(bankIdx);
   useEffect(() => {
     if (prevBankIdx.current === bankIdx) return;
@@ -271,6 +390,56 @@ export function InvoiceForm({ mode, existing }: Props) {
       ?.querySelector(`[data-bank-opt="${bankIdx}"]`)
       ?.scrollIntoView({ block: "nearest" });
   }, [bankIdx]);
+
+  /**
+   * Put the cursor on whatever the chosen mode just made necessary.
+   *
+   * In an effect rather than in the click handler because both targets are
+   * rendered BY that same update — Cash reveals the amount box, Bank reveals
+   * the account box — so anything running before React commits is focusing a
+   * ref that is still null. An earlier attempt used requestAnimationFrame and
+   * silently did nothing for exactly that reason.
+   */
+  useEffect(() => {
+    const m = focusAfterMode.current;
+    if (!m) return;
+    focusAfterMode.current = null;
+    if (m === "bank") bankSelectRef.current?.focus();
+    else if (m !== "credit") amountRef.current?.focus();
+  }, [inv.paymentMode, modeChosen]);
+
+  /* Start at the top — and stay there long enough for it to count.
+
+     The first version reset once, on mount, and the shop still opened a
+     scrolled form: close a half-scrolled New Sale, open another, and there it
+     was again part-way down. Resetting once is not enough, because the things
+     that move a fresh form happen AFTER it mounts — the repo data lands and
+     the page grows, a picker restores its state, the router does its own
+     scroll handling. Whichever of those did it, the answer is the same: put
+     it back on the next tick too.
+
+     Two frames, then done. Nobody scrolls deliberately in the first 80ms of a
+     form they just opened, so this cannot fight a real user; and it stops
+     short of a loop that would make the form impossible to scroll at all.
+
+     Keyed on the route as well as the bill, because opening a new bill after
+     closing one is not a new mount in a workspace that keeps tabs alive — the
+     location changing is the only signal that anything happened. */
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = 0;
+    const raf = requestAnimationFrame(() => {
+      el.scrollTop = 0;
+    });
+    const t = setTimeout(() => {
+      el.scrollTop = 0;
+    }, 80);
+    return () => {
+      cancelAnimationFrame(raf);
+      clearTimeout(t);
+    };
+  }, [existing?.id, formPathname]);
 
   const selectBank = (b: BankAccount) => {
     setInv({ ...inv, bankId: b.id });
@@ -428,7 +597,7 @@ export function InvoiceForm({ mode, existing }: Props) {
       name: it.name,
       qty: 1,
       unit: it.unit,
-      price: historicalPrice ?? (isSale ? it.salePrice || it.purchasePrice : it.purchasePrice),
+      price: isSale ? (it.salePrice ?? 0) : (historicalPrice ?? it.purchasePrice),
       discountPct: 0,
       gstRate: it.gstRate,
       amount: 0,
@@ -570,7 +739,7 @@ export function InvoiceForm({ mode, existing }: Props) {
       name: it.name,
       unit: it.unit,
       gstRate: it.gstRate,
-      price: historicalPrice ?? (isSale ? it.salePrice || it.purchasePrice : it.purchasePrice),
+      price: isSale ? (it.salePrice ?? 0) : (historicalPrice ?? it.purchasePrice),
       costPrice: it.purchasePrice,
       // The old item's foreign price must not survive the swap — a later
       // exchange-rate change re-prices every line that still has one, which
@@ -680,6 +849,24 @@ export function InvoiceForm({ mode, existing }: Props) {
       PaymentRepo.all(),
     );
 
+    /* A split that does not add up is not a document. Refused here rather
+       than corrected, because only the person at the counter knows which of
+       the two figures is the true one. */
+    if (splitRows) {
+      /* Against `paid`, the figure actually being written — not inv.paid.
+         save() clamps paid to the bill total before handing it here, so the
+         two can differ, and validating the rows against a number the
+         document will not carry rejects a document that is in fact correct.
+         That is what made a reopened split bill impossible to save. */
+      const problems = splitProblems(splitRows, paid);
+      if (problems.length) {
+        toast.error(problems[0].message, { duration: 8000 });
+        savingRef.current = false;
+        setSaving(false);
+        return;
+      }
+    }
+
     const finalInv: Invoice = {
       ...inv,
       /* Minted here, not left to addBatched. The serial plan below stamps
@@ -692,8 +879,15 @@ export function InvoiceForm({ mode, existing }: Props) {
       partyId,
       partyName,
       partyPhone: phone,
-      bankId: inv.paymentMode === "bank" ? inv.bankId : undefined,
-      bankPaidAmount: bankPaidNow,
+      /* For a split bill the rows ARE the attribution, and the legacy pair
+         must be left empty: two answers for the same money is how a repair
+         tool later "corrects" one of them and moves an account balance that
+         was already right. paymentMode keeps the largest row so lists and
+         old printouts still say something true about the bill. */
+      paymentMode: splitRows?.length ? largestSplitMode(splitRows) : inv.paymentMode,
+      bankId: splitRows?.length ? undefined : inv.paymentMode === "bank" ? inv.bankId : undefined,
+      bankPaidAmount: splitRows?.length ? undefined : bankPaidNow,
+      paidSplits: splitRows?.length ? splitRows : undefined,
     };
 
     // This invoice's own paid-at-billing amount can move money on a specific
@@ -702,21 +896,18 @@ export function InvoiceForm({ mode, existing }: Props) {
     // later via unrelated Payment-page allocations that never touched this
     // bank account) before applying what it moves now, in the same batch as
     // everything else in this save.
-    if (existing?.paymentMode === "bank" && existing.bankId && (existing.bankPaidAmount ?? 0) > 0) {
-      BankRepo.adjustFieldBatched(
-        batch,
-        existing.bankId,
-        "balance",
-        isSale ? -existing.bankPaidAmount! : existing.bankPaidAmount!,
-      );
+    /* Every account the bill USED to touch is reversed, and every account it
+       touches now is applied — a set at a time, because a split bill can name
+       two accounts, and an edit can move money from one to another. Reading
+       them through bankParts means a bill with no splits produces exactly the
+       single bankPaidAmount adjustment this always made. */
+    if (existing) {
+      for (const [id, amount] of bankParts(existing)) {
+        BankRepo.adjustFieldBatched(batch, id, "balance", isSale ? -amount : amount);
+      }
     }
-    if (finalInv.paymentMode === "bank" && finalInv.bankId && (finalInv.bankPaidAmount ?? 0) > 0) {
-      BankRepo.adjustFieldBatched(
-        batch,
-        finalInv.bankId,
-        "balance",
-        isSale ? finalInv.bankPaidAmount! : -finalInv.bankPaidAmount!,
-      );
+    for (const [id, amount] of bankParts(finalInv)) {
+      BankRepo.adjustFieldBatched(batch, id, "balance", isSale ? amount : -amount);
     }
 
     // If editing dropped the settled amount (bill total reduced, or paid
@@ -837,12 +1028,27 @@ export function InvoiceForm({ mode, existing }: Props) {
       if (!it) continue;
       const extra: Partial<Item> = {};
       if (l.price > 0) {
-        // Track the LAST price this item actually moved at, on both sides.
-        // Sale price used to be written only when the item had none, so
-        // after the very first bill it never changed again and "last sale
-        // price" was really "the price someone typed once, long ago".
-        if (isSale && it.salePrice !== l.price) extra.salePrice = l.price;
-        // Purchase price: always the LATEST cost, so profit stays accurate.
+        /* A SALE no longer rewrites the item's price.
+
+           It used to: whatever a bill charged became the item's sale price.
+           So one discounted bill — a regular customer, a damaged box, a
+           haggle at the counter — silently became the price offered to
+           everybody afterwards, because new lines pre-fill from it. The shop
+           reported exactly that, and it is the kind of error that spreads
+           quietly: nobody is told the catalogue changed, and the next person
+           to bill that item has no reason to doubt the number in front of
+           them.
+
+           The price an item sells at is a decision, made on the Items screen.
+           It is not a side effect of the last bill that happened to go out.
+           A bill that charges something else is still recorded in full — the
+           line keeps its own price, and the party's own history still
+           pre-fills their usual rate (see historicalPrice above). Nothing is
+           lost by leaving the catalogue alone.
+
+           A PURCHASE still updates the cost, and that is a different thing:
+           the latest cost is a fact about what the shop paid, not an offer
+           to anybody, and profit is measured against it. */
         if (!isSale && it.purchasePrice !== l.price) extra.purchasePrice = l.price;
       }
       if (isSerialised(it)) {
@@ -1017,7 +1223,12 @@ export function InvoiceForm({ mode, existing }: Props) {
       setTimeout(() => numberRef.current?.focus(), 50);
       return;
     }
-    if (inv.paymentMode === "bank" && !inv.bankId) {
+    /* Only when the bill is settled one way. A split carries its accounts in
+       its rows and deliberately leaves bankId empty, while paymentMode holds
+       the LARGEST part — so a ₹400 cash + ₹600 bank bill reports "bank" with
+       no bankId and this guard refused to save it at all. The rows are
+       checked on their own terms just below. */
+    if (!splitRows && inv.paymentMode === "bank" && !inv.bankId) {
       toast.error("Select which bank account this goes to");
       return;
     }
@@ -1105,7 +1316,7 @@ export function InvoiceForm({ mode, existing }: Props) {
   );
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full" data-bill-form>
       {/* Header */}
       <div className="px-4 md:px-5 py-3 border-b bg-card flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
         <div className="flex items-center justify-between gap-3 min-w-0">
@@ -1238,7 +1449,11 @@ export function InvoiceForm({ mode, existing }: Props) {
         </div>
       </div>
 
-      <div className="p-4 md:p-5 space-y-4 overflow-auto flex-1 bg-muted/30">
+      <div
+        ref={scrollRef}
+        data-bill-scroll
+        className="p-4 md:p-5 space-y-4 overflow-auto flex-1 bg-muted/30"
+      >
         {/* Party + meta */}
         <div className="bg-card border rounded-lg shadow-card p-4">
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1.5 mb-3">
@@ -1320,10 +1535,14 @@ export function InvoiceForm({ mode, existing }: Props) {
                 </div>
               </label>
               {partyOpen && partySuggests.length > 0 && (
-                <div className="absolute z-20 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-elevated max-h-64 overflow-auto">
+                <div
+                  ref={partyListRef}
+                  className="absolute z-20 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-elevated max-h-64 overflow-auto"
+                >
                   {partySuggests.map((p, i) => (
                     <div
                       key={p.id}
+                      data-opt={i}
                       onMouseDown={(e) => {
                         e.preventDefault();
                         selectParty(p);
@@ -1429,11 +1648,11 @@ export function InvoiceForm({ mode, existing }: Props) {
         <div className="border rounded-lg bg-card shadow-card">
           <div className="px-4 py-2.5 border-b bg-muted/50 flex items-center justify-between rounded-t-lg">
             <span className="text-[13px] font-semibold">Items ({inv.lineItems.length})</span>
-            <span className="text-[11px] text-muted-foreground">
+            <span className="hidden text-[11px] text-muted-foreground sm:inline">
               Type an item name in a row below to add it
             </span>
           </div>
-          <div className="overflow-x-auto rounded-b-lg">
+          <div className="hidden overflow-x-auto rounded-b-lg md:block">
             <table className="w-full text-[13px] min-w-[720px]">
               <thead className="text-[11px] text-muted-foreground uppercase tracking-wider">
                 <tr className="bg-muted/40">
@@ -1593,7 +1812,7 @@ export function InvoiceForm({ mode, existing }: Props) {
                     }}
                     onAddNew={(name) => setQuickAddItem({ name, rowId: id })}
                     registerInput={(el) => {
-                      pendingInputRefs.current[id] = el;
+                      pendingInputRefs.current[`row:${id}`] = el;
                     }}
                   />
                 ))}
@@ -1632,11 +1851,164 @@ export function InvoiceForm({ mode, existing }: Props) {
               )}
             </table>
           </div>
+
+          {/* The same lines, shaped for a phone.
+              Both layouts are mounted and CSS shows one — which is why the
+              focus helpers above look for the visible twin rather than the
+              first match. Rendering only one would mean measuring the
+              viewport in JavaScript and re-mounting inputs on rotation, and
+              re-mounting an input while somebody is typing in it is its own
+              bug. */}
+          <div className="md:hidden">
+            {inv.lineItems.map((l, idx) => (
+              <div key={l.id} className="border-t px-3 py-3">
+                <div className="flex items-start gap-2">
+                  <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded bg-muted text-[11px] font-semibold text-muted-foreground">
+                    {idx + 1}
+                  </span>
+                  {/* The name gets the whole width and wraps. In the table it
+                      was the first thing to scroll off the side. */}
+                  <div className="min-w-0 flex-1 text-[14px] leading-snug break-words">
+                    <ItemNameCell
+                      name={l.name}
+                      items={items}
+                      isSale={isSale}
+                      gstOn={gstOn}
+                      onChange={(it) => changeLineItem(l.id, it)}
+                      onAddNew={(name) =>
+                        setQuickAddItem({ name, rowId: null, replaceLineId: l.id })
+                      }
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => removeLine(l.id)}
+                    aria-label="Remove this item"
+                    className="-mr-1 shrink-0 rounded p-1.5 text-destructive hover:bg-destructive/10"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </div>
+
+                <div className="mt-2.5 grid grid-cols-2 gap-2.5">
+                  <PhoneField label="Qty">
+                    <NumInput
+                      id={`qty-m-${l.id}`}
+                      value={l.qty}
+                      onValue={(n) => updateLine(l.id, { qty: n })}
+                      className={PHONE_NUM}
+                    />
+                  </PhoneField>
+                  {showUnitCol && (
+                    <PhoneField label="Unit">
+                      <input
+                        value={l.unit}
+                        onChange={(e) => updateLine(l.id, { unit: e.target.value })}
+                        className={`${PHONE_NUM} text-left`}
+                      />
+                    </PhoneField>
+                  )}
+                  {inv.isInternational && (
+                    <PhoneField label="Foreign Price">
+                      <NumInput
+                        value={l.foreignPrice ?? 0}
+                        onValue={(n) => updateLine(l.id, { foreignPrice: n })}
+                        className={PHONE_NUM}
+                      />
+                    </PhoneField>
+                  )}
+                  <PhoneField label="Price">
+                    {inv.partyId ? (
+                      <PriceHistoryCell
+                        value={l.price}
+                        onValue={(n) => updateLine(l.id, { price: n })}
+                        history={partyItemHistory(l.itemId)}
+                        partyName={inv.partyName}
+                        isSale={isSale}
+                        inputClassName={PHONE_NUM}
+                      />
+                    ) : (
+                      <NumInput
+                        value={l.price}
+                        onValue={(n) => updateLine(l.id, { price: n })}
+                        className={PHONE_NUM}
+                      />
+                    )}
+                  </PhoneField>
+                  {showDiscCol && (
+                    <PhoneField label="Disc %">
+                      <NumInput
+                        value={l.discountPct}
+                        onValue={(n) => updateLine(l.id, { discountPct: n })}
+                        className={PHONE_NUM}
+                      />
+                    </PhoneField>
+                  )}
+                  {gstOn && (
+                    <PhoneField label="GST %">
+                      <NumInput
+                        value={l.gstRate}
+                        onValue={(n) => updateLine(l.id, { gstRate: n })}
+                        className={PHONE_NUM}
+                      />
+                    </PhoneField>
+                  )}
+                </div>
+
+                <div className="mt-2.5 flex items-center justify-between border-t pt-2">
+                  <span className="text-[10.5px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    Amount
+                  </span>
+                  <span className="text-[15px] font-bold tabular-nums">{fmtMoney(l.amount)}</span>
+                </div>
+              </div>
+            ))}
+
+            {pendingRowIds.map((id) => (
+              <ItemEntryRow
+                key={id}
+                layout="card"
+                items={items}
+                gstOn={gstOn}
+                isSale={isSale}
+                isInternational={!!inv.isInternational}
+                showUnit={showUnitCol}
+                showDisc={showDiscCol}
+                onAdd={(it) => {
+                  focusQtyId.current = addLineItem(it);
+                  completePendingRow(id);
+                }}
+                onAddNew={(name) => setQuickAddItem({ name, rowId: id })}
+                registerInput={(el) => {
+                  pendingInputRefs.current[`card:${id}`] = el;
+                }}
+              />
+            ))}
+
+            {/* The same check the printed bill and the table footing give:
+                eleven pieces on the counter, so the bill had better say
+                eleven. */}
+            {inv.lineItems.length > 0 && (
+              <div className="flex items-center justify-between gap-3 border-t-2 bg-muted/30 px-3 py-2.5">
+                <span className="text-[10.5px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Total · {totalQty} qty
+                </span>
+                <span className="text-[15px] font-bold tabular-nums">
+                  {fmtMoney(totalLineAmount)}
+                </span>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Totals + notes */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-start">
-          <div className="lg:col-span-2 border rounded-lg bg-card shadow-card overflow-hidden text-sm">
+          {/* Not overflow-hidden: the bank-account dropdown is absolutely
+              positioned inside this card, and clipping it cut off every
+              option past the card's bottom edge — reported, reasonably, as a
+              list that would not scroll. The corners stay rounded because
+              nothing inside paints into them. */}
+          <div className="border rounded-lg bg-card shadow-card text-sm">
             {/* Amount breakdown */}
             <div className="p-4 space-y-2.5">
               <Row label="Subtotal" value={fmtMoney(inv.subtotal)} />
@@ -1672,29 +2044,54 @@ export function InvoiceForm({ mode, existing }: Props) {
             </div>
 
             {/* Total — its own band so it reads as the one number that matters */}
-            <div className="flex justify-between items-center gap-2 px-4 py-3 bg-muted/40 border-y font-bold text-lg">
+            <div className="flex justify-between items-center gap-2 px-4 py-3 bg-muted/40 border-t font-bold text-lg rounded-b-lg">
               <span>Total</span>
               <span className="tabular-nums text-primary">{fmtMoney(inv.total)}</span>
             </div>
+          </div>
 
-            {/* Payment */}
+          {/* Payment — its own column now. Not overflow-hidden: the
+              bank-account dropdown is absolutely positioned inside it, and
+              clipping cut off every option past the card's bottom edge. */}
+          <div className="border rounded-lg bg-card shadow-card text-sm">
+            <div className="px-4 py-2.5 border-b bg-muted/50 rounded-t-lg text-[12px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Payment
+            </div>
             <div className="p-4 space-y-2.5">
               <div className="flex justify-between items-center gap-2">
                 <span className="text-muted-foreground">Payment Mode</span>
                 <ModePills
-                  value={inv.paymentMode}
+                  value={modeChosen ? inv.paymentMode : undefined}
                   onChange={(newMode: PaymentMode) => {
+                    // From here the group is one Tab stop, and Tab goes to
+                    // the amount rather than to another pill.
+                    setModeChosen(true);
                     setInv({
                       ...inv,
                       paymentMode: newMode,
                       paid: newMode === "credit" ? 0 : inv.paid,
                       bankId: newMode === "bank" ? inv.bankId : undefined,
                     });
+                    /* Move to whatever the choice just made necessary, rather
+                       than leaving it to Tab.
+
+                       macOS is the reason. With "Keyboard navigation" off —
+                       the system default — Safari's Tab visits text fields
+                       and skips buttons entirely, so tabbing off the Cash
+                       pill reached neither "Full" nor anything else useful,
+                       which is precisely the report. Driving the focus here
+                       makes the run behave the same on every browser instead
+                       of depending on a setting nobody at a shop counter is
+                       going to find.
+
+                       After the state update, so the bank field exists to be
+                       focused when the answer was Bank. */
+                    focusAfterMode.current = newMode;
                   }}
                   modes={["cash", "bank", "credit"]}
                 />
               </div>
-              {inv.paymentMode === "bank" && (
+              {!splitRows && inv.paymentMode === "bank" && (
                 <div className="relative flex flex-col gap-1.5">
                   <span className="text-muted-foreground text-[12px]">Bank Account *</span>
                   <input
@@ -1766,7 +2163,18 @@ export function InvoiceForm({ mode, existing }: Props) {
                 <span className="text-muted-foreground">
                   {mode === "sale" ? "Received Amount" : "Paid Amount"}
                 </span>
-                {inv.paymentMode === "credit" ? (
+                {!modeChosen ? (
+                  /* Nothing has been chosen yet, so say nothing about what
+                     happens next. This used to fall through to the credit
+                     wording — the underlying value starts as credit — so a
+                     bill with the Cash pill merely FOCUSED read "₹0.00, will
+                     receive later" while the counter was looking straight at
+                     Cash. Reported, understandably, as the form contradicting
+                     itself. */
+                  <span className="text-[12px] text-muted-foreground select-none">
+                    Choose Cash, Bank or Credit
+                  </span>
+                ) : inv.paymentMode === "credit" ? (
                   <span className="text-[12px] text-muted-foreground select-none">
                     ₹0.00 — {mode === "sale" ? "will receive later" : "will pay later"}
                   </span>
@@ -1787,13 +2195,63 @@ export function InvoiceForm({ mode, existing }: Props) {
                       Full
                     </button>
                     <NumInput
+                      ref={amountRef}
                       value={inv.paid}
                       onValue={(n) => setInv({ ...inv, paid: n })}
+                      aria-label={mode === "sale" ? "Received amount" : "Paid amount"}
                       className="w-24 h-8 px-2 text-right border rounded-md bg-background focus:border-primary focus:ring-2 focus:ring-ring/20 outline-none tabular-nums"
                     />
                   </div>
                 )}
               </div>
+              {/* Below the amount, on purpose. Splitting is something you
+                 decide AFTER saying how much came in, and sitting above the
+                 Received Amount it also broke the tab run: mode, then this
+                 link, then the bank account, then the amount. The order now
+                 follows the job — mode, account, amount, then how it was
+                 divided.
+                 Offered only when there is money to divide: a credit bill has
+                 none, and an unpaid one has nothing to say yet. */}
+              {inv.paymentMode !== "credit" && inv.paid > 0 && !splitRows && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    // Opens holding what the bill already says, so the first
+                    // row is never something the counter has to re-enter.
+                    setSplitRows([
+                      {
+                        mode: inv.paymentMode,
+                        amount: inv.paid,
+                        bankId: inv.paymentMode === "bank" ? inv.bankId : undefined,
+                      },
+                    ])
+                  }
+                  className="text-[11px] font-medium text-primary hover:underline self-end"
+                >
+                  Split across cash and bank
+                </button>
+              )}
+              {splitRows && (
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-muted-foreground text-[12px]">How it was paid</span>
+                    <button
+                      type="button"
+                      onClick={() => setSplitRows(null)}
+                      className="text-[11px] text-muted-foreground hover:underline"
+                    >
+                      Back to one payment
+                    </button>
+                  </div>
+                  <SplitPaymentRows
+                    rows={splitRows}
+                    onChange={setSplitRows}
+                    total={inv.paid}
+                    banks={banks}
+                    label={isSale ? "Amount received" : "Amount paid"}
+                  />
+                </div>
+              )}
               <div className="flex justify-between items-center gap-2 pt-2 mt-1 border-t font-semibold">
                 <span>Balance Due</span>
                 <span
@@ -1917,6 +2375,7 @@ function ItemEntryRow({
   showUnit,
   showDisc,
   registerInput,
+  layout = "row",
 }: {
   items: Item[];
   onAdd: (i: Item) => void;
@@ -1930,16 +2389,22 @@ function ItemEntryRow({
   showUnit: boolean;
   showDisc: boolean;
   registerInput: (el: HTMLInputElement | null) => void;
+  /**
+   * A phone gets a card, not a table row.
+   *
+   * The nine-column row needs 720px to lay out and a phone has 390, so on a
+   * phone it became a thing you drag sideways: the photograph from the
+   * counter shows Qty, Price and Amount on screen with the item NAME
+   * scrolled off to the left. A card is the same fields stacked, which is
+   * what every phone billing app does and what was asked for here.
+   */
+  layout?: "row" | "card";
 }) {
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(false);
   const [idx, setIdx] = useState(0);
   const inputElRef = useRef<HTMLInputElement | null>(null);
-  const [dropdownRect, setDropdownRect] = useState<{
-    top: number;
-    left: number;
-    width: number;
-  } | null>(null);
+  const [dropdownRect, setDropdownRect] = useState<PopupPlacement | null>(null);
 
   // The row lives inside a horizontally-scrollable table
   // (overflow-x-auto), which per the CSS spec also forces overflow-y to
@@ -1953,7 +2418,9 @@ function ItemEntryRow({
       const el = inputElRef.current;
       if (!el) return;
       const r = el.getBoundingClientRect();
-      const next = { top: r.bottom + 4, left: r.left, width: r.width };
+      // Widened past the input on purpose: in a card layout the input is the
+      // width of a phone, and in the table it is a third of one.
+      const next = popupRect(r, currentViewport(), { minWidth: 260 });
       // Bail out when nothing actually moved. This listener is registered
       // with capture:true, so it also fires for scrolls that happen INSIDE
       // the dropdown — and writing a fresh object there re-rendered the list
@@ -1961,19 +2428,10 @@ function ItemEntryRow({
       // input hasn't moved when you scroll the options, so returning the
       // previous state makes React skip the render entirely (it also stops
       // a 200-row list re-rendering on every frame of an outer scroll).
-      setDropdownRect((prev) =>
-        prev && prev.top === next.top && prev.left === next.left && prev.width === next.width
-          ? prev
-          : next,
-      );
+      setDropdownRect((prev) => (samePlacement(prev, next) ? prev : next));
     };
     updateRect();
-    window.addEventListener("scroll", updateRect, true);
-    window.addEventListener("resize", updateRect);
-    return () => {
-      window.removeEventListener("scroll", updateRect, true);
-      window.removeEventListener("resize", updateRect);
-    };
+    return watchViewport(updateRect);
   }, [open]);
 
   // Empty query — browse the full item catalog (like a combobox), instead
@@ -2026,112 +2484,145 @@ function ItemEntryRow({
     else if (showAddNew) pickNew();
   };
 
+  const field = (
+    <>
+      <input
+        ref={(el) => {
+          inputElRef.current = el;
+          registerInput(el);
+        }}
+        value={q}
+        onChange={(e) => {
+          setQ(e.target.value);
+          setOpen(true);
+          setIdx(0);
+        }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowDown") {
+            e.preventDefault();
+            setIdx((i) => Math.min(optionCount - 1, i + 1));
+          } else if (e.key === "ArrowUp") {
+            e.preventDefault();
+            setIdx((i) => Math.max(0, i - 1));
+          } else if (e.key === "Enter") {
+            e.preventDefault();
+            if (optionCount > 0) choose(idx);
+          } else if (e.key === "Escape" && open) {
+            e.preventDefault();
+            e.stopPropagation();
+            setOpen(false);
+          }
+        }}
+        placeholder="Type item name to add…"
+        className={
+          layout === "card"
+            ? "w-full h-11 px-3 border rounded-lg bg-background focus:border-primary focus:ring-2 focus:ring-ring/20 outline-none text-[16px]"
+            : "w-full h-8 px-2 border rounded bg-background focus:border-primary focus:ring-2 focus:ring-ring/20 outline-none text-sm"
+        }
+      />
+      {open &&
+        optionCount > 0 &&
+        dropdownRect &&
+        createPortal(
+          <div
+            style={placementStyle(dropdownRect, 288)}
+            className="z-50 border rounded-md bg-popover shadow-elevated flex flex-col overflow-hidden"
+          >
+            {/* The list scrolls; the "+N more" note below does NOT live
+                  inside it. As a sticky child of the scroller it sat on top
+                  of the last row and hid it. */}
+            <div ref={optionsRef} className="overflow-auto flex-1 min-h-0">
+              {suggests.map((it, i) => (
+                <div
+                  key={it.id}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    pick(it);
+                  }}
+                  data-opt={i}
+                  className={`px-3 py-2 text-sm cursor-pointer flex justify-between ${i === idx ? "bg-accent" : "hover:bg-accent"}`}
+                >
+                  <div>
+                    <div className="font-semibold">{it.name}</div>
+                    <div className="text-[11px] text-muted-foreground">
+                      {/* Counted from the units on hand, not read off the item:
+                          on this branch stock is derived, and a stored number
+                          would disagree with the serials the moment one moved. */}
+                      Stock: {stockOf(it)} {it.unit}
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    {isSale ? (
+                      <>
+                        <div className="text-[11px] text-muted-foreground tabular-nums">
+                          cost {fmtMoney(it.purchasePrice)}
+                        </div>
+                        <div className="font-semibold tabular-nums">
+                          {it.salePrice ? (
+                            <>sells {fmtMoney(it.salePrice)}</>
+                          ) : (
+                            <span className="text-[11px] font-normal text-amber-600">
+                              No sale price
+                            </span>
+                          )}
+                        </div>
+                      </>
+                    ) : (
+                      <div className="font-semibold tabular-nums">{fmtMoney(it.purchasePrice)}</div>
+                    )}
+                    {gstOn && (
+                      <div className="text-[11px] text-muted-foreground">GST {it.gstRate}%</div>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {showAddNew && (
+                <div
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    pickNew();
+                  }}
+                  className={`px-3 py-2 text-sm cursor-pointer flex items-center gap-2 border-t ${idx === suggests.length ? "bg-accent" : "hover:bg-accent"}`}
+                >
+                  <span className="h-5 w-5 rounded bg-primary-soft text-primary flex items-center justify-center text-xs font-bold">
+                    +
+                  </span>
+                  <span>
+                    Add "<span className="font-semibold">{trimmed}</span>" as new item
+                  </span>
+                </div>
+              )}
+            </div>
+            {hiddenCount > 0 && (
+              <div className="shrink-0 px-3 py-2 text-[11px] text-muted-foreground border-t bg-muted/40">
+                +{hiddenCount} more — keep typing to narrow it down
+              </div>
+            )}
+          </div>,
+          document.body,
+        )}
+    </>
+  );
+
+  if (layout === "card") {
+    return (
+      <div className="border-t bg-muted/20 px-3 py-2.5">
+        <div className="flex items-center gap-2">
+          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary-soft text-primary">
+            <Plus className="h-3.5 w-3.5" />
+          </span>
+          <div className="min-w-0 flex-1">{field}</div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <tr className="border-t hover:bg-accent/20">
       <td className="px-3 py-1.5"></td>
-      <td className="px-3 py-1.5">
-        <input
-          ref={(el) => {
-            inputElRef.current = el;
-            registerInput(el);
-          }}
-          value={q}
-          onChange={(e) => {
-            setQ(e.target.value);
-            setOpen(true);
-            setIdx(0);
-          }}
-          onFocus={() => setOpen(true)}
-          onBlur={() => setTimeout(() => setOpen(false), 150)}
-          onKeyDown={(e) => {
-            if (e.key === "ArrowDown") {
-              e.preventDefault();
-              setIdx((i) => Math.min(optionCount - 1, i + 1));
-            } else if (e.key === "ArrowUp") {
-              e.preventDefault();
-              setIdx((i) => Math.max(0, i - 1));
-            } else if (e.key === "Enter") {
-              e.preventDefault();
-              if (optionCount > 0) choose(idx);
-            } else if (e.key === "Escape" && open) {
-              e.preventDefault();
-              e.stopPropagation();
-              setOpen(false);
-            }
-          }}
-          placeholder="Type item name to add…"
-          className="w-full h-8 px-2 border rounded bg-background focus:border-primary focus:ring-2 focus:ring-ring/20 outline-none text-sm"
-        />
-        {open &&
-          optionCount > 0 &&
-          dropdownRect &&
-          createPortal(
-            <div
-              style={{
-                position: "fixed",
-                top: dropdownRect.top,
-                left: dropdownRect.left,
-                width: dropdownRect.width,
-                pointerEvents: "auto",
-              }}
-              className="z-50 border rounded-md bg-popover shadow-elevated max-h-72 flex flex-col"
-            >
-              {/* The list scrolls; the "+N more" note below does NOT live
-                  inside it. As a sticky child of the scroller it sat on top
-                  of the last row and hid it. */}
-              <div ref={optionsRef} className="overflow-auto flex-1 min-h-0">
-                {suggests.map((it, i) => (
-                  <div
-                    key={it.id}
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      pick(it);
-                    }}
-                    data-opt={i}
-                    className={`px-3 py-2 text-sm cursor-pointer flex justify-between ${i === idx ? "bg-accent" : "hover:bg-accent"}`}
-                  >
-                    <div>
-                      <div className="font-semibold">{it.name}</div>
-                      <div className="text-[11px] text-muted-foreground">
-                        Stock: {stockOf(it)} {it.unit}
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      <div className="font-semibold tabular-nums">
-                        {fmtMoney(isSale ? it.salePrice || it.purchasePrice : it.purchasePrice)}
-                      </div>
-                      {gstOn && (
-                        <div className="text-[11px] text-muted-foreground">GST {it.gstRate}%</div>
-                      )}
-                    </div>
-                  </div>
-                ))}
-                {showAddNew && (
-                  <div
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      pickNew();
-                    }}
-                    className={`px-3 py-2 text-sm cursor-pointer flex items-center gap-2 border-t ${idx === suggests.length ? "bg-accent" : "hover:bg-accent"}`}
-                  >
-                    <span className="h-5 w-5 rounded bg-primary-soft text-primary flex items-center justify-center text-xs font-bold">
-                      +
-                    </span>
-                    <span>
-                      Add "<span className="font-semibold">{trimmed}</span>" as new item
-                    </span>
-                  </div>
-                )}
-              </div>
-              {hiddenCount > 0 && (
-                <div className="shrink-0 px-3 py-2 text-[11px] text-muted-foreground border-t bg-muted/40">
-                  +{hiddenCount} more — keep typing to narrow it down
-                </div>
-              )}
-            </div>,
-            document.body,
-          )}
-      </td>
+      <td className="px-3 py-1.5">{field}</td>
       <td className="py-1.5 px-1">
         <input
           disabled
@@ -2215,23 +2706,18 @@ function ItemNameCell({
   const [q, setQ] = useState("");
   const [idx, setIdx] = useState(0);
   const inputElRef = useRef<HTMLInputElement | null>(null);
-  const [rect, setRect] = useState<{ top: number; left: number; width: number } | null>(null);
+  const [rect, setRect] = useState<PopupPlacement | null>(null);
 
   useEffect(() => {
     if (!editing) return;
     const updateRect = () => {
       const el = inputElRef.current;
       if (!el) return;
-      const r = el.getBoundingClientRect();
-      setRect({ top: r.bottom + 4, left: r.left, width: Math.max(r.width, 240) });
+      const next = popupRect(el.getBoundingClientRect(), currentViewport(), { minWidth: 240 });
+      setRect((prev) => (samePlacement(prev, next) ? prev : next));
     };
     updateRect();
-    window.addEventListener("scroll", updateRect, true);
-    window.addEventListener("resize", updateRect);
-    return () => {
-      window.removeEventListener("scroll", updateRect, true);
-      window.removeEventListener("resize", updateRect);
-    };
+    return watchViewport(updateRect);
   }, [editing]);
 
   const startEdit = () => {
@@ -2292,8 +2778,10 @@ function ItemNameCell({
     setEditing(false);
     const focusId = onChange(it);
     setTimeout(() => {
-      const qtyEl = document.getElementById(`qty-${focusId}`) as HTMLInputElement | null;
-      qtyEl?.focus();
+      visibleOf(
+        document.getElementById(`qty-${focusId}`) as HTMLInputElement | null,
+        document.getElementById(`qty-m-${focusId}`) as HTMLInputElement | null,
+      )?.focus();
     }, 0);
   };
 
@@ -2354,17 +2842,8 @@ function ItemNameCell({
       {rect &&
         createPortal(
           <div
-            style={{
-              position: "fixed",
-              top: rect.top,
-              left: rect.left,
-              width: rect.width,
-              // See the note in ComboInput: a modal Radix dialog switches
-              // pointer events off on <body>, and anything portalled there
-              // goes with it unless it says otherwise.
-              pointerEvents: "auto",
-            }}
-            className="z-50 border rounded-md bg-popover shadow-elevated max-h-72 flex flex-col"
+            style={placementStyle(rect, 288)}
+            className="z-50 border rounded-md bg-popover shadow-elevated flex flex-col overflow-hidden"
           >
             <div ref={optionsRef} className="overflow-auto flex-1 min-h-0">
               {suggests.length === 0 && !showAddNew && (
@@ -2389,9 +2868,24 @@ function ItemNameCell({
                     </div>
                   </div>
                   <div className="text-right">
-                    <div className="font-semibold tabular-nums">
-                      {fmtMoney(isSale ? it.salePrice || it.purchasePrice : it.purchasePrice)}
-                    </div>
+                    {isSale ? (
+                      <>
+                        <div className="text-[11px] text-muted-foreground tabular-nums">
+                          cost {fmtMoney(it.purchasePrice)}
+                        </div>
+                        <div className="font-semibold tabular-nums">
+                          {it.salePrice ? (
+                            <>sells {fmtMoney(it.salePrice)}</>
+                          ) : (
+                            <span className="text-[11px] font-normal text-amber-600">
+                              No sale price
+                            </span>
+                          )}
+                        </div>
+                      </>
+                    ) : (
+                      <div className="font-semibold tabular-nums">{fmtMoney(it.purchasePrice)}</div>
+                    )}
                     {gstOn && (
                       <div className="text-[11px] text-muted-foreground">GST {it.gstRate}%</div>
                     )}
@@ -2432,35 +2926,38 @@ function PriceHistoryCell({
   history,
   partyName,
   isSale,
+  inputClassName,
 }: {
   value: number;
   onValue: (n: number) => void;
   history: { date: string; qty: number; price: number }[];
   partyName: string;
   isSale: boolean;
+  /** The phone card wants a full-height box; the table wants a 28px one. */
+  inputClassName?: string;
 }) {
   const [open, setOpen] = useState(false);
   const inputElRef = useRef<HTMLInputElement | null>(null);
-  const [rect, setRect] = useState<{ top: number; left: number; width: number } | null>(null);
+  const [rect, setRect] = useState<PopupPlacement | null>(null);
 
   // Same portal trick as ItemEntryRow's dropdown — this cell lives inside
   // the overflow-x-auto item table, so a plain absolutely positioned popup
-  // gets clipped by the table's own scroll box.
+  // gets clipped by the table's own scroll box. Right-aligned, which is
+  // precisely how it used to walk off the LEFT edge of a phone: 256 taken
+  // off an input already near the screen's left gutter is a negative x.
   useEffect(() => {
     if (!open) return;
     const updateRect = () => {
       const el = inputElRef.current;
       if (!el) return;
-      const r = el.getBoundingClientRect();
-      setRect({ top: r.bottom + 4, left: r.right - 256, width: 256 });
+      const next = popupRect(el.getBoundingClientRect(), currentViewport(), {
+        align: "right",
+        preferredWidth: 256,
+      });
+      setRect((prev) => (samePlacement(prev, next) ? prev : next));
     };
     updateRect();
-    window.addEventListener("scroll", updateRect, true);
-    window.addEventListener("resize", updateRect);
-    return () => {
-      window.removeEventListener("scroll", updateRect, true);
-      window.removeEventListener("resize", updateRect);
-    };
+    return watchViewport(updateRect);
   }, [open]);
 
   return (
@@ -2471,23 +2968,17 @@ function PriceHistoryCell({
         onValue={onValue}
         onFocus={() => setOpen(true)}
         onBlur={() => setTimeout(() => setOpen(false), 150)}
-        className="w-full h-7 px-1.5 text-right border rounded bg-background focus:border-primary outline-none"
+        className={
+          inputClassName ??
+          "w-full h-7 px-1.5 text-right border rounded bg-background focus:border-primary outline-none"
+        }
       />
       {open &&
         rect &&
         createPortal(
           <div
-            style={{
-              position: "fixed",
-              top: rect.top,
-              left: rect.left,
-              width: rect.width,
-              // See the note in ComboInput: a modal Radix dialog switches
-              // pointer events off on <body>, and anything portalled there
-              // goes with it unless it says otherwise.
-              pointerEvents: "auto",
-            }}
-            className="z-50 border rounded-md bg-popover shadow-elevated overflow-hidden"
+            style={placementStyle(rect)}
+            className="z-50 border rounded-md bg-popover shadow-elevated overflow-auto"
           >
             <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground bg-muted/50 border-b">
               Last {isSale ? "Sale" : "Purchase"} Prices — {partyName}

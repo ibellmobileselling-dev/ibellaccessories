@@ -11,6 +11,8 @@ import type {
 } from "@/types";
 import { serialCostIndex, lineCostBasis } from "@/lib/serialCost";
 
+import { splitsOf, bankParts } from "@/lib/paymentSplit";
+
 const r2 = (n: number) => Math.round(n * 100) / 100;
 
 /** Sum of a payment's per-invoice allocations. Legacy payments (saved before
@@ -280,6 +282,35 @@ export interface FlowEntry {
 /** Money movement for one payment mode (cash, bank, …). Amounts settled
  * later via Payment records count under the payment's own mode, not the
  * invoice's, so nothing is counted twice. */
+/**
+ * What a document put through this mode WITHOUT landing it on a specific
+ * bank account's stored balance.
+ *
+ * That second half is the whole reason these flows exist separately from the
+ * bank ledger: money attributed to an account has already moved that
+ * account's own `balance` field, and the Bank page and dashboard add these
+ * flows ON TOP of the stored balances — so counting it here too would double
+ * it.
+ *
+ * Reading it off the split rows rather than the document's single mode is
+ * what makes a part-cash, part-bank bill possible. Before this, the sales
+ * loop below said "if (s.bankId) continue" and dropped the whole bill: the
+ * bank half was booked correctly by the bank ledger and the cash half
+ * vanished from Cash on Hand. That does not read as a bug at the counter, it
+ * reads as the till being short.
+ */
+function unbankedPart(
+  doc: Parameters<typeof splitsOf>[0],
+  mode: PaymentMode,
+  settledElsewhere = 0,
+): number {
+  return r2(
+    splitsOf(doc, settledElsewhere)
+      .filter((s) => s.mode === mode && !s.bankId)
+      .reduce((n, s) => n + (s.amount || 0), 0),
+  );
+}
+
 export function modeFlows(
   mode: PaymentMode,
   sales: Invoice[],
@@ -287,14 +318,12 @@ export function modeFlows(
   expenses: Expense[],
   payments: Payment[],
 ): FlowEntry[] {
+  // Money allocated to an invoice AFTER it was billed belongs to the Payment
+  // that brought it, which appears in these flows under its own mode.
   const applied = paidViaPayments(payments);
   const list: FlowEntry[] = [];
   for (const s of sales) {
-    if (s.paymentMode !== mode) continue;
-    // Already moved directly onto that specific bank account's balance (see
-    // InvoiceForm.tsx) — counting it again here would double it on the Bank page.
-    if (s.bankId) continue;
-    const direct = Math.max(0, r2((s.paid || 0) - (applied.get(s.id) ?? 0)));
+    const direct = unbankedPart(s, mode, applied.get(s.id) ?? 0);
     if (direct > 0)
       list.push({
         date: s.date,
@@ -306,9 +335,7 @@ export function modeFlows(
       });
   }
   for (const s of purchases) {
-    if (s.paymentMode !== mode) continue;
-    if (s.bankId) continue;
-    const direct = Math.max(0, r2((s.paid || 0) - (applied.get(s.id) ?? 0)));
+    const direct = unbankedPart(s, mode, applied.get(s.id) ?? 0);
     if (direct > 0)
       list.push({
         date: s.date,
@@ -320,36 +347,28 @@ export function modeFlows(
       });
   }
   for (const e of expenses) {
-    if (e.paymentMode !== mode) continue;
-    // Already moved directly onto that specific bank account's stored balance
-    // (see expenses.tsx) — counting it again here would double-subtract it
-    // from the Bank page / dashboard total, which add these flows on top of
-    // the stored balances. Mirrors the sales/purchase/payment guards above.
-    // A cash expense (no bankId) is NOT on any stored balance, so it stays.
-    if (e.bankId) continue;
-    list.push({
-      date: e.date,
-      type: "Expense",
-      ref: e.category,
-      in: 0,
-      out: e.amount,
-      source: { kind: "expense", id: e.id },
-    });
+    const out = unbankedPart(e, mode);
+    if (out > 0)
+      list.push({
+        date: e.date,
+        type: "Expense",
+        ref: e.category,
+        in: 0,
+        out,
+        source: { kind: "expense", id: e.id },
+      });
   }
   for (const p of payments) {
-    if (p.mode !== mode) continue;
-    // A payment tied to a specific bank account already moved money on that
-    // account's own `balance` field directly (see payments.tsx) — counting
-    // it again here would double its effect on the Bank page's total.
-    if (p.bankId) continue;
-    list.push({
-      date: p.date,
-      type: p.type === "in" ? "Payment In" : "Payment Out",
-      ref: p.partyName,
-      in: p.type === "in" ? p.amount : 0,
-      out: p.type === "out" ? p.amount : 0,
-      source: { kind: "payment", id: p.id },
-    });
+    const amount = unbankedPart(p, mode);
+    if (amount > 0)
+      list.push({
+        date: p.date,
+        type: p.type === "in" ? "Payment In" : "Payment Out",
+        ref: p.partyName,
+        in: p.type === "in" ? amount : 0,
+        out: p.type === "out" ? amount : 0,
+        source: { kind: "payment", id: p.id },
+      });
   }
   list.sort((a, b) => b.date.localeCompare(a.date));
   return list;
@@ -614,6 +633,62 @@ export interface PartyStatementRow {
   balance: number;
   docId?: string;
   docKind?: "sale" | "purchase" | "sale-return" | "purchase-return";
+  /**
+   * The record this row's money moved through, so a screen can say HOW —
+   * cash, which bank account, or a split across both.
+   *
+   * Display only: nothing is ever calculated from it, and every balance in
+   * this file is identical with or without it. It exists because a party
+   * ledger reading "Payment Received 5,000" and nothing else cannot answer
+   * the question asked of it a day later — whether that five thousand is in
+   * the drawer or in the bank.
+   *
+   * Carried as the record rather than a formatted string, because only the
+   * caller knows what its bank accounts are called.
+   */
+  settledBy?: Parameters<typeof splitsOf>[0];
+}
+
+/**
+ * What a statement row puts in its two money columns.
+ *
+ * The obvious rule — show which way the balance moved — is wrong, and the
+ * shop found it: a bill paid in full at the counter moves the balance by
+ * nothing at all, so a 7,500 sale with 7,500 handed over showed an empty
+ * row. The money was in the ledger and invisible on it.
+ *
+ * A bill has TWO movements on one line: goods out at their full value, and
+ * whatever came back over the counter. Both are shown. A payment, a return
+ * or a write-off has one, and shows one.
+ *
+ * Derived from the net movement rather than from the record's own settled
+ * figure, so the columns can never disagree with the balance beside them:
+ * gave − got equals the net for every row, which is asserted rather than
+ * hoped for. A return stores its settled amount equal to its total for
+ * bookkeeping reasons, and reading that directly would report a second
+ * movement that never happened.
+ */
+export interface LedgerColumns {
+  /** Value that left the shop: goods sold, or money paid out. */
+  gave: number;
+  /** Value that came back: money taken, or goods bought in. */
+  got: number;
+}
+
+export function ledgerColumns(row: PartyStatementRow, net: number): LedgerColumns {
+  const total = row.total || 0;
+
+  if (row.docKind === "sale") {
+    // Goods out at full value; the rest of the line is what was settled on
+    // the spot — total − net, by definition of how the balance moved.
+    return { gave: total, got: Math.max(0, r2(total - net)) };
+  }
+  if (row.docKind === "purchase") {
+    return { got: total, gave: Math.max(0, r2(total + net)) };
+  }
+
+  // One direction only.
+  return net >= 0 ? { gave: r2(net), got: 0 } : { gave: 0, got: r2(-net) };
 }
 
 /**
@@ -688,6 +763,10 @@ export function buildPartyStatement(
       charges,
       docId: s.id,
       docKind: "sale",
+      // Only when money changed hands on the day. An unpaid bill has no mode
+      // to report, and printing the highlighted pill would claim a payment
+      // that never happened.
+      settledBy: paid > 0.001 ? s : undefined,
     });
   }
   for (const ret of data.saleReturns.filter((x) => x.partyId === party.id)) {
@@ -721,6 +800,7 @@ export function buildPartyStatement(
       charges,
       docId: p.id,
       docKind: "purchase",
+      settledBy: paid > 0.001 ? p : undefined,
     });
   }
   for (const ret of data.purchaseReturns.filter((x) => x.partyId === party.id)) {
@@ -748,6 +828,7 @@ export function buildPartyStatement(
         total: pay.amount,
         receivedOrPaid: pay.amount,
         txnBalance: 0,
+        settledBy: pay,
       });
     }
     // A settlement discount closes a bill without the money ever arriving, so
@@ -825,6 +906,17 @@ export interface BankLedgerRow {
   balance: number;
   docId?: string;
   docKind?: "sale" | "purchase";
+  /**
+   * Set on the two legs of a cash/bank transfer, so the passbook can offer
+   * to correct one.
+   *
+   * A transfer is two records — money out of one account, into the other —
+   * and the only safe way to change it is as the single thing it is. Without
+   * this the passbook had no way of telling a transfer leg apart from an
+   * ordinary deposit, so it offered nothing at all and a mistyped transfer
+   * had to be deleted from the Cash page and re-entered from memory.
+   */
+  transferId?: string;
 }
 
 /**
@@ -849,52 +941,56 @@ export function buildBankLedger(
 ): { rows: BankLedgerRow[]; fullBalance: number; totalDebit: number; totalCredit: number } {
   const entries: Omit<BankLedgerRow, "balance">[] = [];
 
-  for (const s of data.sales.filter((x) => x.bankId === bank.id && (x.bankPaidAmount ?? 0) > 0)) {
+  /* Read through the split rows, not the document's single bankId.
+     A bill can now put part of its money in one account and part in the
+     drawer — or in a second account — and each account's ledger must show
+     its own share and nothing else. For a bill with no splits this is the
+     same figure bankPaidAmount always gave. */
+  for (const s of data.sales) {
+    const credit = bankParts(s).get(bank.id) ?? 0;
+    if (credit <= 0) continue;
     entries.push({
       date: s.date,
       created: s.createdAt,
       type: "Sale Receipt",
       ref: `${s.number} — ${s.partyName}`,
       debit: 0,
-      credit: s.bankPaidAmount!,
+      credit,
       docId: s.id,
       docKind: "sale",
     });
   }
-  for (const p of data.purchases.filter(
-    (x) => x.bankId === bank.id && (x.bankPaidAmount ?? 0) > 0,
-  )) {
+  for (const p of data.purchases) {
+    const debit = bankParts(p).get(bank.id) ?? 0;
+    if (debit <= 0) continue;
     entries.push({
       date: p.date,
       created: p.createdAt,
       type: "Purchase Payment",
       ref: `${p.number} — ${p.partyName}`,
-      debit: p.bankPaidAmount!,
+      debit,
       credit: 0,
       docId: p.id,
       docKind: "purchase",
     });
   }
-  for (const pay of data.payments.filter((x) => x.bankId === bank.id)) {
-    if (pay.type === "in") {
-      entries.push({
-        date: pay.date,
-        created: pay.createdAt,
-        type: "Payment Received",
-        ref: pay.partyName,
-        debit: 0,
-        credit: pay.amount,
-      });
-    } else {
-      entries.push({
-        date: pay.date,
-        created: pay.createdAt,
-        type: "Payment Made",
-        ref: pay.partyName,
-        debit: pay.amount,
-        credit: 0,
-      });
-    }
+  /* Through the rows, like the bills above. A part-cash receipt has no
+     top-level bankId, so filtering on that missed it entirely — and because
+     the shop's balance HAD already been moved by the save, this passbook
+     would have disagreed with the account it describes. bankRepair
+     re-derives balances from exactly these entries, so the next repair would
+     have "corrected" the balance downward and taken the money with it. */
+  for (const pay of data.payments) {
+    const amount = bankParts(pay).get(bank.id) ?? 0;
+    if (amount <= 0) continue;
+    entries.push({
+      date: pay.date,
+      created: pay.createdAt,
+      type: pay.type === "in" ? "Payment Received" : "Payment Made",
+      ref: pay.partyName,
+      debit: pay.type === "in" ? 0 : amount,
+      credit: pay.type === "in" ? amount : 0,
+    });
   }
   for (const t of data.bankTxns.filter((x) => x.bankId === bank.id)) {
     if (t.type === "deposit") {
@@ -905,6 +1001,7 @@ export function buildBankLedger(
         ref: t.notes || "—",
         debit: 0,
         credit: t.amount,
+        transferId: t.transferId,
       });
     } else if (t.type === "withdraw") {
       entries.push({
@@ -914,16 +1011,19 @@ export function buildBankLedger(
         ref: t.notes || "—",
         debit: t.amount,
         credit: 0,
+        transferId: t.transferId,
       });
     }
   }
-  for (const ex of (data.expenses ?? []).filter((x) => x.bankId === bank.id)) {
+  for (const ex of data.expenses ?? []) {
+    const amount = bankParts(ex).get(bank.id) ?? 0;
+    if (amount <= 0) continue;
     entries.push({
       date: ex.date,
       created: ex.createdAt,
       type: "Expense",
       ref: ex.category + (ex.notes ? ` — ${ex.notes}` : ""),
-      debit: ex.amount,
+      debit: amount,
       credit: 0,
     });
   }

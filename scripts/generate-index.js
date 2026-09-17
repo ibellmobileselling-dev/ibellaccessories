@@ -17,7 +17,7 @@ const html = `<!DOCTYPE html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>IBELL — Billing &amp; Inventory ERP</title>
+    <title>IBELL  — Billing &amp; Inventory ERP</title>
     <meta name="description" content="Keyboard-first desktop billing, inventory, and accounting software." />${cssTag}
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="icon" href="/favicon.ico" type="image/x-icon" sizes="48x48" />

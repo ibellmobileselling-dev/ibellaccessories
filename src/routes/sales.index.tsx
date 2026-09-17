@@ -26,10 +26,12 @@ import {
   SlidersHorizontal,
 } from "lucide-react";
 import { toast } from "sonner";
+import { bankParts, describePayment } from "@/lib/paymentSplit";
 import { PaginationBar } from "@/components/Pagination";
 import { usePagination } from "@/hooks/usePagination";
 import { usePeriodLock } from "@/hooks/usePeriodLock";
 import { DataTable } from "@/components/DataTable";
+import { InvoiceBulkExportDialog } from "@/components/InvoiceBulkExportDialog";
 import { fmtMode } from "@/lib/paymentMode";
 import { PageHeader } from "@/components/PageHeader";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -38,6 +40,10 @@ import { VoidDialog, VoidedBadge } from "@/components/VoidDialog";
 import { canDeleteOutright, isVoided, removalWord } from "@/lib/voiding";
 import { SerialRepo } from "@/repositories";
 import { undoSerialsOf } from "@/lib/serialMoves";
+
+/** An account's name for display. The word "Bank" three times over is
+ *  exactly what a split is meant to stop being ambiguous. */
+const bankName = (id: string) => BankRepo.get(id)?.name;
 
 export const Route = createFileRoute("/sales/")({ component: SalesPage });
 
@@ -65,14 +71,27 @@ function SalesPage() {
   const deleteAllowed = isOwner || canDelete("sales");
   const [rows, setRows] = useState<Invoice[]>([]);
   const [parties, setParties] = useState<{ id: string; name: string }[]>([]);
-  const [dateFrom, setDateFrom] = useState(() => filterCache?.dateFrom ?? monthStart());
-  const [dateTo, setDateTo] = useState(() => filterCache?.dateTo ?? today());
+  /* Opens on everything, not on this month.
+   *
+   * A list that silently hides last month's bills is a list that answers the
+   * wrong question: the shop looks for an invoice, does not find it, and has
+   * no reason to suspect a filter it never set. An empty range means no
+   * filter at all, and a date typed in is then a deliberate act.
+   *
+   * The saved filter still wins when there is one — a range somebody chose
+   * survives navigating away and back. */
+  const [dateFrom, setDateFrom] = useState(() => filterCache?.dateFrom ?? "");
+  const [dateTo, setDateTo] = useState(() => filterCache?.dateTo ?? "");
+  /** Bills ticked for a bulk download. Ids, not rows: the list re-derives on
+   *  every repo change and holding rows would keep stale copies alive. */
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [exportOpen, setExportOpen] = useState(false);
   const [partyId, setPartyId] = useState(() => filterCache?.partyId ?? "all");
   const [status, setStatus] = useState<Status>(() => filterCache?.status ?? "all");
   const [search, setSearch] = useState(() => filterCache?.search ?? "");
   const [showPartyDrop, setShowPartyDrop] = useState(false);
   const [partyDropQ, setPartyDropQ] = useState("");
-  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
+  const [filtersOpen, setFiltersOpen] = useState(false);
   // Cancelled bills are off the list by default. They never stop existing —
   // this only decides whether they are in the way.
   const [showVoided, setShowVoided] = useState(false);
@@ -118,6 +137,26 @@ function SalesPage() {
   // Local search over the dropdown only — must never overwrite `parties`
   // itself, or the master list (used for `selectedParty` lookup and "All
   // Customers") gets stuck as whatever subset was last typed/searched.
+  /* Selection is kept as ids and intersected with what is on screen, so a
+     bill filtered out of view is never silently included in a download the
+     shop believes matches what it can see. */
+  const selectedRows = useMemo(
+    () => filtered.filter((r) => selectedIds.has(r.id)),
+    [filtered, selectedIds],
+  );
+  const allFilteredSelected = filtered.length > 0 && selectedRows.length === filtered.length;
+  const toggleOne = (id: string) =>
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  const toggleAllFiltered = () =>
+    setSelectedIds((prev) =>
+      allFilteredSelected ? new Set() : new Set([...prev, ...filtered.map((r) => r.id)]),
+    );
+
   const filteredDropdownParties = useMemo(() => {
     const q = partyDropQ.trim().toLowerCase();
     return q ? parties.filter((p) => p.name.toLowerCase().includes(q)) : parties;
@@ -235,9 +274,11 @@ function SalesPage() {
       }
     }
     // Undo whatever this sale moved on a specific bank account at billing
-    // time, or that account's balance stays permanently wrong.
-    if (live.paymentMode === "bank" && live.bankId && (live.bankPaidAmount ?? 0) > 0) {
-      BankRepo.adjustFieldBatched(batch, live.bankId, "balance", -live.bankPaidAmount!);
+    // time, or that account's balance stays permanently wrong after delete.
+    // Every account it touched, not just one: a split sale can name two,
+    // and leaving either behind makes that balance permanently wrong.
+    for (const [bankId, amount] of bankParts(live)) {
+      BankRepo.adjustFieldBatched(batch, bankId, "balance", -amount);
     }
   };
 
@@ -272,7 +313,7 @@ function SalesPage() {
         iconClassName="text-success"
         mobileAction={
           <button
-            onClick={() => setMobileFiltersOpen(true)}
+            onClick={() => setFiltersOpen(true)}
             className="relative h-9 w-9 flex items-center justify-center rounded-lg border border-gray-200 bg-gray-50/60 text-gray-600"
             title="Filters"
           >
@@ -284,89 +325,20 @@ function SalesPage() {
         }
         actions={
           <>
-            {/* Date range — its own filter sheet on mobile (see Filters
-                button above); this inline row is desktop only, since it
-                doesn't fit next to Customer/Status/Search on a phone. */}
-            <div className="hidden sm:flex items-center gap-1.5 h-9 pl-3 pr-2.5 rounded-lg border border-gray-200 bg-gray-50/60">
-              <input
-                type="date"
-                value={dateFrom}
-                onChange={(e) => setDateFrom(e.target.value)}
-                className="bg-transparent text-xs text-gray-700 focus:outline-none w-[104px]"
-              />
-              <span className="text-gray-300 text-xs">–</span>
-              <input
-                type="date"
-                value={dateTo}
-                onChange={(e) => setDateTo(e.target.value)}
-                className="bg-transparent text-xs text-gray-700 focus:outline-none w-[104px]"
-              />
-            </div>
-
-            {/* Party filter — desktop only, see Filters sheet on mobile */}
-            <div className="hidden sm:block relative">
-              <button
-                onClick={() => setShowPartyDrop((v) => !v)}
-                className="flex items-center gap-2 h-9 border border-gray-200 rounded-lg text-xs px-3 text-gray-700 bg-gray-50/60 hover:bg-gray-100 transition min-w-[140px]"
-              >
-                <span className="flex-1 text-left truncate">
-                  {selectedParty ? selectedParty.name : "All Customers"}
-                </span>
-                <ChevronDown className="h-3.5 w-3.5 text-gray-400 flex-shrink-0" />
-              </button>
-              {showPartyDrop && (
-                <div className="absolute top-full right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg z-30 w-56 max-h-64 overflow-auto">
-                  <div className="p-2 border-b">
-                    <input
-                      autoFocus
-                      placeholder="Search customer..."
-                      value={partyDropQ}
-                      className="w-full text-xs px-2 py-1.5 border border-gray-200 rounded focus:outline-none"
-                      onChange={(e) => setPartyDropQ(e.target.value)}
-                    />
-                  </div>
-                  <button
-                    onClick={() => {
-                      setPartyId("all");
-                      setShowPartyDrop(false);
-                      setPartyDropQ("");
-                    }}
-                    className={`w-full text-left px-3 py-2 text-xs hover:bg-blue-50 ${partyId === "all" ? "text-blue-600 font-semibold bg-blue-50" : "text-gray-700"}`}
-                  >
-                    All Customers
-                  </button>
-                  {filteredDropdownParties.map((p) => (
-                    <button
-                      key={p.id}
-                      onClick={() => {
-                        setPartyId(p.id);
-                        setShowPartyDrop(false);
-                        setPartyDropQ("");
-                      }}
-                      className={`w-full text-left px-3 py-2 text-xs hover:bg-blue-50 truncate ${partyId === p.id ? "text-blue-600 font-semibold bg-blue-50" : "text-gray-700"}`}
-                    >
-                      {p.name}
-                    </button>
-                  ))}
-                  {filteredDropdownParties.length === 0 && (
-                    <p className="text-xs text-gray-400 text-center py-3">No customers found</p>
-                  )}
-                </div>
-              )}
-            </div>
-
-            {/* Status filter — desktop only, see Filters sheet on mobile */}
-            <div className="hidden sm:flex items-center gap-0.5 h-9 border border-gray-200 rounded-lg p-0.5 bg-gray-50/60">
-              {STATUSES.map((s) => (
-                <button
-                  key={s.value}
-                  onClick={() => setStatus(s.value)}
-                  className={`px-2.5 h-7 rounded-md text-xs transition outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${status === s.value ? "bg-primary text-primary-foreground font-semibold" : "text-gray-500 hover:bg-gray-100"}`}
-                >
-                  {s.label}
-                </button>
-              ))}
-            </div>
+            {/* One button, one panel. The date range, the party picker
+                and the status pills used to sit across this toolbar —
+                first thing to wrap on a laptop, and already duplicated
+                inside the filter dialog. They live in the dialog only
+                now, on every screen size. */}
+            <button
+              onClick={() => setFiltersOpen(true)}
+              className="hidden sm:flex relative items-center gap-1.5 h-9 px-3 rounded-lg border border-gray-200 bg-gray-50/60 text-[13px] text-gray-700 hover:bg-gray-100 transition"
+              title="Filters"
+            >
+              <SlidersHorizontal className="h-4 w-4 text-gray-500" />
+              Filters
+              {filtersActive && <span className="ml-0.5 h-2 w-2 rounded-full bg-primary" />}
+            </button>
 
             <button
               onClick={() => setShowVoided((v) => !v)}
@@ -391,15 +363,6 @@ function SalesPage() {
               />
             </div>
 
-            {filtersActive && (
-              <button
-                onClick={clearFilters}
-                className="hidden sm:flex text-xs text-gray-400 hover:text-gray-600 transition items-center gap-1"
-              >
-                <X className="h-3 w-3" /> Clear
-              </button>
-            )}
-
             {editAllowed && (
               <button
                 onClick={() => navigate({ to: "/sales/new" })}
@@ -415,7 +378,7 @@ function SalesPage() {
       {/* Mobile filter sheet — Date Range/Customer/Status don't fit inline
           next to Search on a phone, so they live here behind the header's
           Filters button instead, same state as the desktop inline controls. */}
-      <Dialog open={mobileFiltersOpen} onOpenChange={setMobileFiltersOpen}>
+      <Dialog open={filtersOpen} onOpenChange={setFiltersOpen}>
         <DialogContent className="max-w-sm">
           <DialogHeader>
             <DialogTitle>Filters</DialogTitle>
@@ -518,7 +481,7 @@ function SalesPage() {
                 <span />
               )}
               <button
-                onClick={() => setMobileFiltersOpen(false)}
+                onClick={() => setFiltersOpen(false)}
                 className="h-8 px-4 bg-primary text-primary-foreground rounded-md text-sm font-semibold hover:opacity-90 transition"
               >
                 Done
@@ -549,6 +512,23 @@ function SalesPage() {
                   onClick={() => navigate({ to: "/sales/$id", params: { id: r.id } })}
                   className="bg-white px-4 py-3 active:bg-gray-50 flex items-center gap-3"
                 >
+                  {/* Shown only once a selection is under way, so the card
+                      keeps its usual shape the rest of the time. The label
+                      pads the hit area out to a thumb. */}
+                  {selectedIds.size > 0 && (
+                    <label
+                      onClick={(e) => e.stopPropagation()}
+                      className="-m-1 shrink-0 cursor-pointer p-1"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedIds.has(r.id)}
+                        onChange={() => toggleOne(r.id)}
+                        className="accent-primary h-[18px] w-[18px] align-middle"
+                        aria-label={`Select ${r.number}`}
+                      />
+                    </label>
+                  )}
                   {/* Status-tinted icon: green=paid, amber=partial, red=unpaid */}
                   <div
                     className={`h-9 w-9 rounded-full flex items-center justify-center shrink-0 ${isPaid ? "bg-emerald-50 text-emerald-600" : isPartial ? "bg-amber-50 text-amber-600" : "bg-rose-50 text-rose-600"}`}
@@ -567,7 +547,7 @@ function SalesPage() {
                     <div className="flex items-center justify-between gap-2 mt-1">
                       <p className="text-[11px] text-gray-400 font-mono truncate">
                         <span className={isVoided(r) ? "line-through" : ""}>{r.number}</span> ·{" "}
-                        {fmtDate(r.date)} · {fmtMode(r.paymentMode)}
+                        {fmtDate(r.date)} · {describePayment(r, bankName)}
                         {isVoided(r) && (
                           <>
                             {" "}
@@ -625,12 +605,67 @@ function SalesPage() {
         )}
       </div>
 
+      {/* Only present once something is selected — an always-visible bar
+          would be a permanent strip of nothing on the commonest screen. */}
+      {selectedRows.length > 0 && (
+        <div className="mx-6 mb-0 mt-2 flex flex-wrap items-center gap-3 rounded-lg border border-primary/30 bg-primary-soft px-4 py-2.5 no-print">
+          <label className="flex cursor-pointer select-none items-center gap-2 text-xs font-medium text-primary">
+            <input
+              type="checkbox"
+              checked={allFilteredSelected}
+              onChange={toggleAllFiltered}
+              className="accent-primary h-[18px] w-[18px] cursor-pointer"
+            />
+            Select all {filtered.length}
+          </label>
+          <span className="text-xs text-muted-foreground">{selectedRows.length} selected</span>
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              onClick={() => setSelectedIds(new Set())}
+              className="text-xs text-muted-foreground hover:text-foreground"
+            >
+              Clear
+            </button>
+            <button
+              onClick={() => setExportOpen(true)}
+              className="h-8 rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground shadow-sm transition hover:bg-primary/90"
+            >
+              Download {selectedRows.length}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <InvoiceBulkExportDialog
+        open={exportOpen}
+        onOpenChange={setExportOpen}
+        invoices={selectedRows}
+        mode="sale"
+      />
+
       {/* Table (desktop) */}
       <div className="hidden md:flex flex-1 min-h-0 p-6">
         <DataTable
           storageKey="sales"
           activateOnClick
           columns={[
+            {
+              key: "_sel",
+              label: "",
+              width: "44px",
+              sortValue: () => "",
+              render: (r) => (
+                <input
+                  type="checkbox"
+                  checked={selectedIds.has(r.id)}
+                  onChange={() => toggleOne(r.id)}
+                  // The row opens the bill on click; ticking must not.
+                  onClick={(e) => e.stopPropagation()}
+                  className="accent-primary h-[18px] w-[18px] cursor-pointer align-middle"
+                  aria-label={`Select ${r.number}`}
+                />
+              ),
+            },
             {
               key: "number",
               label: "Invoice #",
@@ -704,7 +739,7 @@ function SalesPage() {
             {
               key: "mode",
               label: "Mode",
-              render: (r) => fmtMode(r.paymentMode),
+              render: (r) => describePayment(r, bankName),
             },
             {
               key: "action",

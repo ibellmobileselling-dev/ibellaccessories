@@ -14,6 +14,15 @@ const r2 = (n: number) => Math.round(n * 100) / 100;
  * Kept here rather than inline in InvoiceForm so the save path, the repair
  * planner below and the audit harness can never drift apart. */
 export function correctBankPaidAmount(inv: Invoice, payments: Payment[]): number | undefined {
+  /* A document that carries split rows has nothing to repair here: the rows
+     ARE its attribution, they are already net of anything that arrived
+     later, and the balance re-derivation below reads them through
+     buildBankLedger. Rewriting the legacy snapshot from `paid` would invent
+     a second, contradictory answer for the same money.
+     Currently unreachable — a split bill's paymentMode is not "bank" — and
+     stated anyway, because relying on that is relying on a detail of how the
+     form happens to fill a field. */
+  if (inv.paidSplits?.length) return undefined;
   if (inv.paymentMode !== "bank" || !inv.bankId) return undefined;
   const viaPayments = paidViaPayments(payments).get(inv.id) ?? 0;
   return Math.max(0, r2((inv.paid || 0) - viaPayments));

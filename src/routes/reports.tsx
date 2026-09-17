@@ -12,9 +12,11 @@ import {
   PaymentRepo,
   CompanyRepo,
   SerialRepo,
+  BankRepo,
 } from "@/repositories";
 import { matchesQuery } from "@/lib/search";
 import { fmtMoney, fmtDate, today, ymd } from "@/lib/format";
+import { describePayment } from "@/lib/paymentSplit";
 import { printOrEscapeStandalone } from "@/lib/print";
 import { useAutoPrintFromUrl } from "@/hooks/useAutoPrintFromUrl";
 import { useRepoData, useRepoMemo } from "@/hooks/useRepoData";
@@ -61,6 +63,10 @@ import {
   ShieldCheck,
   Landmark,
 } from "lucide-react";
+
+/** An account's name for display. The word "Bank" three times over is
+ *  exactly what a split is meant to stop being ambiguous. */
+const bankName = (id: string) => BankRepo.get(id)?.name;
 
 export const Route = createFileRoute("/reports")({
   component: ReportsPage,
@@ -132,8 +138,17 @@ function ReportsPage() {
   const [active, setActive] = useState(() =>
     REPORTS.some((x) => x.key === r) ? (r as string) : (activeReportCache ?? "pl"),
   );
-  const [dateFrom, setDateFrom] = useState(() => dateCache?.dateFrom ?? monthStart());
-  const [dateTo, setDateTo] = useState(() => dateCache?.dateTo ?? today());
+  /* Opens on everything, not on this month.
+   *
+   * A list that silently hides last month's bills is a list that answers the
+   * wrong question: the shop looks for an invoice, does not find it, and has
+   * no reason to suspect a filter it never set. An empty range means no
+   * filter at all, and a date typed in is then a deliberate act.
+   *
+   * The saved filter still wins when there is one — a range somebody chose
+   * survives navigating away and back. */
+  const [dateFrom, setDateFrom] = useState(() => dateCache?.dateFrom ?? "");
+  const [dateTo, setDateTo] = useState(() => dateCache?.dateTo ?? "");
   const [pdfBusy, setPdfBusy] = useState<"download" | "share" | null>(null);
   // Mobile-only: the report list and the report content don't fit side by
   // side on a phone the way they do on desktop's two-pane layout, so mobile
@@ -545,7 +560,7 @@ function ReportView({
               s.number,
               fmtDate(s.date),
               s.partyName,
-              fmtMode(s.paymentMode),
+              describePayment(s, bankName),
               fmtMoney(s.total),
               fmtMoney(s.paid),
               fmtMoney(bal),
@@ -577,7 +592,7 @@ function ReportView({
               s.number,
               fmtDate(s.date),
               s.partyName,
-              fmtMode(s.paymentMode),
+              describePayment(s, bankName),
               fmtMoney(s.total),
               fmtMoney(s.paid),
               fmtMoney(bal),
@@ -648,7 +663,7 @@ function ReportView({
             fmtDate(p.date),
             p.type === "in" ? "In" : "Out",
             p.partyName,
-            fmtMode(p.mode),
+            describePayment(p, bankName),
             p.ref || "—",
             `${p.type === "in" ? "+" : "−"}${fmtMoney(p.amount)}`,
           ])}
@@ -894,19 +909,15 @@ function ReportView({
                   <thead>
                     <tr className="bg-gray-50/60">
                       {[
-                        "Date",
-                        "Txn Type",
-                        "Ref No.",
-                        "Payment Status",
-                        "Total",
-                        "Received/Paid",
-                        "Txn Balance",
-                        "Receivable Balance",
-                        "Payable Balance",
-                      ].map((h, i) => (
+                        ["Date", "left"],
+                        ["Particulars", "left"],
+                        ["You Gave (₹)", "right"],
+                        ["You Got (₹)", "right"],
+                        ["Balance (₹)", "right"],
+                      ].map(([h, align]) => (
                         <th
                           key={h}
-                          className={`px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-gray-500 border-b border-gray-100 whitespace-nowrap ${i >= 4 ? "text-right" : "text-left"}`}
+                          className={`px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-gray-500 border-b border-gray-100 whitespace-nowrap ${align === "right" ? "text-right" : "text-left"}`}
                         >
                           {h}
                         </th>
@@ -915,19 +926,28 @@ function ReportView({
                   </thead>
                   <tbody>
                     {ledger.rows.map((r, i) => (
-                      <PartyStatementRowBlock key={i} row={r} onOpen={() => openRow(r)} />
+                      <PartyStatementRowBlock
+                        key={i}
+                        row={r}
+                        prev={i === 0 ? undefined : ledger.rows[i - 1]}
+                        onOpen={() => openRow(r)}
+                      />
                     ))}
                   </tbody>
                   <tfoot>
                     <tr className="bg-gray-50 border-t-2 border-gray-200 font-bold">
-                      <td colSpan={7} className="px-3 py-2.5 text-[10px] uppercase text-gray-500">
+                      <td colSpan={4} className="px-3 py-2.5 text-[10px] uppercase text-gray-500">
                         Closing Balance
                       </td>
-                      <td className="px-3 py-2.5 text-right tabular-nums text-rose-600">
-                        {closing > 0 ? fmtMoney(closing) : "—"}
-                      </td>
-                      <td className="px-3 py-2.5 text-right tabular-nums text-amber-600">
-                        {closing < 0 ? fmtMoney(-closing) : "—"}
+                      <td className="px-3 py-2.5 text-right">
+                        <div className="tabular-nums text-gray-800">
+                          {fmtMoney(Math.abs(closing))}
+                        </div>
+                        <div
+                          className={`text-[10px] font-normal ${closing > 0 ? "text-rose-500" : closing < 0 ? "text-amber-600" : "text-gray-400"}`}
+                        >
+                          {closing > 0 ? "they owe you" : closing < 0 ? "you owe them" : "settled"}
+                        </div>
                       </td>
                     </tr>
                   </tfoot>

@@ -414,3 +414,42 @@ input[type="number"] {
   -moz-appearance: textfield;
   appearance: textfield;
 }
+
+/* Room to breathe when the keyboard scrolls something into view.
+ *
+ * `scrollIntoView({block:"nearest"})` stops the moment an element is
+ * technically visible, which on these pages means flush against the sticky
+ * footer that carries Save — visible, and unreadable. A scroll margin makes
+ * "nearest" leave a gap instead, so the field it just reached is clear of
+ * the bar underneath it. */
+input,
+select,
+textarea,
+button,
+[role="radio"],
+[role="combobox"] {
+  scroll-margin-block: 5rem;
+}
+
+/* A bill does not zoom out from under the person writing it.
+ *
+ * iOS Safari zooms the whole page the instant a text box smaller than 16px
+ * is focused, and it does not zoom back out. On this form — where the next
+ * thing you do is always tap another box — that means the page jumps, the
+ * layout you were reading slides off to one side, and every subsequent tap
+ * lands somewhere other than where it looked. It was photographed at the
+ * counter and reported as "nothing proper in mobile".
+ *
+ * 16px is the exact threshold, so this is the whole fix. Scoped to the bill
+ * form, and only at phone widths, because on a desk the compact type is
+ * doing real work: the item table fits nine columns at 13px and would not
+ * at 16.
+ *
+ * Checkboxes and radios have no text to zoom toward and keep their size. */
+@media (max-width: 767px) {
+  [data-bill-form] input:not([type="checkbox"]):not([type="radio"]),
+  [data-bill-form] select,
+  [data-bill-form] textarea {
+    font-size: 16px;
+  }
+}

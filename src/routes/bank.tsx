@@ -33,6 +33,7 @@ import {
 } from "lucide-react";
 import { CashBankTransferDialog } from "@/components/CashBankTransferDialog";
 import { toast } from "sonner";
+import { bankParts } from "@/lib/paymentSplit";
 import { usePermissions } from "@/hooks/usePermissions";
 
 export const Route = createFileRoute("/bank")({ component: BankPage });
@@ -257,16 +258,24 @@ function BankPage() {
             // skipped from cash AND bank totals), its passbook 404s, and the
             // cash adjustments its past deposits created are left dangling.
             // Block until nothing references it.
+            /* Through bankParts, not the bankId field: a document settled
+               part cash and part bank names its account ONLY in its split
+               rows, so a plain field check would call this account unused
+               and let it be deleted out from under money that is really
+               there. Transfers carry no splits and are checked directly. */
+            const namesThis = (doc: Parameters<typeof bankParts>[0]) =>
+              (bankParts(doc).get(r.id) ?? 0) > 0;
             const used =
               // allWithVoided: a cancelled document still references this
               // account, and the ledger still posts its reversal against it.
               // Deleting the account would drop it out of the chart and leave
-              // those postings pointing at nothing.
+              // those postings pointing at nothing. namesThis: a split payment
+              // names the account inside its rows, not in a bankId field.
               BankTxnRepo.allWithVoided().some((t) => t.bankId === r.id) ||
-              PaymentRepo.allWithVoided().some((p) => p.bankId === r.id) ||
-              ExpenseRepo.allWithVoided().some((e) => e.bankId === r.id) ||
-              SalesRepo.allWithVoided().some((i) => i.bankId === r.id) ||
-              PurchaseRepo.allWithVoided().some((i) => i.bankId === r.id);
+              PaymentRepo.allWithVoided().some(namesThis) ||
+              ExpenseRepo.allWithVoided().some(namesThis) ||
+              SalesRepo.allWithVoided().some(namesThis) ||
+              PurchaseRepo.allWithVoided().some(namesThis);
             if (used) {
               toast.error(
                 `Can't delete "${r.name}" — it has transactions, payments or bills linked to it. Reassign or remove those first.`,

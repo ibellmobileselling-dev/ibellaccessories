@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown } from "lucide-react";
+import { useHighlightScroll } from "@/hooks/useHighlightScroll";
 
 /**
  * A small dropdown that belongs to this app rather than to Windows.
@@ -33,6 +34,9 @@ export function SelectMenu<T extends string | number>({
 }) {
   const [open, setOpen] = useState(false);
   const [idx, setIdx] = useState(0);
+  /** Arrowing past the bottom edge used to move the highlight invisibly. */
+  const listRef = useRef<HTMLDivElement>(null);
+  useHighlightScroll(listRef, idx, open);
   const [dropUp, setDropUp] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
@@ -115,6 +119,7 @@ export function SelectMenu<T extends string | number>({
         <div
           role="listbox"
           aria-label={ariaLabel}
+          ref={listRef}
           className={`absolute z-40 min-w-full border rounded-md bg-popover shadow-elevated max-h-60 overflow-auto py-1 ${
             dropUp ? "bottom-full mb-1" : "top-full mt-1"
           } ${align === "right" ? "right-0" : "left-0"}`}
@@ -122,6 +127,7 @@ export function SelectMenu<T extends string | number>({
           {options.map((o, i) => (
             <div
               key={String(o.value)}
+              data-opt={i}
               role="option"
               aria-selected={o.value === value}
               onMouseEnter={() => setIdx(i)}

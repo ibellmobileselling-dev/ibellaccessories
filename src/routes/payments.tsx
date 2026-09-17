@@ -12,7 +12,15 @@ import {
 } from "@/repositories";
 import { useRepoData } from "@/hooks/useRepoData";
 import { newBatch, commitBatch } from "@/repositories/base";
-import type { Payment, PaymentAllocation, PaymentMode, Invoice, BankAccount, Party } from "@/types";
+import type {
+  Payment,
+  PaymentAllocation,
+  PaymentMode,
+  Invoice,
+  BankAccount,
+  Party,
+  PaymentSplit,
+} from "@/types";
 import { fmtMoney, fmtDate, today, fmtDateShort } from "@/lib/format";
 import { netPartyPositions, spreadFifo } from "@/lib/ledger";
 import {
@@ -40,6 +48,9 @@ import {
 } from "@/lib/voiding";
 import { Ban } from "lucide-react";
 import { toast } from "sonner";
+import { useHighlightScroll } from "@/hooks/useHighlightScroll";
+import { bankParts, splitProblems, largestSplitMode, describePayment } from "@/lib/paymentSplit";
+import { SplitPaymentRows } from "@/components/SplitPaymentRows";
 import { genId } from "@/repositories/base";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -50,6 +61,10 @@ import { NumInput } from "@/components/NumInput";
 import { ModePills } from "@/components/ModePills";
 import { fmtMode } from "@/lib/paymentMode";
 import { PageHeader } from "@/components/PageHeader";
+
+/** An account's name for display. The word "Bank" three times over is
+ *  exactly what a split is meant to stop being ambiguous. */
+const bankName = (id: string) => BankRepo.get(id)?.name;
 
 export const Route = createFileRoute("/payments")({ component: PaymentsPage });
 
@@ -207,13 +222,15 @@ function PaymentsPage() {
     } else if (live.ref) {
       reverseLegacyRefApplication(batch, repo, live.ref, live.amount);
     }
-    if (live.mode === "bank" && live.bankId && BankRepo.get(live.bankId)) {
-      BankRepo.adjustFieldBatched(
-        batch,
-        live.bankId,
-        "balance",
-        live.type === "in" ? -live.amount : live.amount,
-      );
+    // Money that was moved onto a specific bank account when this payment
+    // was recorded must be moved back off it, or the account balance stays
+    // permanently wrong after the payment is deleted.
+    // Every account, not just one: a receipt can be part cash and part bank,
+    // or land in two accounts, and leaving either behind makes that balance
+    // permanently wrong.
+    for (const [bankId, amount] of bankParts(live)) {
+      if (!BankRepo.get(bankId)) continue;
+      BankRepo.adjustFieldBatched(batch, bankId, "balance", live.type === "in" ? -amount : amount);
     }
   };
 
@@ -256,24 +273,32 @@ function PaymentsPage() {
     },
     {
       key: "linked",
-      label: "Linked Invoice / Bill",
-      render: (r) => (
-        <span className="font-mono text-xs">
-          {r.allocations?.length ? (
-            r.allocations.map((a) => a.number).join(", ")
-          ) : r.ref && r.ref.match(/^(INV|PUR)-/) ? (
-            r.ref
-          ) : (
-            <span className="text-gray-400">—</span>
-          )}
-        </span>
-      ),
+      label: "Settled Against",
+      width: "170px",
+      render: (r) => {
+        const numbers = r.allocations?.length
+          ? r.allocations.map((a) => a.number)
+          : r.ref && r.ref.match(/^(INV|PUR)-/)
+            ? [r.ref]
+            : [];
+        if (!numbers.length) return <span className="text-gray-400">—</span>;
+        const shown = numbers.slice(0, 2).join(", ");
+        const rest = numbers.length - 2;
+        return (
+          <span className="font-mono text-xs whitespace-nowrap" title={numbers.join(", ")}>
+            {shown}
+            {rest > 0 && <span className="ml-1 font-sans text-gray-500">+{rest} more</span>}
+          </span>
+        );
+      },
     },
     {
       key: "mode",
-      label: "Mode",
-      width: "90px",
-      render: (r) => <span className="text-gray-600">{fmtMode(r.mode)}</span>,
+      label: "Received In / Paid From",
+      width: "150px",
+      render: (r) => (
+        <span className="text-gray-700 whitespace-nowrap">{describePayment(r, bankName)}</span>
+      ),
     },
     {
       key: "ref",
@@ -517,7 +542,8 @@ function PaymentsPage() {
                     </div>
                     <div className="flex items-center justify-between gap-2 mt-1">
                       <p className="text-[11px] text-gray-400 truncate">
-                        {fmtDate(r.date)} · {isIn ? "Received" : "Paid Out"} · {fmtMode(r.mode)}
+                        {fmtDate(r.date)} · {isIn ? "Received" : "Paid Out"} ·{" "}
+                        {describePayment(r, bankName)}
                       </p>
                       {refText && (
                         <span className="font-mono text-[11px] text-gray-400 truncate shrink-0 max-w-[38%]">
@@ -635,18 +661,26 @@ interface ApplyRow {
   checked: boolean;
 }
 
-function ReceivePaymentDialog({
+export function ReceivePaymentDialog({
   open,
   onOpenChange,
   type,
   editing,
   onSaved,
+  presetParty,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   type: "in" | "out";
   editing: Payment | null;
   onSaved: () => void;
+  /**
+   * Opened from a party's own page, where who this is about is already
+   * settled. Pre-filling saves retyping a name the screen is already showing
+   * and — more to the point — stops a near-miss spelling creating a second
+   * party record for somebody who already exists.
+   */
+  presetParty?: { id: string; name: string } | null;
 }) {
   const isIn = type === "in";
   const partyRef = useRef<HTMLInputElement>(null);
@@ -659,15 +693,34 @@ function ReceivePaymentDialog({
   const [partyQ, setPartyQ] = useState("");
   const [partyOpen, setPartyOpen] = useState(false);
   const [partyIdx, setPartyIdx] = useState(0);
+  /** Arrowing past the bottom edge used to move the highlight invisibly. */
+  const partyListRef = useRef<HTMLDivElement>(null);
+  useHighlightScroll(partyListRef, partyIdx, partyOpen);
   const [selectedParty, setSelectedParty] = useState<{ id: string; name: string } | null>(null);
 
   const [date, setDate] = useState(today());
   const [mode, setMode] = useState<PaymentMode>("cash");
+  /**
+   * Whether a person has actually picked the mode, as opposed to it holding
+   * the value it was initialised with.
+   *
+   * `mode` cannot simply start undefined — everything downstream is typed on
+   * a real PaymentMode — so the fact of having chosen is tracked separately.
+   * Without it a receipt taken in the bank saves as cash whenever nobody
+   * noticed the pre-lit pill, which is money in the wrong place and no
+   * record of anyone having decided anything.
+   */
+  const [modeChosen, setModeChosen] = useState(false);
+  /** Rows, once the money came in more than one way. null is the ordinary
+   *  single-mode receipt, which is most of them. */
+  const [splitRows, setSplitRows] = useState<PaymentSplit[] | null>(null);
   const [banks, setBanks] = useState<BankAccount[]>([]);
   const [bankId, setBankId] = useState("");
   const [bankQ, setBankQ] = useState("");
   const [bankOpen, setBankOpen] = useState(false);
   const [bankIdx, setBankIdx] = useState(0);
+  const bankListRef = useRef<HTMLDivElement>(null);
+  useHighlightScroll(bankListRef, bankIdx, bankOpen);
   const [applyRows, setApplyRows] = useState<ApplyRow[]>([]);
   const [manualAmount, setManualAmount] = useState(0);
   const [saving, setSaving] = useState(false);
@@ -720,30 +773,52 @@ function ReceivePaymentDialog({
         setSelectedParty({ id: editing.partyId, name: editing.partyName });
         setDate(editing.date);
         setMode(editing.mode);
+        // An existing receipt HAS a chosen mode — that is what it recorded.
+        setModeChosen(true);
         setBankId(editing.bankId ?? "");
+        /* Reopening a split receipt must show it as the split it is. Without
+           this it opened as single-mode and SAVING destroyed the split:
+           the rows were reversed off their accounts and the whole amount
+           re-attributed to one mode. The money did not vanish, which is
+           worse — it moved somewhere nobody asked it to go. */
+        setSplitRows(editing.splits?.length ? editing.splits : null);
         setBankQ(BankRepo.all().find((b) => b.id === editing.bankId)?.name ?? "");
         setManualAmount(editing.allocations?.length ? 0 : editing.amount);
         setAllocMode("manual");
         setPayAmount(editing.amount);
         setPayDiscount(r2((editing.allocations ?? []).reduce((s, a) => s + (a.discount ?? 0), 0)));
       } else {
-        setPartyQ("");
-        setSelectedParty(null);
+        setPartyQ(presetParty?.name ?? "");
+        setSelectedParty(presetParty ?? null);
         setDate(today());
         setMode("cash");
+        setModeChosen(false);
         setBankId("");
         setBankQ("");
         setManualAmount(0);
         setAllocMode("auto");
         setPayAmount(0);
         setPayDiscount(0);
-        setTimeout(() => partyRef.current?.focus(), 60);
+        /* With the party already known there is nothing to type there, and
+           landing on a pre-filled search box invites the first keystroke to
+           reopen the dropdown over an answer that was already right. Start on
+           the first thing still being asked. Found by accessible name rather
+           than a ref, because the amount is a NumInput and threading a ref
+           through it is more moving parts than this is worth. */
+        setTimeout(() => {
+          const amount = presetParty
+            ? document.querySelector<HTMLInputElement>(
+                `input[aria-label="${isIn ? "Amount received" : "Amount paid"}"]`,
+              )
+            : null;
+          (amount ?? partyRef.current)?.focus();
+        }, 60);
       }
       setApplyRows([]);
       setSaving(false);
       savingRef.current = false;
     }
-  }, [open, editing]);
+  }, [open, editing, presetParty, isIn]);
 
   // Load invoices/bills when party selected. When editing, this payment's own
   // allocations are added back to each invoice's due and pre-selected.
@@ -953,9 +1028,29 @@ function ReceivePaymentDialog({
       toast.error("Enter or select an amount to pay");
       return;
     }
-    if (mode === "bank" && !bankId) {
+    /* Nothing is pre-selected, so nothing may be assumed. A receipt that
+       records cash because nobody looked at the pills is money filed in the
+       wrong place, and the ledger has no way of knowing it was never a
+       decision. A split says where every rupee went by construction, so it
+       needs no separate answer here. */
+    if (!splitRows && !modeChosen) {
+      toast.error("Choose how the money moved — Cash or Bank");
+      return;
+    }
+    if (!splitRows && mode === "bank" && !bankId) {
       toast.error("Select which bank account this goes to");
       return;
+    }
+    /* A receipt that does not add up is not a receipt. Refused rather than
+       corrected: only the person taking the money knows which figure is
+       right. Checked against the amount actually being recorded, which is
+       what the rows are shown against too. */
+    if (splitRows) {
+      const problems = splitProblems(splitRows, r2(amount));
+      if (problems.length) {
+        toast.error(problems[0].message, { duration: 8000 });
+        return;
+      }
     }
     savingRef.current = true;
     setSaving(true);
@@ -1014,13 +1109,11 @@ function ReceivePaymentDialog({
       // Editing: reverse the old bank-account effect too, before applying
       // the new one below — handles both "same account, new amount" and
       // "switched to a different account" correctly.
-      if (editing?.mode === "bank" && editing.bankId && BankRepo.get(editing.bankId)) {
-        BankRepo.adjustFieldBatched(
-          batch,
-          editing.bankId,
-          "balance",
-          editing.type === "in" ? -editing.amount : editing.amount,
-        );
+      if (editing) {
+        for (const [id, amt] of bankParts(editing)) {
+          if (!BankRepo.get(id)) continue;
+          BankRepo.adjustFieldBatched(batch, id, "balance", editing.type === "in" ? -amt : amt);
+        }
       }
 
       // Apply to invoices — atomic increments so simultaneous cashiers both count.
@@ -1060,9 +1153,17 @@ function ReceivePaymentDialog({
         );
       }
 
-      // Move money on the selected bank account for this (new) payment.
-      if (mode === "bank" && bankId) {
-        BankRepo.adjustFieldBatched(batch, bankId, "balance", isIn ? amount : -amount);
+      /* Move money on every account this payment names. Read through the
+         same accessor the readers use, so a single-mode receipt produces
+         exactly the one adjustment it always did. */
+      const attribution = {
+        amount: r2(amount),
+        mode,
+        bankId: mode === "bank" ? bankId : undefined,
+        splits: splitRows?.length ? splitRows : undefined,
+      };
+      for (const [id, amt] of bankParts(attribution)) {
+        BankRepo.adjustFieldBatched(batch, id, "balance", isIn ? amt : -amt);
       }
 
       // Record payment
@@ -1073,8 +1174,11 @@ function ReceivePaymentDialog({
           partyName,
           type,
           amount: r2(amount),
-          mode,
-          bankId: mode === "bank" ? bankId : undefined,
+          // For a split receipt the rows are the attribution and the legacy
+          // pair is left empty, so there is one answer for where it went.
+          mode: splitRows?.length ? largestSplitMode(splitRows) : mode,
+          bankId: splitRows?.length ? undefined : mode === "bank" ? bankId : undefined,
+          splits: splitRows?.length ? splitRows : undefined,
           allocations: allocations.length ? allocations : undefined,
           // Clear any legacy `ref` — its application was just reversed above,
           // so leaving it would double-count on the NEXT edit/delete and show
@@ -1089,8 +1193,9 @@ function ReceivePaymentDialog({
           partyName,
           type,
           amount: r2(amount),
-          mode,
-          bankId: mode === "bank" ? bankId : undefined,
+          mode: splitRows?.length ? largestSplitMode(splitRows) : mode,
+          bankId: splitRows?.length ? undefined : mode === "bank" ? bankId : undefined,
+          splits: splitRows?.length ? splitRows : undefined,
           allocations: allocations.length ? allocations : undefined,
           createdAt: new Date().toISOString(),
         };
@@ -1174,10 +1279,14 @@ function ReceivePaymentDialog({
               />
             </label>
             {partyOpen && suggests.length > 0 && (
-              <div className="absolute z-30 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-lg max-h-40 overflow-auto">
+              <div
+                ref={partyListRef}
+                className="absolute z-30 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-lg max-h-40 overflow-auto"
+              >
                 {suggests.map((p, i) => (
                   <div
                     key={p.id}
+                    data-opt={i}
                     onMouseDown={(e) => {
                       e.preventDefault();
                       selectParty(p);
@@ -1542,9 +1651,10 @@ function ReceivePaymentDialog({
               <label className="font-semibold text-gray-600">Payment Mode</label>
               <div className="flex items-center h-8">
                 <ModePills
-                  value={mode}
+                  value={modeChosen ? mode : undefined}
                   onChange={(m) => {
                     setMode(m);
+                    setModeChosen(true);
                     if (m !== "bank") {
                       setBankId("");
                       setBankQ("");
@@ -1556,7 +1666,43 @@ function ReceivePaymentDialog({
             </div>
           </div>
 
-          {mode === "bank" && (
+          {/* Offered only when there is money to divide. */}
+          {payAmount > 0 && !splitRows && (
+            <button
+              type="button"
+              onClick={() =>
+                setSplitRows([
+                  { mode, amount: r2(payAmount), bankId: mode === "bank" ? bankId : undefined },
+                ])
+              }
+              className="self-start text-[11px] font-medium text-primary hover:underline"
+            >
+              Split across cash and bank
+            </button>
+          )}
+          {splitRows && (
+            <div className="flex flex-col gap-1 text-[12px]">
+              <div className="flex items-center justify-between gap-2">
+                <label className="font-semibold text-gray-600">How it was paid</label>
+                <button
+                  type="button"
+                  onClick={() => setSplitRows(null)}
+                  className="text-[11px] text-gray-500 hover:underline"
+                >
+                  Back to one payment
+                </button>
+              </div>
+              <SplitPaymentRows
+                rows={splitRows}
+                onChange={setSplitRows}
+                total={r2(payAmount)}
+                banks={banks}
+                label={isIn ? "Amount received" : "Amount paid"}
+              />
+            </div>
+          )}
+
+          {!splitRows && mode === "bank" && (
             <div className="relative flex flex-col gap-1 text-[12px]">
               <label className="font-semibold text-gray-600">Bank Account *</label>
               <input
@@ -1587,10 +1733,14 @@ function ReceivePaymentDialog({
                 className="h-9 px-2 border rounded-md bg-white focus:border-primary outline-none text-sm"
               />
               {bankOpen && bankSuggests.length > 0 && (
-                <div className="absolute z-20 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-lg max-h-40 overflow-auto">
+                <div
+                  ref={bankListRef}
+                  className="absolute z-20 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-lg max-h-40 overflow-auto"
+                >
                   {bankSuggests.map((b, i) => (
                     <div
                       key={b.id}
+                      data-opt={i}
                       onMouseDown={(e) => {
                         e.preventDefault();
                         selectBank(b);

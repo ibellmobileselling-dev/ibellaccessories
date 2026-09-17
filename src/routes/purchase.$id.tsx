@@ -1,9 +1,10 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useGoBack } from "@/hooks/useGoBack";
 import { useEffect, useRef, useState } from "react";
-import { PurchaseRepo, CompanyRepo } from "@/repositories";
+import { PurchaseRepo, CompanyRepo, BankRepo } from "@/repositories";
 import type { Invoice, Company } from "@/types";
 import { fmtMoney } from "@/lib/format";
+import { describePayment } from "@/lib/paymentSplit";
 import { printWithName, printOrEscapeStandalone, isStandalone } from "@/lib/print";
 import { downloadElementAsPdf } from "@/lib/pdf";
 import { useShareablePdf } from "@/hooks/useShareablePdf";
@@ -24,6 +25,10 @@ import {
   Share2,
   Loader2,
 } from "lucide-react";
+
+/** An account's name for display. The word "Bank" three times over is
+ *  exactly what a split is meant to stop being ambiguous. */
+const bankName = (id: string) => BankRepo.get(id)?.name;
 
 export const Route = createFileRoute("/purchase/$id")({
   component: BillDetailPage,
@@ -149,7 +154,7 @@ function BillDetailPage() {
               )}
             </h1>
             <p className="text-[12px] text-gray-400 truncate">
-              {inv.partyName} · {fmtMoney(inv.total)} · {fmtMode(inv.paymentMode)}
+              {inv.partyName} · {fmtMoney(inv.total)} · {describePayment(inv, bankName)}
             </p>
           </div>
         </div>

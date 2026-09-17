@@ -41,7 +41,10 @@ function collectAppStylesheets(): string {
 /** The exported markup carries no `<script>` tags, only the printable
  * subtree's HTML plus the app's own compiled CSS, so the server just prints
  * a static page — it never boots the SPA or touches Firestore. */
-function buildPrintableHtml(el: HTMLElement, includeAppCss = true): string {
+/** Exported because the WhatsApp outbox stores this string, not the rendered
+ *  PDF: it is a fraction of the size, and a queued bill has to be re-rendered
+ *  at send time anyway. */
+export function buildPrintableHtml(el: HTMLElement, includeAppCss = true): string {
   // The app's compiled stylesheet is ~108 KB and gets uploaded with EVERY
   // render request. Markup that styles itself entirely inline (the party
   // statement built for the bulk ledger export) needs none of it, so
@@ -190,7 +193,15 @@ const PDF_BATCH_SIZE = 10;
  * instead of a spinner that sits still for a minute.
  */
 export async function elementsToPdfBlobs(
-  docs: { el: HTMLElement; orientation?: "portrait" | "landscape"; opts?: PdfOptions }[],
+  docs: {
+    el: HTMLElement;
+    orientation?: "portrait" | "landscape";
+    /** Thermal roll width in mm. The batch endpoint has always accepted it;
+     *  this helper simply never passed it on, so a bulk thermal export came
+     *  back as A4. */
+    pageWidthMm?: number;
+    opts?: PdfOptions;
+  }[],
   onProgress?: (done: number, total: number) => void,
 ): Promise<Blob[]> {
   const token = await requireIdToken();
@@ -203,9 +214,21 @@ export async function elementsToPdfBlobs(
         docs: slice.map((d) => ({
           html: buildPrintableHtml(d.el, !d.opts?.selfContained),
           landscape: d.orientation === "landscape",
+          pageWidthMm: d.pageWidthMm,
         })),
       },
     });
+    /* Callers pair the returned blobs with their own list positionally —
+       that is the only way to know whose document each one is. So a batch
+       that comes back short must stop everything: silently returning fewer
+       blobs shifts every later document onto the wrong name, and in a party
+       ledger export that means handing one customer another customer's
+       account. Failing the whole download is the mild outcome. */
+    if (res.pdfsBase64.length !== slice.length) {
+      throw new Error(
+        `PDF render returned ${res.pdfsBase64.length} documents for ${slice.length} requested — refusing to guess which is which`,
+      );
+    }
     for (const b64 of res.pdfsBase64) {
       const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
       out.push(new Blob([bytes], { type: "application/pdf" }));

@@ -30,6 +30,7 @@ import { TestDataBanner } from "@/routes/__root";
 import { PartyDialog } from "@/routes/parties";
 import { DataTable } from "@/components/DataTable";
 import { PrintableInvoice } from "@/components/PrintableInvoice";
+import { ThermalReceipt } from "@/components/ThermalReceipt";
 import { PrintableReturn } from "@/components/PrintableReturn";
 import { ThermalReceipt } from "@/components/ThermalReceipt";
 import { fmtMoney, today, ymd } from "@/lib/format";
@@ -38,7 +39,7 @@ import { stockOf } from "@/lib/serials";
 import { useEscapeToLeave } from "@/hooks/useFormKeys";
 import { useAppEscape } from "@/hooks/useGoBack";
 import { useWorkspace } from "@/store/workspace";
-import { buildPartyStatement, cashFlows } from "@/lib/ledger";
+import { buildPartyStatement, cashFlows, netFlow } from "@/lib/ledger";
 import { commitBatch } from "@/repositories/base";
 import {
   PartyRepo,
@@ -439,6 +440,20 @@ async function renderRoute(path: string | string[]): Promise<string> {
   return host.textContent ?? "";
 }
 
+/**
+ * The bill form mounts a desk table and a phone card list at once and lets
+ * CSS hide one of them, so "the add-item field" is a question with two
+ * answers. The hidden one cannot be focused or typed into — focus() on a
+ * display:none input is a no-op — so every test that drives this field has
+ * to ask for the one actually on screen.
+ */
+function visibleAddItemInput(): HTMLInputElement | null {
+  const all = Array.from(
+    document.querySelectorAll<HTMLInputElement>('input[placeholder="Type item name to add…"]'),
+  );
+  return all.find((el) => el.offsetParent !== null) ?? all[0] ?? null;
+}
+
 /** Re-read the currently mounted page after letting React settle. */
 async function readMounted(): Promise<string> {
   await act(async () => {
@@ -516,6 +531,225 @@ async function runAll(): Promise<Results> {
   const plAfterArrival = await readMounted();
   has(plAfterArrival, fmtMoney(1000), "cold open: P&L fills in once data arrives (no remount)");
   has(plAfterArrival, fmtMoney(360), "cold open: derived gross profit fills in too");
+
+  /* ── Nothing on a bill spills off the side of a phone ─────────────────
+     Reported as "sale and purchase invoice form not responsive, many bugs".
+     Measured rather than guessed: at a phone width, walk the form and report
+     anything wider than the screen it has to fit on. Runs only when the
+     suite is given a phone viewport, because at the default 800px there is
+     nothing to find. */
+  if (window.innerWidth <= 480) {
+    await renderRoute("/sales/new");
+    await settleMs(120);
+
+    const scope = host as HTMLElement;
+    assert(
+      scope.querySelectorAll("*").length > 50,
+      "mobile bill: the form is actually mounted — " +
+        scope.querySelectorAll("*").length +
+        " nodes",
+    );
+
+    const overflow: string[] = [];
+    scope.querySelectorAll<HTMLElement>("*").forEach((el) => {
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return;
+      // Its own scrolling region is allowed to be wider than the screen —
+      // that is what makes it scroll. Anything else is a spill.
+      const scrolls = /auto|scroll/.test(getComputedStyle(el).overflowX);
+      if (scrolls) return;
+      if (r.right > window.innerWidth + 1 || r.left < -1) {
+        const cls = (el.className || "").toString().slice(0, 60);
+        overflow.push(
+          el.tagName + "." + cls + " @" + Math.round(r.left) + ".." + Math.round(r.right),
+        );
+      }
+    });
+    assert(
+      overflow.length === 0,
+      "mobile bill: nothing spills off the screen — " + overflow.slice(0, 6).join(" | "),
+    );
+
+    /* ── The lines are a card list, not a table dragged sideways ────────
+       The nine-column row needs 720px; the phone has 390. The photograph
+       from the counter shows the result: Qty, Price and Amount on screen
+       and the item NAME scrolled off to the left, so the person billing
+       cannot see what they are billing for. */
+    const wideTable = Array.from(document.querySelectorAll<HTMLElement>("table")).find((t) =>
+      t.className.includes("min-w-[720px]"),
+    );
+    assert(!!wideTable, "mobile bill: the desktop item table is still built");
+    assert(
+      !wideTable || wideTable.offsetParent === null,
+      "mobile bill: but a phone is not shown it",
+    );
+
+    /* ── A dropdown that opens on the screen ────────────────────────────
+       Photographed: the item search opened with its prices hanging off the
+       right edge, because it was anchored to an input inside that 720px
+       table and nothing compared the answer to the width of the phone. */
+    const phoneAdd = Array.from(
+      document.querySelectorAll<HTMLInputElement>('input[placeholder="Type item name to add…"]'),
+    ).find((el) => el.offsetParent !== null);
+    assert(!!phoneAdd, "mobile bill: the phone layout offers an add-item field");
+
+    if (phoneAdd) {
+      await act(async () => {
+        phoneAdd.focus();
+        setInput(phoneAdd, "USB Cable");
+      });
+      await settleMs(160);
+
+      const panel = Array.from(document.body.querySelectorAll<HTMLElement>("div")).find(
+        (d) =>
+          getComputedStyle(d).position === "fixed" &&
+          d.className.includes("z-50") &&
+          (d.textContent ?? "").includes("USB Cable"),
+      );
+      assert(!!panel, "mobile bill: typing an item name opens the picker");
+      if (panel) {
+        const pr = panel.getBoundingClientRect();
+        assert(
+          pr.left >= -1 && pr.right <= window.innerWidth + 1,
+          "mobile bill: the picker opens fully on the screen — " +
+            Math.round(pr.left) +
+            ".." +
+            Math.round(pr.right) +
+            " of " +
+            window.innerWidth,
+        );
+        assert(
+          pr.top >= -1 && pr.bottom <= window.innerHeight + 1,
+          "mobile bill: and fully above the bottom of it — " +
+            Math.round(pr.top) +
+            ".." +
+            Math.round(pr.bottom),
+        );
+
+        /* ── And the name of what was added stays readable ──────────── */
+        /* The OPTION, not whatever container happens to start with the same
+           text: when the item is first in the list, the scroller's own
+           textContent starts with it too, and a mousedown on the scroller
+           never reaches the row's handler. data-opt marks the real one. */
+        const option = Array.from(panel.querySelectorAll<HTMLElement>("[data-opt]")).find((d) =>
+          (d.textContent ?? "").startsWith("USB Cable"),
+        );
+        assert(!!option, "mobile bill: the item is offered");
+        if (option) {
+          await act(async () => {
+            option.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+          });
+          await settleMs(200);
+
+          const nameEl = Array.from(scope.querySelectorAll<HTMLElement>("div")).find(
+            (d) =>
+              (d.textContent ?? "").trim() === "USB Cable" &&
+              d.children.length === 0 &&
+              d.offsetParent !== null &&
+              d.getBoundingClientRect().width > 0,
+          );
+          assert(!!nameEl, "mobile bill: the added item's name is on the page");
+          if (nameEl) {
+            const nr = nameEl.getBoundingClientRect();
+            assert(
+              nr.left >= -1 && nr.right <= window.innerWidth + 1,
+              "mobile bill: and wholly on the screen without dragging it sideways — " +
+                Math.round(nr.left) +
+                ".." +
+                Math.round(nr.right),
+            );
+          }
+
+          /* ── The last-prices popup, which walked off the LEFT ───────
+             It right-aligns itself by subtracting its own 256px width from
+             the input's right edge. On a phone card the Price box ends
+             around x=190, so that arithmetic produces a negative x — which
+             is the second photograph from the counter: the heading "LAST
+             SALE PRICES — GOPAL MOBILE" cut off by the edge of the screen.
+             It only appears once the bill has a party, because it is that
+             party's own history.
+
+             Honest about what this proves: in the CARD layout the Price box
+             sits far enough right that the subtraction lands on screen even
+             unclamped — removing the clamp does not make this fail. It is a
+             regression guard on the shipped layout. The clamp itself is
+             proved by TEST PP in the audit suite, where the anchor can be
+             put where the photograph found it. */
+          const partyInput = Array.from(
+            scope.querySelectorAll<HTMLInputElement>('input[placeholder="Type name or search…"]'),
+          ).find((el) => el.offsetParent !== null);
+          if (partyInput) {
+            await act(async () => {
+              partyInput.focus();
+              setInput(partyInput, "Ramesh");
+            });
+            await settleMs(140);
+            const partyOpt = Array.from(document.querySelectorAll<HTMLElement>("div")).find(
+              (d) =>
+                (d.textContent ?? "").trim() === "Ramesh Traders" &&
+                !d.querySelector("div div") &&
+                !d.querySelector("input"),
+            );
+            if (partyOpt) {
+              await act(async () => {
+                partyOpt.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+              });
+              await settleMs(160);
+            }
+
+            const priceBox = Array.from(scope.querySelectorAll<HTMLInputElement>("input")).find(
+              (el) =>
+                el.offsetParent !== null &&
+                el.className.includes("h-11") &&
+                (el.parentElement?.textContent ?? "").trim().toUpperCase() === "PRICE",
+            );
+            assert(!!priceBox, "mobile bill: the card has a Price box");
+            if (priceBox) {
+              await act(async () => {
+                priceBox.focus();
+                priceBox.dispatchEvent(new FocusEvent("focus", { bubbles: true }));
+              });
+              await settleMs(160);
+              const pricePanel = Array.from(
+                document.body.querySelectorAll<HTMLElement>("div"),
+              ).find(
+                (d) =>
+                  getComputedStyle(d).position === "fixed" &&
+                  d.className.includes("z-50") &&
+                  (d.textContent ?? "").includes("Prices"),
+              );
+              assert(!!pricePanel, "mobile bill: the last-prices popup opens");
+              if (pricePanel) {
+                const lr = pricePanel.getBoundingClientRect();
+                assert(
+                  lr.left >= -1,
+                  "mobile bill: the last-prices popup does not run off the left — left " +
+                    Math.round(lr.left),
+                );
+                assert(
+                  lr.right <= window.innerWidth + 1,
+                  "mobile bill: nor off the right — right " + Math.round(lr.right),
+                );
+              }
+            }
+          }
+
+          /* Every box on a phone card is at least 16px of text: below that,
+             iOS zooms the page the moment it is focused and the bill jumps
+             out from under the person filling it in. */
+          const small = Array.from(scope.querySelectorAll<HTMLInputElement>("input"))
+            .filter((el) => el.offsetParent !== null && el.type !== "checkbox")
+            .filter((el) => parseFloat(getComputedStyle(el).fontSize) < 16)
+            .map((el) => (el.id || el.placeholder || el.className.slice(0, 30)) + " ")
+            .slice(0, 5);
+          assert(
+            small.length === 0,
+            "mobile bill: no box small enough to make iOS zoom the page — " + small.join("| "),
+          );
+        }
+      }
+    }
+  }
 
   const listAfterArrival = await renderRoute("/sales");
   has(listAfterArrival, "INV-0001", "cold open: the list screen shows the arrived data");
@@ -757,6 +991,17 @@ async function runAll(): Promise<Results> {
     }
     assert(text.length > 100, `${url} rendered a suspiciously short page`);
     assert(!/NaN/.test(text), `${url} rendered NaN`);
+    /* A comment written as /* … *\/ instead of {/* … *\/} inside JSX is not a
+       comment — it is TEXT, and React prints it on the page. It compiles,
+       lints and typechecks cleanly, so nothing else in this repo would catch
+       it; I shipped one onto the invoice screen and only saw it by reading
+       the file back. Cheap to check on every page, once. */
+    assert(
+      !text.includes("/*"),
+      `${url} is printing a JSX comment as visible text — ${JSON.stringify(
+        text.slice(Math.max(0, text.indexOf("/*") - 40), text.indexOf("/*") + 80),
+      )}`,
+    );
     has(text, needle, `${url} content`);
   }
 
@@ -880,9 +1125,12 @@ async function runAll(): Promise<Results> {
     }
 
     await renderRoute("/sales/new");
-    const input = Array.from(document.querySelectorAll("input")).find((el) =>
+    const namedInputs = Array.from(document.querySelectorAll("input")).filter((el) =>
       (el.getAttribute("placeholder") ?? "").startsWith("Type item name"),
     );
+    // The bill renders a desk table and a phone card list at once and hides
+    // one of them. Focusing the hidden one does nothing, so take the visible.
+    const input = namedInputs.find((el) => el.offsetParent !== null) ?? namedInputs[0];
     assert(!!input, "item dropdown: found the item search input");
     if (input) {
       await act(async () => {
@@ -1325,6 +1573,29 @@ async function runAll(): Promise<Results> {
 
     const confirm = findButton(/Confirm Receipt/);
     assert(!!confirm, "quick entry: found Confirm Receipt");
+
+    /* Nothing is pre-selected any more, so this must refuse until somebody
+       says where the money went. The shop asked for the default to go: a
+       receipt that records cash because nobody looked at the pills is money
+       filed in the wrong place, with nothing to show it was never a
+       decision. Asserted BEFORE the happy path, because a guard that quietly
+       stopped working would otherwise be invisible here. */
+    await act(async () => {
+      confirm!.click();
+    });
+    await settleMs(150);
+    assert(
+      PaymentRepo.all().filter((p) => p.partyId === "QEP").length === 0,
+      "quick entry: confirming without choosing Cash or Bank records nothing",
+    );
+
+    const cashPill = document.querySelector('[data-mode="cash"]') as HTMLElement | null;
+    assert(!!cashPill, "quick entry: the Cash pill is there to choose");
+    await act(async () => {
+      cashPill!.click();
+    });
+    await settleMs(80);
+
     await act(async () => {
       confirm!.click();
     });
@@ -1850,34 +2121,41 @@ async function runAll(): Promise<Results> {
     await settleMs(60);
     const text = h.textContent ?? "";
 
-    // Every column the statement page shows, by name.
-    for (const col of [
-      "Date",
-      "Txn Type",
-      "Ref No.",
-      "Payment Status",
-      "Total",
-      "Received/Paid",
-      "Txn Balance",
-      "Receivable Balance",
-      "Payable Balance",
-    ]) {
+    /* The bulk download must be the SAME document as the one a single party
+       produces — that is the whole complaint it answers. Same five columns,
+       same wording. */
+    for (const col of ["Date", "Particulars", "You Gave", "You Got", "Balance"]) {
       assert(text.includes(col), `bulk ledger: the full PDF has the "${col}" column`);
     }
-    // And the per-transaction item breakdown, which was missing entirely.
     assert(
-      text.includes("Item name") && text.includes("Price/Unit") && text.includes("Sub Total"),
-      "bulk ledger: the full PDF breaks each bill down by item",
+      !text.includes("Txn Balance") && !text.includes("Payment Status"),
+      "bulk ledger: and none of the columns the statement page stopped showing",
     );
+
+    /* A summary a shop reads before the rows: what was billed, what came
+       back, what is left. */
+    /* Four boxes that RECONCILE — opening + gave − got = closing — so a
+       reader can check the summary against itself. "Total Billed" took part
+       in no such equation, and a party whose whole balance was an opening
+       figure showed 0, 0, 0 and then a closing balance of 5,100 with nothing
+       on the page explaining it. */
+    for (const box of ["Opening Balance", "You Got", "You Gave", "Closing Balance"]) {
+      assert(text.includes(box), `bulk ledger: the summary shows "${box}"`);
+    }
     assert(
       text.includes("USB Cable"),
       `bulk ledger: a real line item reaches the page — ${JSON.stringify(text.slice(0, 200))}`,
     );
     // The numbers are the statement's own, not recomputed.
     const closing = built.rows.length ? built.rows[built.rows.length - 1].balance : 0;
+    /* Compared without the rupee sign: the printed document drops it on
+       purpose, because the headless browser that draws these PDFs has no
+       font carrying it and printed a blank where it stood. The FIGURE is
+       what has to match the statement, and it still does. */
+    const plain = (n: number) => fmtMoney(n).replace("₹", "");
     assert(
-      text.includes(fmtMoney(Math.abs(closing))),
-      `bulk ledger: it closes on the statement's balance ${fmtMoney(Math.abs(closing))}`,
+      text.includes(plain(Math.abs(closing))),
+      `bulk ledger: it closes on the statement's balance ${plain(Math.abs(closing))}`,
     );
 
     // The simple format stays the plain six-column ledger.
@@ -2127,9 +2405,7 @@ async function runAll(): Promise<Results> {
     await renderRoute("/sales/new");
 
     // Add a line by picking an item from the entry row.
-    const addRow = document.querySelector(
-      'input[placeholder="Type item name to add…"]',
-    ) as HTMLInputElement | null;
+    const addRow = visibleAddItemInput();
     assert(!!addRow, "step back: found the item entry row");
     if (addRow) {
       await act(async () => {
@@ -2144,7 +2420,12 @@ async function runAll(): Promise<Results> {
 
     const row = document.querySelector("tbody tr") as HTMLTableRowElement | null;
     assert(!!row, "step back: a bill line was added");
-    if (row) {
+    /* Enter-walks-along-the-row is a KEYBOARD flow, and a keyboard means a
+       desk. A phone is given the card list instead, where there is no row to
+       walk along. Run this where it is the layout actually in use: asserting
+       it against a display:none table proves nothing in either direction,
+       because focus() on a hidden input silently does nothing. */
+    if (row && row.offsetParent !== null) {
       const fields = Array.from(row.querySelectorAll("input")) as HTMLInputElement[];
       assert(
         fields.length >= 2,
@@ -2221,9 +2502,7 @@ async function runAll(): Promise<Results> {
     await renderRoute(["/sales", "/sales/new"]);
 
     // Put something on the bill so leaving would cost work.
-    const addRow2 = document.querySelector(
-      'input[placeholder="Type item name to add…"]',
-    ) as HTMLInputElement | null;
+    const addRow2 = visibleAddItemInput();
     if (addRow2) {
       await act(async () => {
         setInput(addRow2, "USB Cable");
@@ -2902,9 +3181,7 @@ async function runAll(): Promise<Results> {
      still sitting above it. */
   {
     await renderRoute("/sales/new");
-    const addRow = document.querySelector(
-      'input[placeholder="Type item name to add…"]',
-    ) as HTMLInputElement | null;
+    const addRow = visibleAddItemInput();
     assert(!!addRow, "change item: found the item entry row");
     await act(async () => {
       setInput(addRow, "USB Cable");
@@ -2988,48 +3265,73 @@ async function runAll(): Promise<Results> {
     );
   }
 
-  /* ── Payment mode is one tab stop, not three ──────────────────────────
-     Reported from the shop as Tab "going to bank" after choosing Cash. It
-     did — to the Bank PILL, then the Credit pill, before reaching anything
-     that takes a number. Tab should leave the group and land on the amount;
-     moving WITHIN the group is what arrow keys are for. */
+  /* ── Payment mode: walk the pills until one is picked, then leave ─────
+     Two requests that looked contradictory and are the same rule seen from
+     either side of the decision. "Stop Tab walking the pills" — once a mode
+     is chosen, walking past it wastes two presses on the way to the amount.
+     "Why does Tab skip Cash and Bank" — before anything is chosen, the pills
+     are the whole point and Tab must reach them.
+
+     So: nothing chosen, every pill is a Tab stop. Chosen, exactly one. */
   {
     await renderRoute("/sales/new");
-    const pills = Array.from(document.querySelectorAll('[role="radio"]')).filter((p) =>
-      ["Cash", "Bank", "Credit"].includes((p.textContent ?? "").trim()),
-    ) as HTMLElement[];
-    assert(pills.length === 3, `mode tab: found the three payment pills — ${pills.length}`);
+    const pills = () =>
+      Array.from(document.querySelectorAll('[role="radio"]')).filter((p) =>
+        ["Cash", "Bank", "Credit"].includes((p.textContent ?? "").trim()),
+      ) as HTMLElement[];
+    assert(pills().length === 3, `mode tab: found the three payment pills — ${pills().length}`);
 
-    // Whichever mode a new bill starts on — the rule is about the group, not
-    // about one particular pill being chosen.
-    const chosen = pills.find((p) => p.getAttribute("aria-checked") === "true");
-    assert(!!chosen, "mode tab: one of the pills is selected to begin with");
+    /* A new bill has decided nothing. Lighting one by default is how Tab
+       ends up on Credit and looks as though it skipped the other two. */
     assert(
-      chosen!.tabIndex === 0,
-      "mode tab: the chosen mode is the tab stop, so Tab still reaches the group",
+      pills().every((p) => p.getAttribute("aria-checked") !== "true"),
+      "mode tab: a new bill starts with no mode chosen",
     );
     assert(
-      pills.filter((p) => p.tabIndex === 0).length === 1,
-      `mode tab: and it is the ONLY one, so Tab leaves for the amount instead of walking the pills — ${pills.filter((p) => p.tabIndex === 0).length} are tabbable`,
+      pills().every((p) => p.tabIndex === 0),
+      `mode tab: so Tab can reach every one of them — tabbable ${pills().filter((p) => p.tabIndex === 0).length} of 3`,
     );
 
-    // Arrow keys are how you move inside a radiogroup.
-    const startedOn = (chosen!.textContent ?? "").trim();
+    /* And there is nothing after them to land on yet. This is the complaint
+       in the shop's own words — "focus goes straight to Full but I have not
+       selected any mode" — so it is asserted rather than left implied: no
+       mode means nothing was received, which means no amount to receive it
+       into. */
+    const fullBtn = () =>
+      Array.from(document.querySelectorAll("button")).find(
+        (b) => (b.textContent ?? "").trim() === "Full",
+      );
+    assert(!fullBtn(), "mode tab: with no mode chosen there is no Full button to tab into");
+
+    // Pick the one you stopped on.
+    const cash = pills().find((p) => (p.textContent ?? "").trim() === "Cash")!;
     await act(async () => {
-      chosen!.focus();
-      chosen!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+      cash.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await settleMs(80);
-    const nowChosen = Array.from(document.querySelectorAll('[role="radio"]')).find(
-      (p) => p.getAttribute("aria-checked") === "true",
-    ) as HTMLElement | undefined;
+    await settleMs(140);
     assert(
-      (nowChosen?.textContent ?? "").trim() !== startedOn,
-      `mode tab: ArrowRight moves the choice along the group — still on ${startedOn}`,
+      pills()
+        .find((p) => (p.textContent ?? "").trim() === "Cash")
+        ?.getAttribute("aria-checked") === "true",
+      "mode tab: picking one selects it",
     );
     assert(
-      document.activeElement === nowChosen,
-      "mode tab: and focus follows it, or Tab would leave from the wrong pill",
+      pills().filter((p) => p.tabIndex === 0).length === 1,
+      `mode tab: and the group becomes ONE stop, so Tab goes to the amount — ${pills().filter((p) => p.tabIndex === 0).length} still tabbable`,
+    );
+
+    assert(!!fullBtn(), "mode tab: and once one IS chosen, Full appears for Tab to reach");
+
+    /* Bank is the exception, deliberately: it jumps to the account box,
+       because a bank payment is unusable without one. */
+    const bank = pills().find((p) => (p.textContent ?? "").trim() === "Bank")!;
+    await act(async () => {
+      bank.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await settleMs(160);
+    assert(
+      (document.activeElement as HTMLInputElement | null)?.placeholder === "Search bank account…",
+      "mode tab: choosing Bank puts the cursor straight in the account box",
     );
   }
 
@@ -3043,9 +3345,7 @@ async function runAll(): Promise<Results> {
     ItemRepo.update("I1", { category: "Accessories" } as never);
     await renderRoute("/sales/new");
 
-    const addRow = document.querySelector(
-      'input[placeholder="Type item name to add…"]',
-    ) as HTMLInputElement | null;
+    const addRow = visibleAddItemInput();
     assert(!!addRow, "new item category: found the item entry row");
     await act(async () => {
       setInput(addRow, "Tempered Glass X99");
@@ -3100,6 +3400,347 @@ async function runAll(): Promise<Results> {
     );
 
     ItemRepo.update("I1", { category: undefined } as never);
+  }
+
+  /* ── The customer's copy says how it was actually paid ────────────────
+     A bill printing "Cash" when half of it went to a bank is the original
+     complaint restated. The printed copy, the thermal receipt and every list
+     that showed a single mode now say both parts — and name the ACCOUNT,
+     because three accounts all reading "Bank" is the ambiguity this exists
+     to remove. */
+  {
+    BankRepo.add({
+      id: "BPRN",
+      createdAt: "2026-01-01T00:00:00Z",
+      name: "HDFC Current",
+      openingBalance: 0,
+      balance: 0,
+    } as never);
+
+    const splitInv = {
+      id: "PRNSPL",
+      createdAt: `${D4}T09:00:00Z`,
+      number: "INV-PRNSPL",
+      date: D4,
+      partyId: "P1",
+      partyName: "Ramesh Traders",
+      gstEnabled: false,
+      lineItems: [
+        {
+          id: "L",
+          itemId: "I1",
+          name: "USB Cable",
+          unit: "pcs",
+          qty: 1,
+          price: 1000,
+          discountPct: 0,
+          gstRate: 0,
+          costPrice: 0,
+          amount: 1000,
+        },
+      ],
+      subtotal: 1000,
+      discount: 0,
+      shippingCharge: 0,
+      taxAmount: 0,
+      total: 1000,
+      paid: 1000,
+      paymentMode: "cash",
+      paidSplits: [
+        { mode: "cash", amount: 400 },
+        { mode: "bank", amount: 600, bankId: "BPRN" },
+      ],
+    } as never;
+
+    const h = document.createElement("div");
+    document.body.appendChild(h);
+    const r = createRoot(h);
+    const show = async (el: ReactNode) => {
+      await act(async () => {
+        r.render(el);
+      });
+      return h.textContent ?? "";
+    };
+
+    const bill = await show(
+      <PrintableInvoice inv={splitInv} company={CompanyRepo.get()} mode="sale" />,
+    );
+    has(bill, "Cash", "printed split: the printed bill names the cash part");
+    has(bill, "HDFC Current", "printed split: and names the ACCOUNT, not just the word Bank");
+    has(bill, fmtMoney(400), "printed split: with how much was cash");
+    has(bill, fmtMoney(600), "printed split: and how much went to the account");
+
+    const receipt = await show(
+      <ThermalReceipt inv={splitInv} company={CompanyRepo.get()} mode="sale" />,
+    );
+    has(receipt, "HDFC Current", "printed split: the thermal receipt says it too");
+    has(receipt, fmtMoney(400), "printed split: including the cash part");
+
+    /* An ordinary bill must read exactly as it always did — one mode, named,
+       and NO amount, because "Cash ₹1,000" on a ₹1,000 bill is noise. */
+    const plain = await show(
+      <PrintableInvoice
+        inv={{ ...splitInv, id: "PRNPLAIN", paidSplits: undefined } as never}
+        company={CompanyRepo.get()}
+        mode="sale"
+      />,
+    );
+    has(plain, "Cash", "printed split: a single-mode bill still just says Cash");
+    assert(!plain.includes("HDFC Current"), "printed split: with no account it never touched");
+
+    r.unmount();
+    h.remove();
+  }
+
+  /* ── A bill settled part cash, part bank ──────────────────────────────
+     The reported case, driven through the real form. What matters is not
+     that the rows save — it is that both halves land where they belong and
+     neither is counted twice: the cash on the Cash page, the bank on that
+     account's stored balance, and nothing left over. */
+  {
+    BankRepo.add({
+      id: "BSPL",
+      createdAt: "2026-01-01T00:00:00Z",
+      name: "Split Test Bank",
+      openingBalance: 0,
+      balance: 0,
+    } as never);
+
+    await renderRoute("/sales/new");
+    const partyBox = document.querySelector(
+      'input[placeholder="Type name or search…"]',
+    ) as HTMLInputElement | null;
+    assert(!!partyBox, "split bill: found the customer box");
+    await act(async () => {
+      setInput(partyBox, "Ramesh Traders");
+    });
+    await settleMs(140);
+    const pOpt = Array.from(document.querySelectorAll("div")).find(
+      (d) =>
+        (d.textContent ?? "").trim() === "Ramesh Traders" &&
+        !d.querySelector("div div") &&
+        !d.querySelector("input"),
+    );
+    if (pOpt) {
+      await act(async () => {
+        pOpt.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      });
+      await settleMs(140);
+    }
+
+    const addRow = visibleAddItemInput();
+    await act(async () => {
+      setInput(addRow, "USB Cable");
+    });
+    await settleMs(120);
+    await act(async () => {
+      addRow?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    await settleMs(160);
+
+    // One cable at ₹100, quantity 10 → ₹1,000, settled 400 cash + 600 bank.
+    const qty = document.querySelector('[id^="qty-"]') as HTMLInputElement | null;
+    assert(!!qty, "split bill: found the quantity box");
+    await act(async () => {
+      setInput(qty, "10");
+    });
+    await settleMs(140);
+
+    /* A new bill does not start settled, and the Full shortcut only exists
+       once a mode that takes money is chosen. */
+    const cashPill = Array.from(document.querySelectorAll('[role="radio"]')).find(
+      (p) => (p.textContent ?? "").trim() === "Cash",
+    ) as HTMLElement | undefined;
+    assert(!!cashPill, "split bill: found the Cash payment mode");
+    await act(async () => {
+      cashPill?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await settleMs(140);
+
+    const fullBtn = Array.from(document.querySelectorAll("button")).find(
+      (b) => (b.textContent ?? "").trim() === "Full",
+    );
+    assert(!!fullBtn, "split bill: found the Full button to settle it");
+    await act(async () => {
+      fullBtn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await settleMs(160);
+
+    const splitBtn = Array.from(document.querySelectorAll("button")).find((b) =>
+      /Split across cash and bank/.test((b.textContent ?? "").trim()),
+    );
+    assert(!!splitBtn, "split bill: the form offers to split a settled bill");
+    await act(async () => {
+      splitBtn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await settleMs(140);
+
+    const amountBox = (n: number) =>
+      document.querySelector(`input[aria-label="Amount for part ${n}"]`) as HTMLInputElement | null;
+    assert(!!amountBox(1), "split bill: it opens holding the bill's own payment as one part");
+
+    await act(async () => {
+      setInput(amountBox(1), "400");
+    });
+    await settleMs(120);
+    const addAnother = Array.from(document.querySelectorAll("button")).find(
+      (b) => (b.textContent ?? "").trim() === "Add another",
+    );
+    assert(!!addAnother, "split bill: another part can be added");
+    await act(async () => {
+      addAnother?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await settleMs(140);
+
+    /* Driven as the app's own dropdown, not a native <select>: open it, then
+       pick the row. SelectMenu exists precisely so these do not hand their
+       popup to Windows, and a test that sets .value would pass against a
+       control nobody can actually use. */
+    const pickFrom = async (ariaLabel: string, optionText: string) => {
+      const trigger = document.querySelector(
+        `[role="combobox"][aria-label="${ariaLabel}"]`,
+      ) as HTMLElement | null;
+      assert(!!trigger, `split bill: found the "${ariaLabel}" dropdown`);
+      await act(async () => {
+        trigger?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await settleMs(120);
+      const list = document.querySelector(`[role="listbox"][aria-label="${ariaLabel}"]`);
+      const opt = Array.from(list?.querySelectorAll('[role="option"]') ?? []).find(
+        (o) => (o.textContent ?? "").trim() === optionText,
+      );
+      assert(!!opt, `split bill: "${optionText}" is offered in ${ariaLabel}`);
+      await act(async () => {
+        opt?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+      });
+      await settleMs(140);
+    };
+
+    await pickFrom("How part 2 was paid", "Bank");
+    await pickFrom("Which account part 2 went to", "Split Test Bank");
+    await act(async () => {
+      setInput(amountBox(2), "600");
+    });
+    await settleMs(140);
+
+    const before = SalesRepo.all().length;
+    const bankBefore = BankRepo.get("BSPL")?.balance ?? 0;
+    const saveBtn = Array.from(document.querySelectorAll("button")).find(
+      (b) => (b.textContent ?? "").trim() === "Save",
+    );
+
+    /* A document that disagrees with itself is not a document. Try to save
+       ₹400 + ₹500 against a ₹1,000 bill and it must refuse — only the person
+       at the counter knows which of the two figures is the true one. */
+    await act(async () => {
+      setInput(amountBox(2), "500");
+    });
+    await settleMs(140);
+    await act(async () => {
+      saveBtn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await settleMs(240);
+    assert(
+      SalesRepo.all().length === before,
+      "split bill: parts that do not add up to the bill are refused",
+    );
+    assert(
+      (BankRepo.get("BSPL")?.balance ?? 0) === bankBefore,
+      "split bill: and nothing moved on the account while it was refused",
+    );
+
+    await act(async () => {
+      setInput(amountBox(2), "600");
+    });
+    await settleMs(140);
+    await act(async () => {
+      saveBtn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await settleMs(320);
+
+    assert(SalesRepo.all().length === before + 1, "split bill: it saved");
+    const saved = SalesRepo.all()[0];
+    assert(
+      (saved.paidSplits ?? []).length === 2,
+      `split bill: with both parts on the record — ${JSON.stringify(saved.paidSplits)}`,
+    );
+    assert(
+      !saved.bankId && saved.bankPaidAmount === undefined,
+      "split bill: and the legacy pair left empty, so there is one answer for the money",
+    );
+
+    // The bank half moved that account's stored balance, once.
+    assert(
+      r2((BankRepo.get("BSPL")?.balance ?? 0) - bankBefore) === 600,
+      `split bill: the bank part reached the account — ${BankRepo.get("BSPL")?.balance}`,
+    );
+
+    // The cash half reaches the Cash page, and the bank half does not.
+    const flows = cashFlows(
+      SalesRepo.all().filter((s) => s.id === saved.id),
+      [],
+      [],
+      [],
+      [],
+    );
+    assert(
+      netFlow(flows) === 400,
+      `split bill: the cash part reaches Cash on Hand, and only that part — ${netFlow(flows)}`,
+    );
+
+    /* THE SECOND SAVE — the path that broke on the payment and expense
+       dialogs, and which a create-only test cannot see: the first save is
+       correct and the damage happens on the second.
+
+       Reopened, then genuinely EDITED — ₹400/₹600 becomes ₹300/₹700 — so the
+       assertions cannot pass by the save quietly doing nothing. The account
+       must follow the change exactly, and the rows must survive it. */
+    {
+      const bankAfterFirst = BankRepo.get("BSPL")?.balance ?? 0;
+      await renderRoute(`/sales/edit/${saved.id}`);
+      has(
+        document.body.textContent ?? "",
+        "How it was paid",
+        "split re-save: reopening the bill shows it as the split it is",
+      );
+      const part = (n: number) =>
+        document.querySelector(
+          `input[aria-label="Amount for part ${n}"]`,
+        ) as HTMLInputElement | null;
+      assert(!!part(2), "split re-save: with both parts still there, not collapsed to one");
+
+      await act(async () => {
+        setInput(part(1), "300");
+      });
+      await settleMs(120);
+      await act(async () => {
+        setInput(part(2), "700");
+      });
+      await settleMs(140);
+
+      const saveAgain = Array.from(document.querySelectorAll("button")).find(
+        (b) => (b.textContent ?? "").trim() === "Save",
+      );
+      assert(!!saveAgain, "split re-save: found Save on the edit form");
+      await act(async () => {
+        saveAgain?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await settleMs(340);
+
+      const again = SalesRepo.get(saved.id);
+      assert(
+        JSON.stringify((again?.paidSplits ?? []).map((r) => r.amount)) === "[300,700]",
+        `split re-save: the edited split is what was stored — ${JSON.stringify(again?.paidSplits)}`,
+      );
+      assert(
+        r2((BankRepo.get("BSPL")?.balance ?? 0) - bankAfterFirst) === 100,
+        `split re-save: and the account moved by exactly the difference, once — ${bankAfterFirst} then ${BankRepo.get("BSPL")?.balance}`,
+      );
+      assert(
+        netFlow(cashFlows([again!], [], [], [], [])) === 300,
+        `split re-save: with the cash half following too — ${netFlow(cashFlows([again!], [], [], [], []))}`,
+      );
+    }
   }
 
   /* ── The bank list has to follow the arrow keys ───────────────────────
@@ -3965,6 +4606,13 @@ async function runAll(): Promise<Results> {
       ["/purchase/new", "purchase"],
     ] as const) {
       await renderRoute(route);
+      /* The bill forms are the pages the smoke loop above cannot reach, and
+         they carry the most JSX. Same check, same reason: a comment written
+         without its braces is text, and React prints it. */
+      assert(
+        !(document.body.textContent ?? "").includes("/*"),
+        `bill columns: the ${what} form is printing a JSX comment as visible text`,
+      );
       const heads = headersOf();
       assert(heads.length > 0, `bill columns: the ${what} grid rendered — ${heads}`);
       assert(
@@ -6403,6 +7051,426 @@ async function runAll(): Promise<Results> {
     } as never);
   }
 
+  /* ── Picking a payment mode carries the keyboard onward ───────────────
+     The shop works a MacBook with no mouse. With macOS "Keyboard
+     navigation" off — the system default — Safari's Tab visits text fields
+     and skips buttons, so tabbing off the Cash pill reached neither the
+     Full button nor the amount, and the run simply died there. Focus is
+     driven explicitly now, so it behaves the same on every browser rather
+     than depending on a setting nobody at a counter will find.
+
+     Asserted on where the focus actually lands, because that is the whole
+     feature; nothing about the rendered markup would change if it broke. */
+  {
+    await renderRoute("/sales/new");
+
+    const cash = document.querySelector('[data-mode="cash"]') as HTMLElement | null;
+    assert(!!cash, "mode focus: the Cash pill is on a new bill");
+    if (cash) {
+      await act(async () => {
+        cash.click();
+      });
+      await settleMs(80);
+      const amount = document.querySelector(
+        'input[aria-label="Received amount"]',
+      ) as HTMLInputElement | null;
+      assert(!!amount, "mode focus: the received-amount box exists");
+      assert(
+        document.activeElement === amount,
+        "mode focus: choosing Cash puts the cursor straight on the amount — focus is on " +
+          (document.activeElement
+            ? document.activeElement.tagName +
+              "[" +
+              (document.activeElement.getAttribute("aria-label") ??
+                document.activeElement.getAttribute("data-mode") ??
+                document.activeElement.getAttribute("placeholder") ??
+                (document.activeElement.textContent ?? "").slice(0, 24)) +
+              "]"
+            : "nothing"),
+      );
+    }
+
+    const bank = document.querySelector('[data-mode="bank"]') as HTMLElement | null;
+    assert(!!bank, "mode focus: the Bank pill is there too");
+    if (bank) {
+      await act(async () => {
+        bank.click();
+      });
+      await settleMs(80);
+      // Bank asks a question Cash does not, so the cursor goes there instead.
+      const bankBox = document.querySelector(
+        'input[placeholder="Search bank account…"]',
+      ) as HTMLInputElement | null;
+      assert(!!bankBox, "mode focus: choosing Bank reveals the account box");
+      assert(
+        document.activeElement === bankBox,
+        "mode focus: and the cursor is in it, not left on the pill",
+      );
+
+      /* The account list is absolutely positioned inside the totals card.
+         That card was overflow-hidden, so every option past its bottom edge
+         was clipped away — reported as a list that would not scroll. */
+      const list = bankBox?.parentElement?.querySelector("[class*='overflow-auto']");
+      if (list) {
+        let clipped = false;
+        for (let el = list.parentElement; el; el = el.parentElement) {
+          if (el === document.body) break;
+          if (getComputedStyle(el).overflow === "hidden") {
+            clipped = true;
+            break;
+          }
+        }
+        assert(!clipped, "mode focus: no ancestor clips the bank list away");
+      }
+    }
+  }
+
+  /* ── Ticking a bill selects it, and does NOT open it ──────────────────
+     The sales table opens the bill on row click. A checkbox dropped into
+     that row inherits the click unless it stops it, so the first tick would
+     navigate away — taking the selection with it. Cheap to get wrong,
+     invisible in the markup, and the whole feature is unusable if it is. */
+  {
+    await renderRoute("/sales");
+
+    const tick = document.querySelector(
+      'input[type="checkbox"][aria-label^="Select "]',
+    ) as HTMLInputElement | null;
+    assert(!!tick, "invoice select: the sales list has a tick box per row");
+
+    if (tick) {
+      await act(async () => {
+        tick.click();
+      });
+      await settleMs(120);
+
+      /* A memory router keeps window.location fixed, so the URL proves
+         nothing here. The list surviving does: navigating to the bill would
+         unmount the row this box lives in. */
+      assert(
+        tick.isConnected,
+        "invoice select: ticking stays on the list instead of opening the bill",
+      );
+      assert(tick.checked, "invoice select: and the row is actually selected");
+
+      const body = document.body.textContent ?? "";
+      assert(
+        /1 selected/.test(body),
+        "invoice select: the bulk bar appears and counts the selection",
+      );
+      assert(
+        !!findButton(/Download 1/),
+        "invoice select: with a Download button for what is ticked",
+      );
+
+      /* The bar is absent until something is ticked — an always-present strip
+         of nothing is what makes a list feel cluttered. */
+      await act(async () => {
+        tick.click();
+      });
+      await settleMs(120);
+      assert(
+        !/1 selected/.test(document.body.textContent ?? ""),
+        "invoice select: and it goes away again when nothing is ticked",
+      );
+    }
+  }
+
+  /* ── The bottom of the bill really is three columns ───────────────────
+     It was two blocks in a three-column grid — one wide card carrying both
+     the amount breakdown AND the whole payment section, then Notes. Asked
+     for three, told it was three, and it was not. Stacked like that the card
+     also grew tall enough to push the payment rows under the sticky Save
+     bar on a laptop.
+
+     Counted rather than eyeballed, because the count is the claim. The
+     widths themselves are gated at lg: and this browser is 800px wide, so
+     nothing here can speak to how it LOOKS — only to how many pieces there
+     are, which is what was actually wrong. */
+  {
+    await renderRoute("/sales/new");
+
+    const rows = Array.from(document.querySelectorAll('div[class*="grid-cols-3"]')).filter((el) =>
+      (el.textContent ?? "").includes("Subtotal"),
+    );
+    assert(rows.length === 1, "three columns: found the bill's bottom row");
+
+    if (rows[0]) {
+      const cols = Array.from(rows[0].children);
+      assert(
+        cols.length === 3,
+        "three columns: money, payment and notes are three separate cards — got " + cols.length,
+      );
+      /* Each one holds its own thing, so a later merge back into one wide
+         card fails here rather than silently undoing this. */
+      const text = cols.map((c) => c.textContent ?? "");
+      assert(
+        text.some((t) => t.includes("Subtotal") && t.includes("Total")),
+        "three columns: one column carries the amounts",
+      );
+      assert(
+        text.some((t) => t.includes("Payment Mode")),
+        "three columns: another carries the payment",
+      );
+      assert(
+        text.some((t) => t.includes("Notes")),
+        "three columns: and the third the notes",
+      );
+      assert(
+        !text.some((t) => t.includes("Subtotal") && t.includes("Payment Mode")),
+        "three columns: the amounts and the payment are not stacked in one card again",
+      );
+    }
+  }
+
+  /* ── The party statement reads without an accountant ──────────────────
+     "This is so hard to understand for uneducated people." It carried nine
+     columns, three of which were running balances — Txn Balance, Receivable
+     Balance, Payable Balance — and closed with a figure marked Dr, which
+     means nothing to the person this is handed to.
+
+     Eight columns now, one balance, and the closing figure says in words
+     whose money it is. Asserted on what is actually on the page, because
+     every one of these is a thing the shop looks for and would notice gone. */
+  {
+    const stmt = await renderRoute("/parties/P1");
+
+    /* Two money columns and a balance, which is the shape of every
+       hand-written khata in the country. Eight columns of Quantity / Rate /
+       Amount put a bill's internals on the same line as the running account
+       and made a month of trading unreadable. */
+    for (const heading of ["Date", "Particulars", "You Gave", "You Got", "Balance"]) {
+      has(stmt, heading, "statement: the column named " + heading);
+    }
+    /* Scoped to the header, not the page: "Quantity" legitimately appears
+       inside an opened breakdown and on the mobile card, and asserting
+       against the whole document fails for the wrong reason. */
+    const head = document.querySelector("table thead")?.textContent ?? "";
+    assert(
+      head.length > 0 && !head.includes("Quantity") && !head.includes("Reference No."),
+      "statement: a bill's internals are no longer columns of the account — " + head,
+    );
+
+    /* The detail is folded away, not thrown away. Seven item lines under
+       every sale is what turned this into six screens of scrolling. */
+    /* Tied to the data rather than assumed: a breakdown is offered only for
+       a bill this row cannot already describe in full, so requiring one
+       unconditionally just asserts what the seed happens to contain. */
+    const hasMultiItemRow = /d+ items/.test(stmt);
+    assert(
+      !hasMultiItemRow || stmt.includes("View details"),
+      "statement: a bill with several items offers its breakdown",
+    );
+    const anyItemLine = /S22U LCD TAPE|SM A16 NEW WITH FRAME LCD/.test(stmt);
+    assert(!anyItemLine, "statement: but it starts closed, so the account reads as an account");
+
+    /* The three that had to go. "Dr" is the clearest example of the whole
+       complaint: correct, conventional, and unreadable to this shop. */
+    assert(
+      !stmt.includes("Txn Balance") && !stmt.includes("Receivable Balance"),
+      "statement: the three competing balance columns are gone",
+    );
+    assert(!/\bDr\b/.test(stmt) && !/\bCr\b/.test(stmt), "statement: and so is Dr / Cr");
+
+    /* What replaced them: the same fact, in a sentence. */
+    assert(
+      /Total amount (they owe you|you owe them)|Nothing outstanding/.test(stmt),
+      "statement: the closing balance says whose money it is, in words",
+    );
+    has(stmt, "Closing Balance", "statement: and still calls it the closing balance");
+
+    /* A receipt applied to several bills used to print every number in the
+       reference cell and push the columns after it off the screen. */
+    const longRef = Array.from(document.querySelectorAll("td[title]")).find(
+      (td) => (td.getAttribute("title") ?? "").split(",").length > 2,
+    );
+    if (longRef) {
+      assert(
+        (longRef.textContent ?? "").includes("more"),
+        "statement: a payment settling many bills is summarised, not printed in full",
+      );
+    }
+  }
+
+  /* ── Filters live behind one button, on every screen ──────────────────
+     The date range, the customer picker and four status pills used to sit
+     across the toolbar. It is the first row to wrap on a laptop, and every
+     one of those controls was already duplicated inside the filter dialog
+     the mobile button opened. They live in the dialog only now.
+
+     Asserted from both sides: gone from the toolbar, present once the
+     button is pressed. Only checking one half would pass for a page that had
+     simply lost its filters. */
+  for (const url of ["/sales", "/purchase"]) {
+    await renderRoute(url);
+
+    const before = document.body.textContent ?? "";
+    assert(before.includes("Filters"), url + ": there is a Filters button");
+    assert(
+      !/\bPartial\b/.test(before),
+      url + ": the status pills are not strewn across the toolbar any more",
+    );
+
+    const btn = findButton(/^Filters$/);
+    assert(!!btn, url + ": the Filters button is reachable");
+    if (btn) {
+      await act(async () => {
+        btn.click();
+      });
+      await settleMs(150);
+
+      const open = document.body.textContent ?? "";
+      for (const control of ["Paid", "Partial", "Unpaid"]) {
+        assert(open.includes(control), url + ": the dialog offers " + control);
+      }
+      assert(
+        document.querySelectorAll('input[type="date"]').length >= 2,
+        url + ": and the date range is in there with them",
+      );
+    }
+  }
+
+  /* ── A statement row never repeats itself ─────────────────────────────
+     A one-item bill printed its item on the row AND again, verbatim, on a
+     line underneath: same name, same quantity, same rate, same amount. A
+     payment row managed it too — the pill said "Payment Received" and the
+     description said "Payment Received" right beside it.
+
+     The breakdown exists to explain a row that cannot explain itself. One
+     item fits on its own row and needs no second line. Asserted structurally
+     rather than by counting text, because the rule is about adjacency: no
+     row may be followed by a line that just says it again. */
+  {
+    await renderRoute("/parties/P1");
+
+    const body = document.querySelector("table tbody");
+    assert(!!body, "statement dupes: the statement table rendered");
+
+    if (body) {
+      const rows = Array.from(body.querySelectorAll("tr"));
+      let repeats = 0;
+      let example = "";
+      for (let i = 0; i < rows.length - 1; i++) {
+        const cells = rows[i].querySelectorAll("td");
+        // A transaction row has the full set of columns; a breakdown line
+        // has two (a spacer and a wide cell).
+        if (cells.length < 5) continue;
+        const description = (cells[1].textContent ?? "").trim();
+        if (!description) continue;
+        const next = rows[i + 1];
+        if (next.querySelectorAll("td").length >= 5) continue; // another txn
+        const detail = (next.textContent ?? "").trim();
+        if (detail.includes(description) && description.length > 3) {
+          repeats++;
+          example = description;
+        }
+      }
+      assert(
+        repeats === 0,
+        "statement dupes: no row is followed by a line repeating it — " +
+          repeats +
+          " found, e.g. " +
+          example,
+      );
+
+      /* And the description of a row with no items of its own says where the
+         money went, which is the question that row is actually asked. */
+    }
+  }
+
+  /* ── Whatever a PDF is built from must survive the print stylesheet ────
+     The party statement downloaded as two completely blank pages. No error,
+     nothing in the console — just white.
+
+     buildPrintableHtml takes ONE element's outerHTML, with no ancestors, and
+     ships the app stylesheet alongside it. That stylesheet hides everything
+     in print except .print-area and .print-visible, so an element carrying
+     neither renders as nothing at all. The offscreen copy the PDF is now
+     built from had no such class, and every download from that page came out
+     empty.
+
+     Asserted on the element itself, because this is the one fault in the
+     whole pipeline that produces a perfectly successful-looking failure. */
+  {
+    await renderRoute("/parties/P1");
+
+    /* The element the PDF is actually built from, by name. Querying for
+       ".print-visible" found the on-screen statement instead — which carries
+       the class too — so the check passed while the real PDF source had
+       none, and the mutation that caused the blank pages survived it. */
+    const source = document.querySelector("[data-pdf-source]");
+    assert(!!source, "pdf source: the party page has an element PDFs are built from");
+    assert(
+      source?.classList.contains("print-visible"),
+      "pdf source: and it survives the print stylesheet, which hides everything else",
+    );
+
+    /* And it is the statement, not an empty wrapper — a blank page passes a
+       "does it exist" check just as happily. */
+    const text = source?.textContent ?? "";
+    assert(
+      text.includes("Closing Balance"),
+      "pdf source: and it carries the statement, not an empty shell",
+    );
+    assert(
+      text.includes("You Gave") && text.includes("You Got"),
+      "pdf source: with the columns the document is supposed to have",
+    );
+  }
+
+  /* ── A sale line starts at the item's selling price ───────────────────
+     The picker showed 7,000 and the line came out at 6,105, because this
+     party's own last price beat the catalogue. That preference made sense
+     while an item's sale price was rewritten by whatever bill went out last;
+     since that write was removed the sale price IS the shop's decision, and
+     a different figure arriving on the line is the shop being overruled by
+     its own history.
+
+     Asserted because nothing did: all 630 assertions passed both before and
+     after the behaviour was reversed, which is the definition of untested. */
+  {
+    await renderRoute("/sales/new");
+
+    const add = visibleAddItemInput();
+    assert(!!add, "sale price: the new-bill form has an item entry row");
+
+    if (add) {
+      await act(async () => {
+        setInput(add, "USB Cable");
+      });
+      await settleMs(120);
+
+      /* The option the picker itself marks, not the first div whose text
+         happens to start with the name — the outer container matches that
+         too, and clicking it does nothing because React events bubble up. */
+      const option = Array.from(document.querySelectorAll("[data-opt]")).find((el) =>
+        (el.textContent ?? "").includes("USB Cable"),
+      );
+      assert(!!option, "sale price: the item is offered");
+      if (option) {
+        await act(async () => {
+          option.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        });
+        await settleMs(160);
+
+        /* USB Cable: cost 60, sells 100. The line must start at 100 — and
+           must never start at 60, which is the failure that quietly bills
+           at cost. */
+        const values = Array.from(document.querySelectorAll("input"))
+          .map((el) => (el as HTMLInputElement).value)
+          .filter(Boolean);
+        assert(
+          values.includes("100"),
+          "sale price: picking an item creates a line at its price — saw " + values.join(","),
+        );
+        assert(
+          !values.includes("60"),
+          "sale price: and never at the purchase price — saw " + values.join(","),
+        );
+      }
+    }
+  }
+
   const bulkHost = document.createElement("div");
   document.body.appendChild(bulkHost);
   const bulkRoot = createRoot(bulkHost);
@@ -6458,6 +7526,7 @@ async function runAll(): Promise<Results> {
       );
     }
   }
+
   bulkRoot.unmount();
   bulkHost.remove();
 

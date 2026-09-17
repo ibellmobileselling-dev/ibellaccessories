@@ -9,6 +9,7 @@ import {
   BankTxnRepo,
   ExpenseRepo,
   CompanyRepo,
+  CashAdjustmentRepo,
 } from "@/repositories";
 import { buildBankLedger, type BankLedgerRow } from "@/lib/ledger";
 import { fmtDate, fmtDateShort, fmtMoney } from "@/lib/format";
@@ -17,7 +18,9 @@ import { useAutoPrintFromUrl } from "@/hooks/useAutoPrintFromUrl";
 import { useRepoData, useRepoMemo } from "@/hooks/useRepoData";
 import { downloadCsv } from "@/lib/csv";
 import { downloadElementAsPdf } from "@/lib/pdf";
-import type { BankAccount } from "@/types";
+import type { BankAccount, CashAdjustment } from "@/types";
+import { Pencil } from "lucide-react";
+import { CashBankTransferDialog } from "@/components/CashBankTransferDialog";
 import {
   ArrowLeft,
   Printer,
@@ -61,6 +64,24 @@ function BankStatementPage() {
   // lib/print.ts) — this tab opened fresh with ?print=1, so print
   // immediately once the bank account has loaded.
   useAutoPrintFromUrl(bank ? `Bank-${bank.name.replace(/\s+/g, "-")}` : null, !!bank);
+
+  /* A transfer is corrected as the whole thing it is — both legs together —
+     so the dialog is handed its CASH leg, which is what it keys on. Editing
+     one side alone is the outcome that must never happen: the money would
+     move on one account and not the other. */
+  const [editingTransfer, setEditingTransfer] = useState<CashAdjustment | null>(null);
+  const [editingTransferId, setEditingTransferId] = useState<string | null>(null);
+
+  /** Open whichever kind of transfer this row belongs to. */
+  const editTransfer = (transferId: string) => {
+    const cashLeg = CashAdjustmentRepo.all().find((a) => a.transferId === transferId) ?? null;
+    if (cashLeg) setEditingTransfer(cashLeg);
+    else setEditingTransferId(transferId);
+  };
+  const closeTransfer = () => {
+    setEditingTransfer(null);
+    setEditingTransferId(null);
+  };
 
   const { rows } = useRepoMemo(() => {
     if (!bank) return { rows: [] as BankLedgerRow[] };
@@ -355,7 +376,7 @@ function BankStatementPage() {
           <table className="hidden md:table bank-ledger-table w-full text-[12.5px] border-collapse">
             <thead>
               <tr className="bg-gray-50">
-                {["Date", "Type", "Ref #", "Debit (−)", "Credit (+)", "Balance"].map((h, i) => (
+                {["Date", "Type", "Ref #", "Debit (−)", "Credit (+)", "Balance", ""].map((h, i) => (
                   <th
                     key={h}
                     className={`px-4 py-2.5 text-[10px] font-semibold uppercase tracking-wider text-gray-500 border-b border-gray-200 whitespace-nowrap ${i >= 3 ? "text-right" : "text-left"}`}
@@ -368,7 +389,7 @@ function BankStatementPage() {
             <tbody>
               {rows.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="text-center py-14 text-gray-400">
+                  <td colSpan={7} className="text-center py-14 text-gray-400">
                     No transactions in this account yet
                   </td>
                 </tr>
@@ -393,6 +414,24 @@ function BankStatementPage() {
                     </td>
                     <td className="px-4 py-2.5 text-right tabular-nums font-semibold text-gray-800">
                       {fmtMoney(e.balance)}
+                    </td>
+                    {/* Only a transfer offers this. Everything else in a
+                        passbook is the shadow of something with its own
+                        screen — a bill, a receipt, an expense — and is
+                        corrected there, where the rest of its detail lives. */}
+                    <td className="px-2 py-2.5 text-right whitespace-nowrap no-print">
+                      {e.transferId && (
+                        <button
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                            editTransfer(e.transferId!);
+                          }}
+                          className="rounded p-1.5 text-gray-300 transition hover:bg-blue-50 hover:text-blue-600"
+                          title="Edit this transfer (both accounts)"
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))
@@ -419,6 +458,19 @@ function BankStatementPage() {
           </table>
         </div>
       </div>
+
+      {/* The same dialog the Cash page uses. Reused rather than rebuilt: it
+          rewrites BOTH legs of a transfer together, and a second
+          implementation of that is a second chance to move money on one
+          account and not the other. */}
+      <CashBankTransferDialog
+        open={!!editingTransfer || !!editingTransferId}
+        onOpenChange={(v) => !v && closeTransfer()}
+        editing={editingTransfer}
+        editingTransferId={editingTransferId}
+        onEditingDone={closeTransfer}
+        onSaved={closeTransfer}
+      />
     </div>
   );
 }

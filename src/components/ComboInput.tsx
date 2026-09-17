@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { matchesQuery, byRelevance } from "@/lib/search";
 import { Plus } from "lucide-react";
+import { useHighlightScroll } from "@/hooks/useHighlightScroll";
 
 /**
  * A text box that suggests what has been typed here before, and still accepts
@@ -39,6 +40,9 @@ export function ComboInput({
 }) {
   const [open, setOpen] = useState(false);
   const [idx, setIdx] = useState(0);
+  /** Arrowing past the bottom edge used to move the highlight invisibly. */
+  const listRef = useRef<HTMLDivElement>(null);
+  useHighlightScroll(listRef, idx, open);
   const inputRef = useRef<HTMLInputElement>(null);
   const [rect, setRect] = useState<{ top: number; left: number; width: number } | null>(null);
 
@@ -166,11 +170,13 @@ export function ComboInput({
               // goes with it unless it says otherwise.
               pointerEvents: "auto",
             }}
+            ref={listRef}
             className="z-50 border rounded-md bg-popover shadow-elevated max-h-56 overflow-auto"
           >
             {rows.map((opt, i) => (
               <div
                 key={opt ?? "__add__"}
+                data-opt={i}
                 role="option"
                 aria-selected={i === idx}
                 onMouseDown={(e) => {

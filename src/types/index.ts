@@ -80,6 +80,22 @@ export interface LineItem {
 
 export type PaymentMode = "cash" | "bank" | "credit" | "upi" | "cheque";
 
+/**
+ * One part of a payment that was not all taken the same way.
+ *
+ * The shop settles a bill ₹4,000 cash and ₹6,000 into HDFC; that is two rows.
+ * A document with no rows means what it has always meant — its own
+ * paymentMode and amount — so nothing existing had to be rewritten to add
+ * this. See docs/SPLIT-PAYMENT-PLAN.md and lib/paymentSplit.ts, which is the
+ * only thing that should read these fields directly.
+ */
+export interface PaymentSplit {
+  mode: PaymentMode;
+  amount: number;
+  /** Which account it landed in. Required for any mode that names one. */
+  bankId?: ID;
+}
+
 export interface Invoice extends Voidable {
   id: ID;
   number: string;
@@ -104,6 +120,10 @@ export interface Invoice extends Voidable {
   /** Snapshot of `paid` at the moment it was attributed to bankId, so an edit can
    * reverse exactly that amount even if `paid` later grows via Payment allocations. */
   bankPaidAmount?: number;
+  /** Set only when the paid amount was NOT all taken one way. Absent on every
+   *  document written before splits existed, and on every single-mode one
+   *  since. Read it through lib/paymentSplit.ts, never directly. */
+  paidSplits?: PaymentSplit[];
   /** Purchase bills only — each line's `foreignPrice` (in the supplier's
    * currency) gets converted to INR as `foreignPrice * exchangeRate +
    * carryCostPerUnit`, so the landed per-unit cost (currency conversion +
@@ -146,6 +166,8 @@ export interface Expense extends Voidable {
   paymentMode: PaymentMode;
   /** Which bank account this was paid from — only set when paymentMode is "bank". */
   bankId?: ID;
+  /** Set only when this was not all taken one way. See PaymentSplit. */
+  splits?: PaymentSplit[];
   /** Who this was actually paid to — see Payee. Optional on the type so
    * older records saved before this existed still load; the expense form
    * requires it going forward. */
@@ -300,6 +322,8 @@ export interface Payment extends Voidable {
   mode: PaymentMode;
   /** Which bank account this moved money into/out of — only set when mode is "bank". */
   bankId?: ID;
+  /** Set only when this was not all taken one way. See PaymentSplit. */
+  splits?: PaymentSplit[];
   ref?: string;
   allocations?: PaymentAllocation[];
   createdAt: string;

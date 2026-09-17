@@ -7,7 +7,7 @@ import { usePeriodLock } from "@/hooks/usePeriodLock";
 import { ExpenseRepo, BankRepo, PayeeRepo, CompanyRepo } from "@/repositories";
 import { useRepoData, useRepoMemo } from "@/hooks/useRepoData";
 import { newBatch, commitBatch, genId } from "@/repositories/base";
-import type { Expense, BankAccount, Payee } from "@/types";
+import type { Expense, BankAccount, Payee, PaymentSplit } from "@/types";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Field } from "@/components/Field";
@@ -24,6 +24,9 @@ import { fmtMode } from "@/lib/paymentMode";
 import { fmtDate, fmtDateShort, fmtMoney, today } from "@/lib/format";
 import { Plus, Receipt, Trash2, Pencil } from "lucide-react";
 import { toast } from "sonner";
+import { useHighlightScroll } from "@/hooks/useHighlightScroll";
+import { bankParts, splitProblems, largestSplitMode, describePayment } from "@/lib/paymentSplit";
+import { SplitPaymentRows } from "@/components/SplitPaymentRows";
 import { usePermissions } from "@/hooks/usePermissions";
 import { VoidDialog, VoidedBadge } from "@/components/VoidDialog";
 import {
@@ -34,6 +37,10 @@ import {
   removalWord,
 } from "@/lib/voiding";
 import { Ban } from "lucide-react";
+
+/** An account's name for display. The word "Bank" three times over is
+ *  exactly what a split is meant to stop being ambiguous. */
+const bankName = (id: string) => BankRepo.get(id)?.name;
 
 export const Route = createFileRoute("/expenses")({ component: ExpensesPage });
 
@@ -115,8 +122,11 @@ function ExpensesPage() {
    * reversal, and two copies would drift.
    */
   const undoExpenseEffects = (batch: ReturnType<typeof newBatch>, live: Expense) => {
-    if (live.paymentMode === "bank" && live.bankId && BankRepo.get(live.bankId)) {
-      BankRepo.adjustFieldBatched(batch, live.bankId, "balance", live.amount);
+    // Every account it was paid from, not just one: an expense settled partly
+    // from HDFC and partly from ICICI owes both of them their money back.
+    for (const [bankId, amount] of bankParts(live)) {
+      if (!BankRepo.get(bankId)) continue;
+      BankRepo.adjustFieldBatched(batch, bankId, "balance", amount);
     }
   };
 
@@ -174,7 +184,7 @@ function ExpensesPage() {
       key: "mode",
       label: "Mode",
       width: "80px",
-      render: (r) => <span className="text-xs">{fmtMode(r.paymentMode)}</span>,
+      render: (r) => <span className="text-xs">{describePayment(r, bankName)}</span>,
     },
     {
       key: "amount",
@@ -299,7 +309,7 @@ function ExpensesPage() {
                     </p>
                   </div>
                   <p className="text-[11px] text-gray-400 mt-1 truncate">
-                    {fmtDate(r.date)} · {r.payeeName ?? "—"} · {fmtMode(r.paymentMode)}
+                    {fmtDate(r.date)} · {r.payeeName ?? "—"} · {describePayment(r, bankName)}
                     {r.notes ? ` · ${r.notes}` : ""}
                   </p>
                 </div>
@@ -389,6 +399,8 @@ function ExpenseDialog({
   const firstRef = useRef<HTMLButtonElement>(null);
   const { canPost, lockedUpto } = usePeriodLock();
   const [f, setF] = useState<Partial<Expense>>({});
+  /** Rows, once the money came out in more than one way. */
+  const [splitRows, setSplitRows] = useState<PaymentSplit[] | null>(null);
   const [saving, setSaving] = useState(false);
   // Synchronous double-submit guard — prevents a same-tick double Enter from
   // recording the expense (and its bank-balance move) twice.
@@ -406,7 +418,12 @@ function ExpenseDialog({
     f.category && !categories.includes(f.category) ? [f.category, ...categories] : categories;
   useEffect(() => {
     if (open) {
-      setF(expense ?? { date: today(), paymentMode: "cash", amount: 0, category: "" });
+      // No paymentMode: a blank expense has not been paid any particular way
+      // yet, and pre-lighting Cash is how one gets recorded as cash by default.
+      setF(expense ?? { date: today(), amount: 0, category: "" });
+      // Same as the payment dialog: reopening a split expense must show the
+      // split, or saving it again quietly re-attributes the money.
+      setSplitRows(expense?.splits?.length ? expense.splits : null);
       setPayeeQ(expense?.payeeName ?? "");
       setSaving(false);
       savingRef.current = false;
@@ -420,6 +437,9 @@ function ExpenseDialog({
   const [bankQ, setBankQ] = useState("");
   const [bankOpen, setBankOpen] = useState(false);
   const [bankIdx, setBankIdx] = useState(0);
+  /** Arrowing past the bottom edge used to move the highlight invisibly. */
+  const bankListRef = useRef<HTMLDivElement>(null);
+  useHighlightScroll(bankListRef, bankIdx, bankOpen);
   useEffect(() => {
     setBankQ(banks.find((b) => b.id === f.bankId)?.name ?? "");
   }, [f.bankId, banks]);
@@ -441,6 +461,8 @@ function ExpenseDialog({
   const [payeeQ, setPayeeQ] = useState("");
   const [payeeOpen, setPayeeOpen] = useState(false);
   const [payeeIdx, setPayeeIdx] = useState(0);
+  const payeeListRef = useRef<HTMLDivElement>(null);
+  useHighlightScroll(payeeListRef, payeeIdx, payeeOpen);
   const payeeSuggests = payees.filter((p) => {
     const q = payeeQ.trim().toLowerCase();
     if (!q) return true;
@@ -471,7 +493,22 @@ function ExpenseDialog({
       toast.error("Amount must be positive");
       return;
     }
-    if (f.paymentMode === "bank" && !f.bankId) {
+    /* An expense that does not add up is not an expense. Refused rather than
+       corrected: only the person who paid it knows which figure is right. */
+    if (splitRows) {
+      const problems = splitProblems(splitRows, f.amount ?? 0);
+      if (problems.length) {
+        toast.error(problems[0].message, { duration: 8000 });
+        return;
+      }
+    }
+    /* Same rule as a receipt: with nothing pre-selected, an unanswered
+       question must be asked rather than answered with a default. */
+    if (!splitRows && !f.paymentMode) {
+      toast.error("Choose how this was paid — Cash or Bank");
+      return;
+    }
+    if (!splitRows && f.paymentMode === "bank" && !f.bankId) {
       toast.error("Select which bank account this was paid from");
       return;
     }
@@ -490,12 +527,23 @@ function ExpenseDialog({
     // Editing: reverse the old bank-account effect first, before applying
     // the new one below — handles both "same account, new amount" and
     // "switched to a different account" correctly.
-    if (expense?.paymentMode === "bank" && expense.bankId && BankRepo.get(expense.bankId)) {
-      BankRepo.adjustFieldBatched(batch, expense.bankId, "balance", expense.amount);
+    if (expense) {
+      for (const [bankId, amount] of bankParts(expense)) {
+        if (!BankRepo.get(bankId)) continue;
+        BankRepo.adjustFieldBatched(batch, bankId, "balance", amount);
+      }
     }
-    // Money paid out of the selected bank account for this (new) expense.
-    if (f.paymentMode === "bank" && f.bankId) {
-      BankRepo.adjustFieldBatched(batch, f.bankId, "balance", -f.amount);
+    /* Money paid out of every account this expense names. Read through the
+       same accessor as everything else, so a single-mode expense produces
+       exactly the one adjustment it always did. */
+    const attribution = {
+      amount: f.amount ?? 0,
+      paymentMode: f.paymentMode ?? "cash",
+      bankId: f.paymentMode === "bank" ? f.bankId : undefined,
+      splits: splitRows?.length ? splitRows : undefined,
+    };
+    for (const [bankId, amount] of bankParts(attribution)) {
+      BankRepo.adjustFieldBatched(batch, bankId, "balance", -amount);
     }
 
     // f.payeeId is only trusted if it was set by an actual pick from the
@@ -516,7 +564,13 @@ function ExpenseDialog({
 
     const record: Partial<Expense> = {
       ...f,
-      bankId: f.paymentMode === "bank" ? f.bankId : undefined,
+      /* For a split expense the rows ARE the attribution and the legacy pair
+         is left empty, so there is one answer for where the money came from.
+         paymentMode keeps the largest part, so lists still say something
+         true about it. */
+      paymentMode: splitRows?.length ? largestSplitMode(splitRows) : f.paymentMode,
+      bankId: splitRows?.length ? undefined : f.paymentMode === "bank" ? f.bankId : undefined,
+      splits: splitRows?.length ? splitRows : undefined,
       payeeId,
       payeeName,
     };
@@ -592,10 +646,14 @@ function ExpenseDialog({
               className="h-8 px-3 border rounded-md bg-background focus:border-primary focus:ring-2 focus:ring-ring/20 outline-none text-sm"
             />
             {payeeOpen && payeeSuggests.length > 0 && (
-              <div className="absolute z-20 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-elevated max-h-56 overflow-auto">
+              <div
+                ref={payeeListRef}
+                className="absolute z-20 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-elevated max-h-56 overflow-auto"
+              >
                 {payeeSuggests.map((p, i) => (
                   <div
                     key={p.id}
+                    data-opt={i}
                     onMouseDown={(ev) => {
                       ev.preventDefault();
                       selectPayee(p);
@@ -628,7 +686,7 @@ function ExpenseDialog({
             <span className="text-muted-foreground font-medium">Payment Mode</span>
             <div className="flex items-center h-8">
               <ModePills
-                value={f.paymentMode ?? "cash"}
+                value={f.paymentMode}
                 onChange={(m) => {
                   setF({ ...f, paymentMode: m, bankId: m === "bank" ? f.bankId : undefined });
                 }}
@@ -636,7 +694,45 @@ function ExpenseDialog({
               />
             </div>
           </label>
-          {f.paymentMode === "bank" && (
+          {(f.amount ?? 0) > 0 && !splitRows && (
+            <button
+              type="button"
+              onClick={() =>
+                setSplitRows([
+                  {
+                    mode: f.paymentMode ?? "cash",
+                    amount: f.amount ?? 0,
+                    bankId: f.paymentMode === "bank" ? f.bankId : undefined,
+                  },
+                ])
+              }
+              className="self-start text-[11px] font-medium text-primary hover:underline"
+            >
+              Split across cash and bank
+            </button>
+          )}
+          {splitRows && (
+            <div className="flex flex-col gap-1 text-[12px]">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-semibold text-gray-600">How it was paid</span>
+                <button
+                  type="button"
+                  onClick={() => setSplitRows(null)}
+                  className="text-[11px] text-gray-500 hover:underline"
+                >
+                  Back to one payment
+                </button>
+              </div>
+              <SplitPaymentRows
+                rows={splitRows}
+                onChange={setSplitRows}
+                total={f.amount ?? 0}
+                banks={banks}
+                label="Amount paid"
+              />
+            </div>
+          )}
+          {!splitRows && f.paymentMode === "bank" && (
             <div className="relative flex flex-col gap-1 text-[12px]">
               <span className="text-muted-foreground font-medium">Bank Account *</span>
               <input
@@ -667,10 +763,14 @@ function ExpenseDialog({
                 className="h-8 px-3 border rounded-md bg-background focus:border-primary focus:ring-2 focus:ring-ring/20 outline-none text-sm"
               />
               {bankOpen && bankSuggests.length > 0 && (
-                <div className="absolute z-20 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-elevated max-h-56 overflow-auto">
+                <div
+                  ref={bankListRef}
+                  className="absolute z-20 top-full left-0 right-0 mt-1 border rounded-md bg-popover shadow-elevated max-h-56 overflow-auto"
+                >
                   {bankSuggests.map((b, i) => (
                     <div
                       key={b.id}
+                      data-opt={i}
                       onMouseDown={(e) => {
                         e.preventDefault();
                         selectBank(b);

@@ -22,6 +22,7 @@ import {
   spreadFifo,
 } from "@/lib/ledger";
 import type {
+  PaymentSplit,
   StockAdjustment,
   BankTxn,
   CashAdjustment,
@@ -96,6 +97,37 @@ import {
   purposeLabel,
   totalsByPurpose,
 } from "@/lib/cashPurpose";
+import {
+  splitsOf,
+  cashPart,
+  bankParts,
+  unassignedPart,
+  splitProblems,
+  describePayment,
+  largestSplitMode,
+} from "@/lib/paymentSplit";
+import { readFileSync } from "node:fs";
+import { ledgerColumns } from "@/lib/ledger";
+import {
+  classifySendFailure,
+  isDue,
+  needsAttention,
+  retryDelayMs,
+  queuedMessage,
+  MAX_ATTEMPTS,
+  CLAIM_STALE_MS,
+  type OutboxItem,
+} from "@/lib/outbox";
+import { popupRect } from "@/lib/popupRect";
+import {
+  deriveLinkState,
+  linkSeverity,
+  needsScan,
+  linkHeadline,
+  linkAdvice,
+  sinceLabel,
+  LINK_GRACE_MS,
+} from "@/lib/whatsappLink";
 
 let passed = 0,
   failed = 0;
@@ -5040,6 +5072,1671 @@ console.log(`\n═════════════════════�
   assert(
     planSaleSerials(wrong, null, itemOf).update[0]?.id === "u-belongs-to-cable",
     "T50: which is why the FORM clears them on a change rather than the plan guessing",
+  );
+}
+
+/* ═══ TEST S1: splits describe today's documents without changing them ══
+   The seam has one job before anything can create a split: report, for every
+   document that already exists, exactly the attribution the current readers
+   compute. If it disagrees with them by a rupee, routing them through it
+   moves money on screens the shop is using right now. */
+{
+  const cashBill = { paid: 1000, paymentMode: "cash" } as unknown as Invoice;
+  assert(splitsOf(cashBill).length === 1, "S1: a cash bill is one row");
+  assert(cashPart(cashBill) === 1000, "S1: and all of it is in the drawer");
+  assert(bankParts(cashBill).size === 0, "S1: with no account involved");
+
+  /* A bank bill reports bankPaidAmount, NOT paid. They differ whenever a
+     receipt was allocated to this invoice afterwards, and the bank ledger has
+     always used the smaller figure — reporting paid here would credit the
+     account with money that arrived as a separate Payment. */
+  const bankBill = {
+    paid: 5000,
+    paymentMode: "bank",
+    bankId: "B1",
+    bankPaidAmount: 3000,
+  } as unknown as Invoice;
+  assert(bankParts(bankBill).get("B1") === 3000, "S1: a bank bill reports what it attributed");
+  assert(
+    cashPart(bankBill) === 0,
+    "S1: and nothing to cash — the rest of paid came from a Payment with its own mode",
+  );
+
+  // Credit is the absence of payment, not a way of paying.
+  assert(
+    splitsOf({ paid: 0, paymentMode: "credit" } as unknown as Invoice).length === 0,
+    "S1: a credit bill attributes nothing",
+  );
+  assert(
+    splitsOf({ paid: 0, paymentMode: "cash" } as unknown as Invoice).length === 0,
+    "S1: nor does an unpaid one, whatever mode it names",
+  );
+
+  /* upi and cheque name no account. That is a pre-existing wart the daybook
+     already buckets, and it must stay visible rather than being quietly
+     credited to some account it never reached. */
+  const upi = { paid: 700, paymentMode: "upi" } as unknown as Invoice;
+  assert(bankParts(upi).size === 0, "S1: unassigned money is not credited to an account");
+  assert(cashPart(upi) === 0, "S1: nor counted as cash");
+  assert(unassignedPart(upi) === 700, "S1: it is reported as unassigned, which is the truth");
+
+  // Payments and expenses use different field names for the same idea.
+  assert(
+    cashPart({ amount: 250, mode: "cash" } as unknown as Payment) === 250,
+    "S1: a Payment reads the same way",
+  );
+  assert(
+    bankParts({ amount: 400, paymentMode: "bank", bankId: "B2" } as unknown as Expense).get(
+      "B2",
+    ) === 400,
+    "S1: and so does an Expense",
+  );
+
+  /* Money that reached the document LATER belongs to the Payment that
+     brought it, which carries its own mode and is counted there. A legacy
+     document reports its amount less that; stored rows are already the
+     document's own portion and must not be reduced a second time. Getting
+     either direction wrong is a wrong number on the Cash page. */
+  assert(
+    cashPart({ paid: 1000, paymentMode: "cash" } as unknown as Invoice, 400) === 600,
+    "S1: a legacy row reports only what the document itself settled",
+  );
+  assert(
+    cashPart({ paid: 1000, paymentMode: "cash" } as unknown as Invoice, 1000) === 0,
+    "S1: and nothing at all once every rupee of it arrived later",
+  );
+  assert(
+    bankParts(bankBill, 2000).get("B1") === 3000,
+    "S1: a legacy bank row is already the at-billing snapshot, so it is NOT reduced again",
+  );
+
+  // Stored rows win, and are the only case with more than one.
+  const split = {
+    paid: 10000,
+    paymentMode: "cash",
+    paidSplits: [
+      { mode: "cash", amount: 4000 },
+      { mode: "bank", amount: 6000, bankId: "B1" },
+    ],
+  } as unknown as Invoice;
+  assert(cashPart(split) === 4000, "S1: a split bill reports its cash row");
+  assert(
+    cashPart(split, 2500) === 4000,
+    "S1: and stored rows are the document's own portion already — never reduced twice",
+  );
+  assert(bankParts(split).get("B1") === 6000, "S1: and its bank row");
+  assert(
+    cashPart(split) + (bankParts(split).get("B1") ?? 0) === split.paid,
+    "S1: and together they are the whole of what was paid",
+  );
+}
+
+/* ═══ TEST S2: a document may not disagree with itself ══════════════════ */
+{
+  const ok = [
+    { mode: "cash", amount: 4000 },
+    { mode: "bank", amount: 6000, bankId: "B1" },
+  ] as PaymentSplit[];
+  assert(splitProblems(ok, 10000).length === 0, "S2: rows that add up are accepted");
+  assert(
+    splitProblems(ok, 9500).some((p) => p.message.includes("add up")),
+    "S2: rows that do not add up to the amount are refused, and say both figures",
+  );
+  /* No assertion about sub-paisa dust: splitProblems rounds BOTH sides to
+     paise before comparing, so dust cannot reach the comparison at all and
+     any test of the tolerance passes with the tolerance removed. The
+     tolerance stays as belt-and-braces should the rounding ever go, but
+     claiming it is covered would be claiming coverage that does not exist. */
+  assert(
+    splitProblems([{ mode: "bank", amount: 500 }] as PaymentSplit[], 500).some((p) =>
+      p.message.includes("which account"),
+    ),
+    "S2: bank money must say which account it went to",
+  );
+  assert(
+    splitProblems([{ mode: "cash", amount: 0 }] as PaymentSplit[], 0).some((p) =>
+      p.message.includes("enter an amount"),
+    ),
+    "S2: a row with no amount is not a row",
+  );
+  assert(
+    splitProblems([{ mode: "credit", amount: 100 }] as PaymentSplit[], 100).some((p) =>
+      p.message.includes("credit"),
+    ),
+    "S2: credit is what is left unpaid, not a way of paying",
+  );
+  assert(splitProblems([], 1000).length === 0, "S2: no rows at all is a single-mode document");
+}
+
+/* ═══ TEST S3: a part-cash, part-bank bill reaches BOTH places ══════════
+   The reported case: ₹10,000 taken as ₹4,000 cash and ₹6,000 into HDFC.
+
+   The dangerous half is cash. modeFlows used to drop any bill that touched a
+   bank, so the ₹6,000 was booked to HDFC correctly and the ₹4,000 simply
+   stopped existing — which at the counter reads as the till being short
+   rather than as a bug in a report. */
+{
+  const splitBill = {
+    id: "SPL1",
+    number: "INV-SPL",
+    date: "2026-06-01",
+    partyId: "P1",
+    partyName: "A Customer",
+    lineItems: [],
+    total: 10000,
+    paid: 10000,
+    paymentMode: "cash",
+    paidSplits: [
+      { mode: "cash", amount: 4000 },
+      { mode: "bank", amount: 6000, bankId: "B1" },
+    ],
+  } as unknown as Invoice;
+
+  const cash = cashFlows([splitBill], [], [], [], []);
+  assert(cash.length === 1, `S3: the bill reaches the cash page — ${cash.length} entries`);
+  assert(
+    netFlow(cash) === 4000,
+    `S3: for the cash part only, not the whole bill and not nothing — ${netFlow(cash)}`,
+  );
+
+  // And the bank half is still the bank's, counted once.
+  assert(
+    bankParts(splitBill).get("B1") === 6000,
+    "S3: the bank part is attributed to the account it went into",
+  );
+  assert(
+    netFlow(modeFlows("bank", [splitBill], [], [], [])) === 0,
+    "S3: and does NOT also appear in the bank-mode flows, which would double it",
+  );
+  assert(
+    r2(netFlow(cash) + (bankParts(splitBill).get("B1") ?? 0)) === splitBill.paid,
+    "S3: the two halves account for every rupee of what was paid, exactly once",
+  );
+
+  /* The bank half must reach the ACCOUNT's own ledger, not just the
+     accessor. This is the mirror of the cash bug: read the account off the
+     document's single bankId and a split bill — which has none — shows its
+     cash correctly and its bank half nowhere at all. */
+  {
+    const bank = { id: "B1", name: "HDFC", openingBalance: 0 } as unknown as BankAccount;
+    const led = buildBankLedger(bank, {
+      sales: [splitBill],
+      purchases: [],
+      payments: [],
+      bankTxns: [],
+      expenses: [],
+    });
+    assert(
+      led.rows.some((r) => r.credit === 6000),
+      `S3: the account's own ledger shows the bank half — ${JSON.stringify(led.rows.map((r) => r.credit))}`,
+    );
+    assert(
+      r2(led.fullBalance) === 6000,
+      `S3: and its balance is that and no more — ${led.fullBalance}`,
+    );
+    const other = buildBankLedger({ ...bank, id: "B2" } as unknown as BankAccount, {
+      sales: [splitBill],
+      purchases: [],
+      payments: [],
+      bankTxns: [],
+      expenses: [],
+    });
+    assert(
+      r2(other.fullBalance) === 0,
+      "S3: while an account the money never reached shows nothing",
+    );
+  }
+
+  /* A purchase settled the same way takes money OUT of both. */
+  const splitPurchase = {
+    ...splitBill,
+    id: "SPL2",
+    number: "PUR-SPL",
+  } as unknown as Invoice;
+  assert(
+    netFlow(cashFlows([], [splitPurchase], [], [], [])) === -4000,
+    "S3: a purchase settled part-cash takes only the cash part out of the drawer",
+  );
+
+  /* An ordinary single-mode bill is unaffected — the whole point of the
+     accessor is that nothing existing moved. */
+  const plainCash = {
+    ...splitBill,
+    id: "SPL3",
+    paidSplits: undefined,
+    paid: 800,
+    paymentMode: "cash",
+  } as unknown as Invoice;
+  assert(
+    netFlow(cashFlows([plainCash], [], [], [], [])) === 800,
+    "S3: a plain cash bill still counts in full",
+  );
+  const plainBank = {
+    ...splitBill,
+    id: "SPL4",
+    paidSplits: undefined,
+    paid: 900,
+    paymentMode: "bank",
+    bankId: "B1",
+    bankPaidAmount: 900,
+  } as unknown as Invoice;
+  assert(
+    netFlow(cashFlows([plainBank], [], [], [], [])) === 0,
+    "S3: and a plain bank bill still contributes nothing to cash",
+  );
+}
+
+/* ═══ TEST S4: how a document says it was paid ══════════════════════════
+   A bill printing "Cash" when half of it went to a bank is the original
+   complaint restated. Asserted on the exact string, because the printed page
+   contains the total and every other figure too — "does the page mention
+   ₹1,000" cannot tell a payment label from an invoice line. */
+{
+  const named = (id: string) => (id === "B1" ? "HDFC Current" : undefined);
+
+  const one = { paid: 1000, paymentMode: "cash" } as unknown as Invoice;
+  assert(
+    describePayment(one, named) === "Cash",
+    `S4: a single-mode bill says just the mode — "${describePayment(one, named)}"`,
+  );
+
+  const bank = {
+    paid: 1000,
+    paymentMode: "bank",
+    bankId: "B1",
+    bankPaidAmount: 1000,
+  } as unknown as Invoice;
+  assert(
+    describePayment(bank, named) === "HDFC Current",
+    `S4: and a bank one names the ACCOUNT rather than the word Bank — "${describePayment(bank, named)}"`,
+  );
+  assert(
+    describePayment(bank) === "Bank",
+    "S4: falling back to the mode when no name is available",
+  );
+
+  const split = {
+    paid: 1000,
+    paymentMode: "cash",
+    paidSplits: [
+      { mode: "cash", amount: 400 },
+      { mode: "bank", amount: 600, bankId: "B1" },
+    ],
+  } as unknown as Invoice;
+  assert(
+    describePayment(split, named) === "Cash ₹400.00 + HDFC Current ₹600.00",
+    `S4: a split says both parts and how much each was — "${describePayment(split, named)}"`,
+  );
+
+  assert(
+    describePayment({ paid: 0, paymentMode: "credit" } as unknown as Invoice, named) === "Credit",
+    "S4: a credit bill still reads as credit",
+  );
+  /* A new bill starts on Cash so that tabbing lands there, which means an
+     unpaid bill can have the Cash pill lit. It is not a cash sale, and saying
+     "Cash" on the customer's copy of a bill nobody paid is a small lie that
+     becomes an argument later. */
+  assert(
+    describePayment({ paid: 0, paymentMode: "cash" } as unknown as Invoice, named) === "Unpaid",
+    `S4: a bill with the Cash pill lit and nothing received reads as Unpaid — "${describePayment({ paid: 0, paymentMode: "cash" } as unknown as Invoice, named)}"`,
+  );
+  assert(
+    describePayment({ paid: 0, paymentMode: "bank", bankId: "B1" } as unknown as Invoice, named) ===
+      "Unpaid",
+    "S4: and so does an unpaid one pointed at an account",
+  );
+}
+
+/* ═══ TEST S5: a split reaches the account's own passbook ═══════════════
+   Found by sweeping the rest of the app rather than by a failing test, and
+   the worst of the lot. Step 5 moved the account's stored balance for a
+   split receipt; the passbook still filtered on the document's bankId, which
+   a split does not have. So the balance moved and the passbook did not show
+   why — and bankRepair RE-DERIVES balances from exactly these entries, so the
+   next repair would have "corrected" the balance back down and taken the
+   money with it. */
+{
+  const bank = { id: "B1", name: "HDFC", openingBalance: 0 } as unknown as BankAccount;
+  const splitReceipt = {
+    id: "PS1",
+    date: "2026-06-01",
+    partyId: "P1",
+    partyName: "A Customer",
+    type: "in",
+    amount: 1000,
+    mode: "cash",
+    splits: [
+      { mode: "cash", amount: 400 },
+      { mode: "bank", amount: 600, bankId: "B1" },
+    ],
+  } as unknown as Payment;
+  const splitExpense = {
+    id: "ES1",
+    date: "2026-06-02",
+    category: "Rent",
+    amount: 500,
+    paymentMode: "cash",
+    splits: [
+      { mode: "cash", amount: 200 },
+      { mode: "bank", amount: 300, bankId: "B1" },
+    ],
+  } as unknown as Expense;
+
+  const led = buildBankLedger(bank, {
+    sales: [],
+    purchases: [],
+    payments: [splitReceipt],
+    bankTxns: [],
+    expenses: [splitExpense],
+  });
+  assert(
+    led.rows.some((r) => r.credit === 600),
+    `S5: a part-bank receipt shows in the passbook — ${JSON.stringify(led.rows.map((r) => [r.type, r.debit, r.credit]))}`,
+  );
+  assert(
+    led.rows.some((r) => r.debit === 300),
+    "S5: and so does a part-bank expense",
+  );
+  assert(
+    r2(led.fullBalance) === 300,
+    `S5: leaving the balance the passbook itself explains — 600 in, 300 out — ${led.fullBalance}`,
+  );
+  /* The property that makes the repair safe: what the passbook says and what
+     the account holds must be the same number, or a repair "fixes" one of
+     them into being wrong. */
+  const cashSideOnly = cashPart(splitReceipt) - cashPart(splitExpense);
+  assert(
+    r2(cashSideOnly) === 200,
+    `S5: and the cash halves stay in the drawer, not on the account — ${cashSideOnly}`,
+  );
+}
+
+/* ═══ TEST S6: a split changes no NUMBER a party is shown ═══════════════
+   Asked directly what "the party ledger is unaffected by design" means, and
+   it deserves an assertion rather than a reading of the code — that same
+   reasoning is what missed the passbook.
+
+   The claim: a split decides which of the SHOP's accounts holds the money.
+   It never changes what the party owes. So the same bill, settled the same
+   total, must produce identical figures whether it was taken one way or two.
+   If this ever fails, the split work is wrong.
+
+   This compared whole rows byte-for-byte until the shop asked to be told
+   which account each payment landed in — "which bank, cash, which — nothing
+   mentioned anywhere". Rows now carry `settledBy` for exactly that, and it
+   differs between a one-way and a split bill BECAUSE that is the difference
+   being reported. So the comparison drops that one display-only field and
+   keeps every figure, which is what the invariant was always about: the
+   party's money, not the shop's filing. */
+{
+  const party = { id: "PX", openingBalance: 0 };
+  const bill = (id: string, paidSplits?: unknown) =>
+    ({
+      id,
+      number: "INV-" + id,
+      date: "2026-06-01",
+      partyId: "PX",
+      partyName: "Someone",
+      lineItems: [],
+      total: 1000,
+      paid: 1000,
+      paymentMode: "cash",
+      createdAt: "2026-06-01T09:00:00Z",
+      ...(paidSplits ? { paidSplits } : {}),
+    }) as unknown as Invoice;
+
+  const oneWay = buildPartyStatement(party, {
+    sales: [bill("A")],
+    purchases: [],
+    saleReturns: [],
+    purchaseReturns: [],
+    payments: [],
+  });
+  const twoWays = buildPartyStatement(party, {
+    sales: [
+      bill("A", [
+        { mode: "cash", amount: 400 },
+        { mode: "bank", amount: 600, bankId: "B1" },
+      ]),
+    ],
+    purchases: [],
+    saleReturns: [],
+    purchaseReturns: [],
+    payments: [],
+  });
+
+  assert(
+    oneWay.fullBalance === twoWays.fullBalance,
+    `S6: splitting a bill does not move the party's balance — ${oneWay.fullBalance} vs ${twoWays.fullBalance}`,
+  );
+  /** Everything except how the shop filed it. */
+  const figuresOf = (rows: typeof oneWay.rows) =>
+    JSON.stringify(rows.map(({ settledBy: _ignored, ...rest }) => rest));
+  assert(
+    figuresOf(oneWay.rows) === figuresOf(twoWays.rows),
+    "S6: nor any figure on their statement — a split is about the shop's accounts, not the party",
+  );
+  /* And the new field is genuinely display-only: it is the ONLY difference
+     between the two statements. Asserted so that a future change which
+     smuggles a calculation into it fails here rather than quietly. */
+  assert(
+    JSON.stringify(oneWay.rows) !== JSON.stringify(twoWays.rows),
+    "S6: while the split IS reported — the shop can see which account took it",
+  );
+  assert(
+    twoWays.fullBalance === 0,
+    `S6: and a bill paid in full leaves them owing nothing, however it was paid — ${twoWays.fullBalance}`,
+  );
+}
+
+/* ═══ TEST S7: re-saving a split must not re-attribute the money ════════
+   The bug this guards, found by asking whether the feature was really
+   finished rather than by any test failing: the payment and expense dialogs
+   never loaded an existing record's rows, so reopening a split showed it as
+   single-mode. Saving then reversed the rows off their accounts and put the
+   whole amount under one mode. The money did not vanish, which is worse —
+   it moved somewhere nobody asked it to.
+
+   Asserted on the property that makes a re-save safe: reversing what a
+   document attributed and re-applying it must leave every account where it
+   started. If the rows are lost in between, this stops being true. */
+{
+  const rows = [
+    { mode: "cash", amount: 400 },
+    { mode: "bank", amount: 600, bankId: "B1" },
+  ] as PaymentSplit[];
+  const saved = { amount: 1000, mode: "cash", splits: rows } as unknown as Payment;
+
+  // What the dialog reloads, and what it would save back unchanged.
+  const reloaded = saved.splits?.length ? saved.splits : null;
+  assert(!!reloaded, "S7: reopening a split receipt finds its rows to show");
+
+  const resaved = {
+    amount: 1000,
+    mode: reloaded ? largestSplitMode(reloaded) : "cash",
+    splits: reloaded ?? undefined,
+  } as unknown as Payment;
+
+  const before = bankParts(saved);
+  const after = bankParts(resaved);
+  assert(
+    (after.get("B1") ?? 0) === (before.get("B1") ?? 0),
+    `S7: re-saving it untouched leaves the account exactly where it was — ${before.get("B1")} then ${after.get("B1")}`,
+  );
+  assert(
+    cashPart(resaved) === cashPart(saved),
+    "S7: and the drawer too, instead of swallowing the bank half",
+  );
+
+  /* The failure it replaces, stated so the assertion above cannot be read as
+     trivia: a dialog that dropped the rows would re-save this as one mode. */
+  const dropped = { amount: 1000, mode: "cash", splits: undefined } as unknown as Payment;
+  assert(
+    cashPart(dropped) === 1000 && (bankParts(dropped).get("B1") ?? 0) === 0,
+    "S7: losing the rows would put the whole receipt in cash and empty the account",
+  );
+}
+
+/* ═══════ TEST W: the WhatsApp link, said in a way a shop can act on ═══════
+   The bridge reports three states and a shop needs six. Everything below is
+   about the three it cannot report — and the two boundaries that decide
+   whether the shop is told "wait" or "go and scan", which are the entire
+   value of the feature and are trivially inverted. */
+{
+  const T0 = Date.parse("2026-09-09T10:00:00Z");
+  const fresh = { everConnected: false };
+  const used = { everConnected: true, lastConnectedAt: "2026-09-07T10:00:00Z" };
+
+  /* ── Connected outranks everything, including a stale unsettled clock ── */
+  assert(
+    deriveLinkState({ status: "connected" }, { everConnected: true, unsettledSince: 0 }, T0) ===
+      "connected",
+    "W1: a live socket reads connected even if the fault clock was left running",
+  );
+  assert(linkSeverity("connected") === "ok", "W1: and it is the only green state");
+  assert(
+    linkSeverity("dropped") === "bad" &&
+      linkSeverity("never_linked") === "bad" &&
+      linkSeverity("unreachable") === "bad" &&
+      linkSeverity("scan_needed") === "bad",
+    "W1: every state that cannot send a bill shows red",
+  );
+  assert(
+    linkSeverity("starting") === "busy",
+    "W1: except a normal start, which must not train the shop to ignore red",
+  );
+
+  /* ── The grace period, at both sides of the line ────────────────────── */
+  const waitingFor = (ms: number, h: { everConnected: boolean }) =>
+    deriveLinkState({ status: "waiting" }, { ...h, unsettledSince: T0 - ms }, T0);
+
+  assert(
+    waitingFor(LINK_GRACE_MS - 1000, used) === "starting",
+    "W2: one second inside the grace period is still just starting up",
+  );
+  assert(
+    waitingFor(LINK_GRACE_MS + 1000, used) === "dropped",
+    "W2: one second past it is a fault the shop is told about",
+  );
+  assert(
+    deriveLinkState({ status: "waiting" }, { everConnected: true }, T0) === "starting",
+    "W2: a first reading with no fault clock yet is treated as a start, not a fault",
+  );
+
+  /* ── The same wire response, opposite messages ──────────────────────── */
+  assert(
+    waitingFor(LINK_GRACE_MS + 1000, fresh) === "never_linked",
+    "W3: identical bytes mean 'not set up' for a shop that never linked",
+  );
+  assert(
+    waitingFor(LINK_GRACE_MS + 1000, used) === "dropped",
+    "W3: and 'it broke' for one that had it working",
+  );
+  assert(
+    linkHeadline("scan_needed", fresh) !== linkHeadline("scan_needed", used),
+    "W3: a first link and a relink are not described with the same sentence",
+  );
+
+  /* ── A QR is an action, so it outranks the wait ─────────────────────── */
+  assert(
+    deriveLinkState({ status: "qr" }, { ...used, unsettledSince: T0 - 1000 }, T0) === "scan_needed",
+    "W4: a QR one second old is offered immediately, not hidden behind the grace period",
+  );
+
+  /* ── An unreachable service is a different fault from a dead socket ─── */
+  assert(
+    deriveLinkState({ status: null }, { ...used, unsettledSince: T0 - 1000 }, T0) === "starting",
+    "W5: one missed poll during a cold start does not go red",
+  );
+  assert(
+    deriveLinkState({ status: null }, { ...used, unsettledSince: T0 - 60_000 }, T0) ===
+      "unreachable",
+    "W5: a service that keeps not answering is named as the service, not as WhatsApp",
+  );
+  assert(
+    linkHeadline("unreachable", used) !== linkHeadline("dropped", used),
+    "W5: because the two need different people to fix them",
+  );
+
+  /* ── Staff are never handed work only an owner can do ───────────────── */
+  for (const st of ["scan_needed", "dropped", "never_linked", "unreachable"] as const) {
+    assert(
+      !/scan/i.test(linkAdvice(st, used, false)),
+      "W6: staff are never told to scan a QR they will never be shown — " + st,
+    );
+    assert(
+      needsScan(st) === (st !== "unreachable"),
+      "W6: only a link fault is fixed by scanning; an unreachable service is not — " + st,
+    );
+  }
+  assert(
+    /owner/i.test(linkAdvice("dropped", used, false)),
+    "W6: they are told who can fix it instead",
+  );
+  assert(
+    /Linked Devices/i.test(linkAdvice("scan_needed", used, true)),
+    "W6: while the owner gets the actual steps on the phone",
+  );
+  assert(
+    !needsScan("connected") && !needsScan("starting"),
+    "W6: and nothing is asked of anyone while it is working",
+  );
+
+  /* ── "since Tuesday" — the phrase that says how many bills went unsent ─ */
+  const H = 3_600_000;
+  assert(sinceLabel(undefined, T0) === undefined, "W7: a shop that never linked has no since");
+  assert(
+    sinceLabel(new Date(T0 - 30 * 60_000).toISOString(), T0) === "Last connected 30 minutes ago",
+    "W7: minutes while it is still this shift",
+  );
+  assert(
+    sinceLabel(new Date(T0 - 5 * H).toISOString(), T0) === "Last connected 5 hours ago",
+    "W7: hours after that",
+  );
+  assert(
+    sinceLabel(new Date(T0 - 50 * H).toISOString(), T0) === "Last connected 2 days ago",
+    "W7: and days once it has been broken overnight",
+  );
+  assert(
+    sinceLabel(new Date(T0 - 40 * 24 * H).toISOString(), T0) ===
+      "Last connected more than a week ago",
+    "W7: past a week it stops implying a precision this record does not have",
+  );
+  assert(
+    sinceLabel(new Date(T0 + H).toISOString(), T0) === undefined,
+    "W7: a clock skewed into the future says nothing rather than something absurd",
+  );
+}
+
+/* ═══════ TEST W8: the QR must never reach a staff browser ═══════
+   Read from the source rather than exercised, because the thing being
+   protected is an absence — a field that must not be in a response — and the
+   way it comes back is a refactor that "simplifies" the explicit field list
+   into a spread. A test that renders a screen would not notice. */
+{
+  const src = readFileSync(process.cwd() + "/src/lib/whatsappAdmin.ts", "utf8");
+
+  const staffAt = src.indexOf("export const getWhatsAppLinkStateServerFn");
+  assert(
+    staffAt !== -1,
+    "W8: the staff-facing reader exists (renamed? this check just went blind)",
+  );
+
+  // To the end of that declaration, not to the end of the file.
+  const after = src.slice(staffAt);
+  const end = after.indexOf("\n  });");
+  assert(end !== -1, "W8: its handler body could be delimited");
+  const body = after.slice(0, end);
+
+  assert(body.includes("requireActiveUser"), "W8: anyone who may send a bill may read the status");
+  assert(
+    !body.includes("requireOwner"),
+    "W8: but it is not quietly narrowed back to owners, which would break the header for staff",
+  );
+  assert(
+    !/\bqr\s*:/.test(body),
+    "W8: and it never returns the QR itself — that code IS a login to the shop's WhatsApp",
+  );
+  assert(
+    !/\.\.\.\s*\w+/.test(body),
+    "W8: fields are listed one by one, so a new secret on the service stays behind by default",
+  );
+
+  const ownerAt = src.indexOf("export const getWhatsAppStatusServerFn");
+  assert(ownerAt !== -1, "W8: the owner's reader is still there");
+  const ownerBody = src.slice(ownerAt, ownerAt + src.slice(ownerAt).indexOf("\n  });"));
+  assert(
+    ownerBody.includes("requireOwner"),
+    "W8: and it is the one that stayed owner-only, since it is the one carrying the QR",
+  );
+}
+
+/* ═══════ TEST X: the outbox, and what it refuses to do on its own ═══════
+   A queue that retries everything is not resilience — it is a machine for
+   sending a customer two copies of the same invoice, and for keeping a bill
+   that can never send in a red badge until the shop stops reading badges.
+   Both refusals are asserted here. */
+{
+  const T0 = Date.parse("2026-09-09T10:00:00Z");
+  const row = (over: Partial<OutboxItem> = {}): OutboxItem => ({
+    id: "q1",
+    label: "INV-0012",
+    phone: "9876543210",
+    message: "hi",
+    fileName: "INV-0012.pdf",
+    html: "<html></html>",
+    landscape: false,
+    queuedAt: new Date(T0 - 3_600_000).toISOString(),
+    attempts: 0,
+    auto: true,
+    ...over,
+  });
+
+  /* ── Nothing that will fail forever goes in the queue ────────────────── */
+  for (const m of [
+    "This party has no phone number saved — add one to send via WhatsApp.",
+    "Not signed in",
+    "WhatsApp service isn't configured yet — set WHATSAPP_SERVICE_URL and ...",
+    "Only the business owner can do this.",
+    "Your account isn't active — ask the business owner to check your access.",
+  ]) {
+    assert(
+      classifySendFailure(m, false) === "permanent",
+      "X1: a fault in the request is never queued to retry forever — " + m.slice(0, 34),
+    );
+    assert(
+      classifySendFailure(m, true) === "permanent",
+      "X1: and the link's state does not change that — " + m.slice(0, 34),
+    );
+  }
+
+  /* ── Only a failure we can prove is retried by itself ────────────────── */
+  assert(
+    classifySendFailure("Could not send WhatsApp message", false) === "offline",
+    "X2: with the link already down, the message certainly did not go",
+  );
+  assert(
+    classifySendFailure("Session not connected", true) === "offline",
+    "X2: and the service saying so is just as good a proof",
+  );
+  assert(
+    classifySendFailure("socket hang up", true) === "uncertain",
+    "X3: but an unexplained failure on a live link might have sent — it is NOT offline",
+  );
+  assert(
+    !isDue(row({ auto: false }), T0 + 86_400_000),
+    "X3: and an uncertain one is never sent again by a timer, however long it waits",
+  );
+  assert(needsAttention(row({ auto: false })), "X3: it waits for a person instead, and says so");
+
+  /* ── Backoff counts from the last attempt, not from queueing ─────────── */
+  assert(
+    retryDelayMs(0) < retryDelayMs(3) && retryDelayMs(3) < retryDelayMs(6),
+    "X4: waits grow with each failure",
+  );
+  assert(retryDelayMs(99) === 1_800_000, "X4: and stop growing at half an hour");
+  {
+    const tried = row({ attempts: 3, lastAttemptAt: new Date(T0 - 1000).toISOString() });
+    assert(
+      !isDue(tried, T0),
+      "X4: a row tried a second ago is not due again, however old the queue entry is",
+    );
+    assert(
+      isDue({ ...tried, lastAttemptAt: new Date(T0 - retryDelayMs(3) - 1000).toISOString() }, T0),
+      "X4: and is due once its own wait has passed",
+    );
+  }
+
+  /* ── Two tills must not send the same bill twice ─────────────────────── */
+  assert(
+    !isDue(row({ sendingSince: T0 - 1000 }), T0),
+    "X5: a row another tab is already sending is left alone",
+  );
+  assert(
+    isDue(row({ sendingSince: T0 - CLAIM_STALE_MS - 1000 }), T0),
+    "X5: unless that tab died holding it, or the row would be stuck forever",
+  );
+
+  /* ── Giving up hands over to a person; it never discards the bill ────── */
+  assert(
+    !isDue(row({ attempts: MAX_ATTEMPTS }), T0),
+    "X6: after the last attempt the timer stops trying",
+  );
+  assert(
+    needsAttention(row({ attempts: MAX_ATTEMPTS })),
+    "X6: and the row is raised for a person rather than quietly dropped",
+  );
+  assert(
+    !needsAttention(row({ attempts: MAX_ATTEMPTS - 1 })),
+    "X6: while it still has attempts left, nobody is bothered",
+  );
+
+  /* ── The counter is told which of the two situations it is ───────────── */
+  assert(
+    queuedMessage("offline", "this invoice") !== queuedMessage("uncertain", "this invoice"),
+    "X7: 'it will send itself' and 'check whether it sent' are not the same sentence",
+  );
+  assert(
+    /queued|will send/i.test(queuedMessage("offline", "this invoice")),
+    "X7: the offline one promises it will go",
+  );
+  assert(
+    !/will send on its own/i.test(queuedMessage("uncertain", "this invoice")),
+    "X7: the uncertain one promises nothing of the sort",
+  );
+}
+
+/* ═══════ TEST Y: the two rules at the send seam ═══════
+   Read from the source, because both are about ORDER and about an exception
+   NOT being swallowed — neither shows up in the value a function returns, and
+   both are exactly the kind of thing a later tidy-up inverts while every
+   other test stays green. */
+{
+  const src = readFileSync(process.cwd() + "/src/lib/whatsappSend.ts", "utf8");
+
+  /* ── The link is read BEFORE the attempt ───────────────────────────────
+     A failed send drives the indicator red. Read it afterwards and the
+     answer is always "it was down", so every unexplained failure would be
+     filed as safe-to-retry — which is the machine for sending a customer a
+     second copy of their invoice. */
+  const readAt = src.indexOf('useWhatsAppLinkStore.getState().state === "connected"');
+  const transmitAt = src.indexOf("await transmit(");
+  assert(readAt !== -1, "Y1: the send path still reads the link state at all");
+  assert(transmitAt !== -1, "Y1: and still transmits (renamed? this check just went blind)");
+  assert(
+    readAt < transmitAt,
+    "Y1: it is read BEFORE the attempt, or every uncertain failure is misfiled as offline",
+  );
+
+  /* ── A fault in the request is never queued ──────────────────────────── */
+  assert(
+    /phase === "prepare"\)\s*throw/.test(src),
+    "Y2: a prepare-phase failure is rethrown, not put in a queue that can only fail",
+  );
+  assert(/kind === "permanent"\)\s*throw/.test(src), "Y2: and so is anything classified permanent");
+
+  /* ── Only a provable failure retries itself ──────────────────────────── */
+  assert(
+    /auto:\s*kind === "offline"/.test(src),
+    "Y3: the queue only re-sends on its own what it can prove never went",
+  );
+
+  /* ── One bill, one id, across every attempt ───────────────────────────
+     The service refuses a second send of an id it has already sent. That
+     only protects anybody if a retry arrives under the SAME id — a fresh id
+     per attempt is, from the service's side, simply a different bill, and
+     the duplicate it exists to stop goes out anyway. Two halves, both
+     needed, and both silently satisfiable-looking on their own. */
+  const mintAt = src.indexOf("const clientMessageId =");
+  assert(mintAt !== -1, "Y4: the send path mints an id for the bill");
+  assert(
+    mintAt < transmitAt,
+    "Y4: before the first attempt, so the first send and its retries share it",
+  );
+  assert(
+    /id:\s*clientMessageId,/.test(src),
+    "Y4: and the queued row is stored under that very id, not a new one",
+  );
+
+  const queue = readFileSync(process.cwd() + "/src/store/whatsappOutbox.ts", "utf8");
+  assert(
+    /clientMessageId:\s*item\.id,/.test(queue),
+    "Y4: which the queue then sends back as the id, closing the loop",
+  );
+}
+
+/* ═══════ TEST Z: a service that answered is never called unreachable ═══════
+   The bug this replaces was live for one deploy. A bridge responding in
+   under half a second was shown to the shop as "Can't reach the WhatsApp
+   service", because every failure — a rejected token, our own server
+   erroring, the bridge genuinely being down — arrived as one exception and
+   was rendered as the last of those. The fix is that the reader REPORTS an
+   unreachable bridge rather than throwing, so a throw can only mean the call
+   itself never got off the ground. Asserted from the source, because what
+   matters is the shape of the contract rather than any one value. */
+{
+  const admin = readFileSync(process.cwd() + "/src/lib/whatsappAdmin.ts", "utf8");
+  const at = admin.indexOf("export const getWhatsAppLinkStateServerFn");
+  assert(at !== -1, "Z1: the staff-facing reader exists (renamed? this check just went blind)");
+  const body = admin.slice(at, at + admin.slice(at).indexOf("\n  });"));
+
+  assert(
+    /reachable:\s*true/.test(body) && /reachable:\s*false/.test(body),
+    "Z1: it answers whether the bridge replied, rather than leaving it to an exception",
+  );
+  assert(
+    /catch\s*\(/.test(body),
+    "Z1: a bridge that fails to answer is caught here, not thrown at the browser",
+  );
+  assert(
+    /error:/.test(body),
+    "Z1: and its actual words are handed back, so the screen can say what went wrong",
+  );
+
+  const store = readFileSync(process.cwd() + "/src/store/whatsappLink.ts", "utf8");
+  assert(
+    /lean\.reachable\s*\?/.test(store),
+    "Z2: the store trusts that answer instead of inferring reachability from a throw",
+  );
+  assert(
+    /askFailed\s*=\s*true/.test(store),
+    "Z2: and a call that never got off the ground is recorded as OUR fault, separately",
+  );
+  assert(
+    !/}\s*catch\s*{\s*reading\s*=\s*{\s*status:\s*null\s*};?\s*}/.test(store),
+    "Z2: no bare catch quietly turning every fault into 'the service is down' again",
+  );
+
+  /* ── The Settings card must still be able to show a QR ────────────────
+     Gating the code on being inside the header dialog meant an owner on the
+     Settings page — where this shop has always scanned from — waited forever
+     for a QR that was sitting on the service the whole time. */
+  const ui = readFileSync(process.cwd() + "/src/components/WhatsAppLink.tsx", "utf8");
+  assert(
+    /useWatchWhileMounted\(isOwner\)/.test(ui),
+    "Z3: any panel an owner is looking at asks for the QR, not only the dialog",
+  );
+  assert(
+    /lastError/.test(ui),
+    "Z3: and whatever went wrong is put on the screen rather than kept in a variable",
+  );
+}
+
+/* ═══════ TEST M: a ledger says WHERE the money went, not only how much ═══
+   The shop's report: "payment gone and received — which bank, cash, which —
+   nothing mentioned anywhere". The statement held the answer the whole time
+   and simply never carried it out of the builder. Asserted on values rather
+   than on the rendering, because the rendering is the easy half. */
+{
+  const party = { id: "MP", openingBalance: 0 };
+  const mk = (over: Record<string, unknown>) =>
+    ({
+      id: "MPAY1",
+      createdAt: "2026-09-01T10:00:00Z",
+      date: "2026-09-01",
+      partyId: "MP",
+      partyName: "Mode Party",
+      type: "in",
+      amount: 1000,
+      ...over,
+    }) as unknown as Payment;
+
+  const bankPay = mk({ mode: "bank", bankId: "HDFC" });
+  const st = buildPartyStatement(party, {
+    sales: [],
+    purchases: [],
+    saleReturns: [],
+    purchaseReturns: [],
+    payments: [bankPay],
+  });
+  const row = st.rows.find((r) => r.type === "Payment Received");
+  assert(!!row, "M1: the receipt has a row at all");
+  assert(!!row?.settledBy, "M1: and that row carries the record the money moved through");
+  assert(
+    describePayment(row!.settledBy!, (id) => (id === "HDFC" ? "HDFC Current" : undefined)) ===
+      "HDFC Current",
+    "M1: which names the actual account, not the word 'Bank'",
+  );
+
+  /* A write-off moved no money. Labelling it with a mode would invent a
+     payment that never happened — the one way this feature could lie. */
+  const withDiscount = mk({
+    id: "MPAY2",
+    mode: "cash",
+    amount: 0,
+    allocations: [{ id: "X", number: "INV-1", amount: 0, discount: 250 }],
+  });
+  const st2 = buildPartyStatement(party, {
+    sales: [],
+    purchases: [],
+    saleReturns: [],
+    purchaseReturns: [],
+    payments: [withDiscount],
+  });
+  const off = st2.rows.find((r) => r.type === "Discount Given");
+  assert(!!off, "M2: the write-off has its own row");
+  assert(!off?.settledBy, "M2: and carries no payment mode, because no money moved");
+
+  /* An unpaid bill likewise: the pill highlighted on the form is not a
+     payment, and printing it would be a small lie that becomes an argument. */
+  const unpaid = {
+    id: "MB1",
+    createdAt: "2026-09-02T10:00:00Z",
+    number: "INV-M1",
+    date: "2026-09-02",
+    partyId: "MP",
+    partyName: "Mode Party",
+    lineItems: [],
+    total: 500,
+    paid: 0,
+    paymentMode: "cash",
+  } as unknown as Invoice;
+  const paidAtCounter = { ...unpaid, id: "MB2", number: "INV-M2", paid: 500 } as Invoice;
+  const st3 = buildPartyStatement(party, {
+    sales: [unpaid, paidAtCounter],
+    purchases: [],
+    saleReturns: [],
+    purchaseReturns: [],
+    payments: [],
+  });
+  assert(
+    !st3.rows.find((r) => r.ref === "INV-M1")?.settledBy,
+    "M3: an unpaid bill reports no mode, whatever pill was lit when it was written",
+  );
+  assert(
+    !!st3.rows.find((r) => r.ref === "INV-M2")?.settledBy,
+    "M3: while one settled at the counter does",
+  );
+}
+
+/* ═══════ TEST P: a ledger PDF cannot be saved under the wrong name ═══════
+   The bulk export walked TWO arrays with one index — the documents it had
+   managed to render, and the parties it meant to name them after. Any party
+   whose markup failed to mount was dropped from the first list only, and
+   from there every remaining PDF was written under the previous party's
+   name. The shop read that as "some came out full and some simple". What it
+   actually was is one customer's account in a file named after another,
+   which is the kind of thing that gets emailed onward.
+
+   Read from the source because the failure is structural — two lists that
+   must not be indexed independently — and a test that rendered one party
+   would never see it. */
+{
+  const dlg = readFileSync(process.cwd() + "/src/components/PartyLedgerExportDialog.tsx", "utf8");
+
+  assert(
+    /docs\[i\]\.party\.name/.test(dlg),
+    "P1: each PDF is named from the party carried WITH it",
+  );
+  assert(
+    !/parties\[i\]\.name/.test(dlg),
+    "P1: never from a second list walked with the same index",
+  );
+  assert(/party:\s*p,/.test(dlg), "P1: which means the party is pushed alongside its document");
+  assert(
+    /missed/.test(dlg),
+    "P1: and a party whose document failed is reported, not silently dropped",
+  );
+
+  /* The bulk INVOICE export is the same shape and inherits the same trap,
+     so it is held to the same rule. Checked here rather than on screen
+     because the screen suite never downloads anything — a mutation that
+     renamed the files from a second list survived every one of its
+     assertions, which is exactly how the party version shipped broken. */
+  const bulk = readFileSync(process.cwd() + "/src/components/InvoiceBulkExportDialog.tsx", "utf8");
+  assert(
+    /docs\[i\]\.inv\.number/.test(bulk),
+    "P1: each bill's PDF is named from the bill carried WITH it",
+  );
+  assert(!/invoices\[i\]/.test(bulk), "P1: never from the selection list walked by the same index");
+  assert(
+    /inv,\s*el/.test(bulk) || /\{\s*inv,\s*el\s*\}/.test(bulk),
+    "P1: which means the bill is pushed alongside its document",
+  );
+
+  /* The same trap one level down: the renderer hands back a plain array that
+     callers pair positionally, so a short batch must fail rather than shift
+     every later document onto the wrong name. */
+  const pdf = readFileSync(process.cwd() + "/src/lib/pdf.ts", "utf8");
+  assert(
+    /pdfsBase64\.length !== slice\.length/.test(pdf),
+    "P2: a batch that renders fewer PDFs than asked for throws instead of misaligning",
+  );
+}
+
+/* ═══════ TEST K: the keyboard keeps its own cursor on screen ═══════
+   The shop runs this from a MacBook with no mouse. On a 13" screen, tabbing
+   into a field below the fold left the cursor somewhere invisible and the
+   next thing typed went into a box nobody could see.
+
+   Read from the source, and that is worth explaining rather than excusing.
+   The behaviour lives in AppShell, and the screen suite — which renders real
+   pages in a real browser — does NOT mount AppShell: a probe asserting
+   document.querySelector("header") fails there. So nothing in the shell is
+   covered by those 592 assertions, which is a gap worth knowing about well
+   beyond this hook. Until that changes, the rules are pinned here, where
+   they can at least not be deleted silently. */
+{
+  const hook = readFileSync(process.cwd() + "/src/hooks/useKeyboardFocusScroll.ts", "utf8");
+
+  assert(/addEventListener\("focusin"/.test(hook), "K1: something watches where the focus lands");
+  assert(
+    /scrollIntoView\(\{\s*block:\s*"nearest"/.test(hook),
+    "K1: and moves the least it can — anything stronger re-centres the page on every Tab",
+  );
+
+  /* The half that is easy to forget: a pointer must NOT scroll. A page that
+     jumps under the hand that just clicked it is worse than one that never
+     scrolls at all. */
+  /* The SUBSCRIPTION, not the word. Matching "mousedown" anywhere passed
+     happily when the listener was deleted and only its removeEventListener
+     cleanup was left behind — found by mutation, which is the entire point
+     of running one. */
+  assert(
+    /addEventListener\("mousedown", onPointer/.test(hook) &&
+      /addEventListener\("touchstart", onPointer/.test(hook),
+    "K2: a pointer cancels it, so clicking never yanks the page",
+  );
+  assert(
+    /if \(!byKeyboard\) return;/.test(hook),
+    "K2: enforced by a guard, not by hoping the events arrive in a helpful order",
+  );
+
+  /* Only keys that MOVE focus. Scrolling on a plain letter would fire in the
+     middle of typing a party's name. */
+  assert(
+    /"Tab"/.test(hook) && /startsWith\("Arrow"\)/.test(hook),
+    "K3: Tab and the arrows count as a focus move",
+  );
+  assert(!/e\.key\.length === 1/.test(hook), "K3: and a plain character is not treated as one");
+
+  const shell = readFileSync(process.cwd() + "/src/components/layout/AppShell.tsx", "utf8");
+  /* Commenting the call out left the name in the file, and a plain substring
+     match called that mounted. It has to be a live statement. */
+  assert(
+    /^\s*useKeyboardFocusScroll\(\);\s*$/m.test(shell),
+    "K4: the hook is actually mounted — app-wide, since every list page scrolls",
+  );
+}
+
+/* ═══════ TEST D: an arrowed-to option is an option you can see ═══════
+   Reported for "all dropdown selection": arrowing down walked the highlight
+   straight past the bottom edge and kept going, invisibly. The shop arrows,
+   sees nothing move, and presses Enter on something it cannot see — on a
+   counter worked entirely by keyboard that is a wrong item on a bill, not a
+   rough edge.
+
+   Only the invoice form did this, with its own hand-rolled copy. It is one
+   shared hook now, and every picker is held to using it. Listed by name on
+   purpose: a new dropdown added later without it is the exact regression
+   this is here to catch, and a count would quietly pass as they came and
+   went. */
+{
+  const hook = readFileSync(process.cwd() + "/src/hooks/useHighlightScroll.ts", "utf8");
+  assert(
+    /scrollIntoView\(\{ block: "nearest" \}\)/.test(hook),
+    "D1: the highlight is brought just into view, not re-centred on every keypress",
+  );
+  /* Without this it runs on every render and snaps a hand-scrolled list back
+     to the highlight — which feels exactly like a list that cannot be
+     scrolled, i.e. the complaint being fixed. */
+  assert(
+    /if \(prev\.current === index\) return;/.test(hook),
+    "D1: and only when the highlight actually moved",
+  );
+
+  const wired = [
+    "/src/components/SelectMenu.tsx",
+    "/src/components/ComboInput.tsx",
+    "/src/routes/payments.tsx",
+    "/src/routes/expenses.tsx",
+    "/src/components/ReturnForm.tsx",
+    "/src/components/CashBankTransferDialog.tsx",
+  ];
+
+  /* The bill form is checked separately: its two item pickers carry their own
+     older copies of this behaviour, so counting hooks against marked lists
+     would not balance. What matters is the one that was missing — the
+     customer picker, the single most-used dropdown in the app, which had no
+     scroll handling of any kind while the bank and item pickers beside it
+     did. That is how a shared hook gets written and a caller still gets
+     forgotten. */
+  /* The two money columns were asserted to be mutually exclusive, and that
+     rule was WRONG — the shop found it. A bill settled at the counter moves
+     the balance by nothing, so a 7,500 sale with 7,500 handed over rendered
+     a completely blank row. Both movements belong on a bill's line.
+
+     What replaces it is the property that actually has to hold, tested on
+     values in TEST LC above: gave − got equals the net movement. All that is
+     checked here is that both documents get their columns from the one place
+     that enforces it, rather than each working it out again. */
+  const stmt = readFileSync(process.cwd() + "/src/routes/parties_." + "$id.tsx", "utf8");
+  const printable = readFileSync(
+    process.cwd() + "/src/components/PrintablePartyStatement.tsx",
+    "utf8",
+  );
+  for (const [name, src] of [
+    ["the statement page", stmt],
+    ["the printed statement", printable],
+  ] as const) {
+    assert(
+      src.includes("ledgerColumns("),
+      "D4: " + name + " takes its two columns from the shared rule",
+    );
+    assert(
+      !src.includes("delta > 0 &&") && !src.includes("delta > 0.01 ?"),
+      "D4: " + name + " no longer works the columns out from the net movement itself",
+    );
+  }
+
+  const bill = readFileSync(process.cwd() + "/src/components/InvoiceForm.tsx", "utf8");
+  assert(
+    bill.includes("useHighlightScroll(partyListRef, partyIdx, partyOpen)"),
+    "D3: the bill customer picker scrolls its highlight",
+  );
+  /* Counted, not merely present.
+
+     A first version asked only whether each file mentioned the hook at all,
+     and a file with TWO dropdowns passed happily after one of them lost its
+     call — the other still matched. Found by mutation. Every marked list
+     must have a hook call of its own, so the two counts have to agree. */
+  for (const rel of wired) {
+    const src = readFileSync(process.cwd() + rel, "utf8");
+    const hooks = (src.match(/useHighlightScroll\([a-zA-Z]/g) ?? []).length;
+    const lists = (src.match(/data-opt=\{/g) ?? []).length;
+    assert(hooks > 0, "D2: this picker scrolls its highlight — " + rel);
+    /* The hook finds the option by this attribute; without it the lookup
+       silently returns nothing and the hook is decoration. */
+    assert(lists > 0, "D2: and marks its options so the hook can find them — " + rel);
+    assert(
+      hooks === lists,
+      `D2: every list in this file has a hook call of its own — ${rel}: ${hooks} hooks, ${lists} lists`,
+    );
+  }
+}
+
+/* ═══════ TEST B: a reopened bill form starts at the top ═══════
+   Reported twice: open a new bill, scroll down, close it, open another, and
+   it came back part-way down — customer card off the top, party field out of
+   reach.
+
+   Source-level, and for a reason worth writing down rather than hiding. The
+   screen harness renders an 800x600 window, where an empty bill is not tall
+   enough to scroll at all, so any assertion about its scroll position passes
+   without testing anything — which is exactly what happened when I tried,
+   and the check said so instead of going green. It also builds a fresh
+   router per render, so it cannot reproduce the case that actually broke: a
+   workspace tab whose component stays mounted while you work elsewhere.
+
+   A test that cannot fail is worse than no test. What CAN be pinned is that
+   the reset exists, happens more than once, and is keyed on more than first
+   mount. Plain string checks rather than regexes, because the thing being
+   matched is full of brackets and an escaping slip here fails silently. */
+{
+  const form = readFileSync(process.cwd() + "/src/components/InvoiceForm.tsx", "utf8");
+
+  assert(form.includes("data-bill-scroll"), "B1: the form has a scrolling region of its own");
+  assert(form.includes("el.scrollTop = 0;"), "B1: which is put back to the top");
+
+  /* Once was not enough: the things that move a fresh form — data landing, a
+     picker restoring, the router's own scroll handling — all happen after
+     mount. */
+  assert(
+    form.includes("requestAnimationFrame(") && form.includes("}, 80);"),
+    "B2: on the next frame and the next tick too, not only once on mount",
+  );
+
+  /* Keyed on the route, because reopening a bill in a workspace that keeps
+     tabs alive is not a new mount. */
+  assert(
+    form.includes("[existing?.id, formPathname]"),
+    "B3: and re-runs when the form is opened again, not only when it is built",
+  );
+}
+
+/* ═══════ TEST PR: the printed statement behaves like paper ═══════
+   The PDF is the very table that is on screen, so anything needing a mouse
+   printed as nonsense. Three faults in one download:
+
+     A folded breakdown printed the words "View details" and nothing else —
+     an instruction the reader cannot carry out. The detail is always
+     rendered now and merely hidden on screen while it is folded.
+
+     The closing balance appeared on every page, because a browser repeats
+     <tfoot> on each printed page of a table that breaks across pages.
+     Repeating the column headers is exactly what you want; repeating the
+     bottom line mid-statement is a second, contradictory total.
+
+     And the rupee sign came out blank — the headless browser that draws
+     these PDFs carries no font with it — so a column headed "You Gave (₹)"
+     printed as "You Gave ( )". */
+{
+  const page = readFileSync(process.cwd() + "/src/routes/parties_." + "$id.tsx", "utf8");
+
+  assert(
+    page.includes("hidden print:table-row"),
+    "PR1: a folded breakdown is hidden on screen but printed in full",
+  );
+  /* Matched on the control, not on its styling: the first version pinned an
+     exact hover colour and broke the moment the row was restyled, which
+     tells you nothing about whether the button still prints. */
+  const foldButton = page.slice(page.indexOf("setOpen((v) => !v)"));
+  assert(
+    foldButton.slice(0, 400).includes("print:hidden"),
+    "PR1: and the control that folds it never prints",
+  );
+
+  /* The closing balance lives in the body, so it prints once, at the end. */
+  assert(
+    !page.includes("<tfoot>"),
+    "PR2: nothing sits in a tfoot, which a browser repeats on every printed page",
+  );
+
+  /* And a bottom line is never left alone on a fresh page. Moving it out of
+     the tfoot stopped it REPEATING; this stops it arriving by itself under a
+     full set of reprinted column headings, which reads as a second, empty
+     statement. Both closing rows — the statement and the simple ledger —
+     refuse a page break before them. */
+  assert(
+    (page.match(/breakBefore: "avoid"/g) ?? []).length >= 2,
+    "PR4: neither closing row can be orphaned onto a page of its own",
+  );
+
+  assert(
+    !page.includes("You Gave (\u20B9)"),
+    "PR3: no column header leans on a glyph the PDF renderer cannot draw",
+  );
+}
+
+/* ═══════ TEST SD: one ledger document, however it is downloaded ═══════
+   Downloading one party's ledger built its PDF from the live table on the
+   page; selecting several parties and downloading built theirs from
+   PrintablePartyStatement. Two components rendering the same rows, so the
+   two documents drifted apart — and the shop got a visibly different file
+   depending on which button it pressed. Rebuilding the screen and forgetting
+   the printable is exactly how that gap opened in the first place.
+
+   Both go through the printable now. Asserted structurally, because the
+   guarantee worth having is "there is only one of them", not "these two
+   happen to match today". */
+{
+  const page = readFileSync(process.cwd() + "/src/routes/parties_." + "$id.tsx", "utf8");
+
+  assert(
+    page.includes("<PrintablePartyStatement"),
+    "SD1: the party page renders the same printable the bulk export uses",
+  );
+  /* And points its PDFs at it. Rendering one and then exporting the screen
+     anyway is a failure that looks exactly like success. */
+  assert(
+    page.includes('ledgerFormat === "simple" ? simpleLedgerRef.current : pdfRef.current'),
+    "SD1: and every PDF is built from that, not from the screen",
+  );
+
+  /* The summary has to add up, or it is decoration. Opening + gave − got =
+     closing: a party whose whole balance was an opening figure previously
+     showed 0, 0, 0 and a closing balance of 5,100. */
+  const printable = readFileSync(
+    process.cwd() + "/src/components/PrintablePartyStatement.tsx",
+    "utf8",
+  );
+  assert(
+    printable.includes("Opening Balance") &&
+      printable.includes("You Gave") &&
+      printable.includes("You Got") &&
+      printable.includes("Closing Balance"),
+    "SD2: the summary carries the four figures that reconcile",
+  );
+  assert(
+    !printable.includes('label: "Total Billed"'),
+    "SD2: and not a fifth that takes part in no equation",
+  );
+}
+
+/* ═══════ TEST NU: the WhatsApp nudge stays out of the way ═══════
+   It opened across the Sales list while the counter was working, and the
+   shop asked for it off those pages by name. What it reports is nearly
+   always a configuration fault nobody at a till can fix — a wrong service
+   URL, an expired key — so the red dot in the header carries it, and the
+   dialog opens on a click when somebody actually wants it.
+
+   In the audit suite because the nudge lives in AppShell, which the screen
+   harness does not mount at all. */
+{
+  const ui = readFileSync(process.cwd() + "/src/components/WhatsAppLink.tsx", "utf8");
+  /* Pulled out by string rather than by regex: the pattern being looked for
+     is itself full of brackets and pipes, and an escaping slip in the search
+     fails silently — it finds nothing and the check quietly passes. */
+  const marker = 'const BUSY_ROUTE = new RegExp("';
+  const at = ui.indexOf(marker);
+  assert(at !== -1, "NU1: the nudge still has a list of places it must not appear");
+  if (at !== -1) {
+    const rest = ui.slice(at + marker.length);
+    const re = new RegExp(rest.slice(0, rest.indexOf('"')));
+    for (const path of ["/sales", "/purchase", "/sales/new", "/purchase/edit/abc"]) {
+      assert(re.test(path), "NU1: it stays off " + path);
+    }
+    /* And still appears where there is nothing to interrupt, or it has
+       simply been switched off rather than aimed. */
+    for (const path of ["/", "/parties", "/settings"]) {
+      assert(!re.test(path), "NU2: but it can still be shown on " + path);
+    }
+  }
+}
+
+/* ═══════ TEST LC: the two money columns always add up to the balance ═══
+   The shop opened a party whose bills were all paid at the counter and saw
+   a statement of blank rows: a 7,500 sale with 7,500 handed over moves the
+   balance by nothing, and the columns were showing the movement. The money
+   was in the ledger and invisible on it.
+
+   A bill has two movements on one line — goods out, and whatever came back
+   over the counter — and both belong on the row. The property that makes
+   that safe is the one asserted here: whatever the two columns say, gave
+   minus got must equal how far the balance actually moved. If that ever
+   stops holding, the statement is telling the shop two different stories
+   about the same rupees. */
+{
+  const check = (
+    label: string,
+    row: Record<string, unknown>,
+    net: number,
+    want: { gave: number; got: number },
+  ) => {
+    const c = ledgerColumns(row as never, net);
+    assert(
+      approx(c.gave, want.gave) && approx(c.got, want.got),
+      "LC: " + label + " — got gave=" + c.gave + " got=" + c.got,
+    );
+    assert(
+      approx(r2(c.gave - c.got), net),
+      "LC: " + label + " reconciles — " + c.gave + " − " + c.got + " should be " + net,
+    );
+  };
+
+  /* The case that was broken: nothing owed before, nothing owed after, and
+     7,500 of trade on the line. */
+  check("a sale settled in full at the counter", { docKind: "sale", total: 7500 }, 0, {
+    gave: 7500,
+    got: 7500,
+  });
+  check("a sale wholly on credit", { docKind: "sale", total: 300 }, 300, { gave: 300, got: 0 });
+  check("a part-paid sale", { docKind: "sale", total: 1000 }, 600, { gave: 1000, got: 400 });
+
+  /* Purchases mirror it: goods IN at full value, money out on the same line. */
+  check("a purchase paid on the spot", { docKind: "purchase", total: 18000 }, 0, {
+    gave: 18000,
+    got: 18000,
+  });
+  check("a purchase on credit", { docKind: "purchase", total: 18000 }, -18000, {
+    gave: 0,
+    got: 18000,
+  });
+
+  /* One-directional rows stay one-directional. A return's stored settled
+     figure equals its total for bookkeeping reasons, and reading that
+     directly would invent a second movement. */
+  check("a payment received", { type: "Payment Received", total: 2890 }, -2890, {
+    gave: 0,
+    got: 2890,
+  });
+  check("a payment made", { type: "Payment Made", total: 5000 }, 5000, { gave: 5000, got: 0 });
+  check(
+    "a sale return, whose settled figure mirrors its total",
+    { docKind: "sale-return", total: 500, receivedOrPaid: 500 },
+    -500,
+    { gave: 0, got: 500 },
+  );
+  check("a write-off", { type: "Discount Given", total: 250 }, -250, { gave: 0, got: 250 });
+}
+
+/* ═══════ TEST SP: what a line starts at ═══════
+   Two rules, both of which have already gone wrong in production.
+
+   A sale line must start at the item selling price — not at this party own
+   last price, which is how a picker showing 7,000 produced a line of 6,105.
+   That preference was right while an item selling price was rewritten by
+   whatever bill went out last; once that write was removed the selling price
+   became the shop own decision, and history quietly overruling it is the
+   shop being argued with by its records.
+
+   And it must never fall back to the purchase price, which billed at cost
+   with nothing on screen looking wrong.
+
+   Source-level, and honestly so: the behavioural version of this passes
+   whichever rule is in force, because the seeded item sells at 100 and has
+   no differing history, so both mutations survive it. A test that cannot
+   fail is not evidence. */
+{
+  const form = readFileSync(process.cwd() + "/src/components/InvoiceForm.tsx", "utf8");
+  const want = "price: isSale ? (it.salePrice ?? 0) : (historicalPrice ?? it.purchasePrice),";
+  const n = form.split(want).length - 1;
+  assert(
+    n === 2,
+    "SP1: both places that build a line start a sale at the selling price — found " + n + " of 2",
+  );
+  assert(
+    !form.includes("it.salePrice || it.purchasePrice"),
+    "SP2: and no sale ever falls back to cost",
+  );
+}
+
+/* ═══════ TEST LO: the total closes the entry, it does not open it ═══════
+   A bill on paper lists what was bought and totals it underneath. The
+   statement was doing the reverse — announcing "7 items · 17,790.00" and then
+   showing the seven — which is an order you have to be taught to read. Every
+   hand-written khata in the shop already works the other way round.
+
+   Pinned at the source because document ORDER is the whole claim, and the two
+   documents have to agree: the screen and the PDF are the same statement, and
+   the shop has already been burnt once by them disagreeing. */
+{
+  const screen = readFileSync(process.cwd() + "/src/routes/parties_.$id.tsx", "utf8");
+  const itemsAt = screen.indexOf("{hasDetail && (");
+  const totalAt = screen.indexOf("onClick={onOpen}");
+  assert(itemsAt > 0 && totalAt > 0, "LO1: the statement row still has both halves");
+  assert(
+    itemsAt < totalAt,
+    "LO2: on screen the item lines come first and the total closes the entry",
+  );
+
+  const pdf = readFileSync(process.cwd() + "/src/components/PrintablePartyStatement.tsx", "utf8");
+  const pItems = pdf.indexOf("{showBreakdown && (");
+  const pTotal = pdf.indexOf(`{opening ? "" : fmtDate(r.date)}`);
+  assert(pItems > 0 && pTotal > 0, "LO3: the printed statement still has both halves");
+  assert(pItems < pTotal, "LO4: and the PDF prints them in that same order");
+
+  /* A total torn onto the next page away from the lines it totals is the
+     failure this order introduces, so both documents refuse that break. */
+  assert(
+    screen.includes(`breakBefore: hasDetail ? "avoid" : undefined`),
+    "LO5: on screen a total is never broken away from its items",
+  );
+  assert(
+    pdf.includes(`...(showBreakdown ? { pageBreakBefore: "avoid", breakBefore: "avoid" } : null)`),
+    "LO6: nor in the PDF",
+  );
+}
+
+/* ═══════ TEST PP: a dropdown that lands on the screen ═══════
+   Photographed at the counter, on a phone: the item search dropdown opened
+   with its prices hanging off the right edge of the display, and the
+   last-prices popup lost its heading off the left. Both were anchored to an
+   input inside a 720px-wide table on a 390px screen, and neither ever
+   compared its answer to the width of the phone.
+
+   The phone is the case every assertion here is built around, because the
+   desk is the case that already worked. */
+{
+  const phone = { width: 390, height: 844 };
+  /* An input sitting 140px into a table that is wider than the screen — so
+     its right edge is already past the display. */
+  const scrolledOff = { top: 300, bottom: 328, left: 140, right: 440, width: 300 };
+
+  {
+    const p = popupRect(scrolledOff, phone, { minWidth: 260 });
+    assert(p.left >= 8, "PP1: a dropdown starts on the screen — left " + p.left);
+    assert(p.left + p.width <= 390 - 8, "PP2: and ends on it — right edge " + (p.left + p.width));
+    assert(p.width >= 260, "PP3: without being squeezed below readable — " + p.width);
+  }
+
+  /* Right-aligned, which is the one that walked off the LEFT: 256 subtracted
+     from an input near the left gutter is a negative x. */
+  {
+    const nearLeft = { top: 300, bottom: 328, left: 12, right: 120, width: 108 };
+    const p = popupRect(nearLeft, phone, { align: "right", preferredWidth: 256 });
+    assert(p.left >= 8, "PP4: a right-aligned popup does not walk off the left — " + p.left);
+    assert(p.left + p.width <= 382, "PP5: nor off the right — " + (p.left + p.width));
+  }
+
+  /* A panel may never be wider than the screen it has to fit on, however wide
+     the thing it is anchored to. */
+  {
+    const wide = { top: 100, bottom: 130, left: 0, right: 700, width: 700 };
+    const p = popupRect(wide, phone, { minWidth: 600 });
+    assert(p.width <= 390 - 16, "PP6: never wider than the screen — " + p.width);
+    assert(p.left >= 8 && p.left + p.width <= 382, "PP7: and still inside both gutters");
+  }
+
+  /* The keyboard, and the trap underneath it.
+     A keyboard does not change the layout viewport at all — window.innerHeight
+     is still 844 — it only covers the bottom of it. So the room below is
+     measured against the visible band and the placement is measured against
+     the layout box, and those are two different numbers that must not be
+     swapped. */
+  {
+    const keyboardUp = { width: 390, height: 844, visibleTop: 0, visibleBottom: 400 };
+    const low = { top: 330, bottom: 360, left: 20, right: 300, width: 280 };
+    const p = popupRect(low, keyboardUp);
+    assert(p.top === undefined, "PP8: with the keyboard over it, the list does not open downwards");
+    /* The one that matters. `bottom` on a fixed element is measured from the
+       bottom of the LAYOUT viewport, so this is the only value that puts the
+       panel's lower edge against the input. Photographed failing: it was
+       computed against the visible band instead and landed 220px above the
+       box it belongs to, up beside the Bill Date field. */
+    assert(
+      p.bottom === 844 - (330 - 4),
+      "PP9: it grows upward FROM the input — bottom " + p.bottom,
+    );
+    assert(
+      844 - (p.bottom ?? 0) === 326,
+      "PP10: whose lower edge is 4px above the input, not somewhere up the page",
+    );
+    assert(p.maxHeight > 0 && p.maxHeight <= 330, "PP11: within the room above it");
+  }
+
+  /* The exact reading that produced the photograph. At the moment a field is
+     focused, iOS has already scrolled for the keyboard (offsetTop ≈ 217) but
+     has not yet reported the shorter height, so visibleBottom comes back as
+     1061 on an 844px phone. A bottom edge below the bottom of the screen is
+     not a reading worth acting on: clamp it, and the answer is simply "there
+     is room below", which there is. */
+  {
+    const stale = { width: 390, height: 844, visibleTop: 217, visibleBottom: 1061 };
+    const box = { top: 330, bottom: 360, left: 20, right: 300, width: 280 };
+    const p = popupRect(box, stale);
+    assert(p.top === 364, "PP12: a viewport taller than the screen is not believed — top " + p.top);
+    assert(
+      (p.top ?? 0) + p.maxHeight <= 844,
+      "PP13: and nothing is placed past the bottom of the real screen",
+    );
+  }
+
+  /* And when there IS room below, it stays below — flipping a dropdown that
+     had somewhere to go is its own kind of wrong. */
+  {
+    const high = { top: 100, bottom: 130, left: 20, right: 300, width: 280 };
+    const p = popupRect(high, phone);
+    assert(p.top === 134, "PP14: with room below, it hangs below the input — " + p.top);
+    assert(p.bottom === undefined, "PP15: and is not bottom-anchored");
+    assert(p.maxHeight <= 844 - 134, "PP16: never taller than the room it was given");
+  }
+
+  /* The desk, unchanged: a dropdown under a 200px input on a wide screen
+     lines up with the input's own left edge and takes its own width. */
+  {
+    const desk = { width: 1440, height: 900 };
+    const input = { top: 300, bottom: 328, left: 420, right: 620, width: 200 };
+    const p = popupRect(input, desk);
+    assert(p.left === 420, "PP17: on a desk it still lines up with its input");
+    assert(p.width === 200, "PP18: at the input's own width");
+    assert(p.top === 332, "PP19: just below it");
+  }
+}
+
+/* ═══════ TEST WA: what the bridge now says, and what we do about it ═══════
+   The bridge was rebuilt to answer honestly instead of optimistically, and
+   every new sentence it can produce has to land in the right bucket here.
+   Getting one wrong costs the shop a customer's trust in one direction or a
+   duplicate invoice in the other. */
+{
+  /* A number that is not on WhatsApp. Before the bridge asked, this send
+     "succeeded" into nothing — a landline or a mistyped digit swallowed a
+     bill silently. It is a real answer about the number, so it must reach a
+     person and must never sit in a retry queue: no amount of waiting makes a
+     number exist. */
+  assert(
+    classifySendFailure(
+      "919999999999 is not on WhatsApp — check the number saved for this party",
+      true,
+    ) === "permanent",
+    "WA1: a number that is not on WhatsApp is never queued",
+  );
+  assert(
+    classifySendFailure("919999999999 is not on WhatsApp — check the number", false) ===
+      "permanent",
+    "WA2: and stays permanent even when the app thought the link was down",
+  );
+
+  /* The two that must never be retried by a timer. Both can arrive while the
+     app believes the link is down, which is exactly the path that used to
+     classify them "offline" — safe to retry — when a message may already be
+     on its way. */
+  assert(
+    classifySendFailure(
+      "This message is already being sent — wait for that attempt to finish",
+      false,
+    ) === "uncertain",
+    "WA3: a send already in flight is never auto-retried, link state notwithstanding",
+  );
+  assert(
+    classifySendFailure(
+      "The WhatsApp service didn't answer in time — the message may or may not have been sent.",
+      false,
+    ) === "uncertain",
+    "WA4: nor is a request that timed out with no answer at all",
+  );
+
+  /* And the opposite mistake. A halted bridge reports through "not
+     connected", which means nothing was handed over — so this one IS safe for
+     the queue to retry on its own, and treating it as uncertain would leave
+     the shop hand-sending every bill after a blip. */
+  assert(
+    classifySendFailure(
+      "WhatsApp is not connected — this session was taken over by another connection",
+      true,
+    ) === "offline",
+    "WA5: a session taken over means nothing was sent, so the queue may retry it",
   );
 }
 

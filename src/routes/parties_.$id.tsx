@@ -9,8 +9,14 @@ import {
   PurchaseReturnRepo,
   PaymentRepo,
   CompanyRepo,
+  BankRepo,
 } from "@/repositories";
-import { buildPartyStatement, buildSimpleLedgerRows, type PartyStatementRow } from "@/lib/ledger";
+import {
+  buildPartyStatement,
+  buildSimpleLedgerRows,
+  ledgerColumns,
+  type PartyStatementRow,
+} from "@/lib/ledger";
 import { fmtMoney, fmtDate } from "@/lib/format";
 import { printOrEscapeStandalone } from "@/lib/print";
 import { useAutoPrintFromUrl } from "@/hooks/useAutoPrintFromUrl";
@@ -19,8 +25,14 @@ import { downloadXlsx } from "@/lib/xlsx";
 import { downloadElementAsPdf } from "@/lib/pdf";
 import { useShareablePdf } from "@/hooks/useShareablePdf";
 import { sendElementViaWhatsApp } from "@/lib/whatsappSend";
+import { describePayment } from "@/lib/paymentSplit";
+import { PrintablePartyStatement } from "@/components/PrintablePartyStatement";
+import { NEEDS_DATE_HINT } from "@/lib/dateHint";
+import { Wallet, ChevronRight, ChevronDown } from "lucide-react";
+import { ArrowDownCircle, ArrowUpCircle } from "lucide-react";
 import { partyStatementSheet } from "@/lib/partySheet";
 import { PartyDialog } from "./parties";
+import { ReceivePaymentDialog } from "./payments";
 import { usePermissions } from "@/hooks/usePermissions";
 import type { Party } from "@/types";
 import { toast } from "sonner";
@@ -73,6 +85,8 @@ function PartyStatementPage() {
   const goBack = useGoBack("/parties");
   const { isOwner, canEdit } = usePermissions();
   const editAllowed = isOwner || canEdit("masterData");
+  /** null = closed. "in" takes money from them, "out" pays them. */
+  const [payDialog, setPayDialog] = useState<"in" | "out" | null>(null);
   const [party, setParty] = useState<Party | null | undefined>(undefined);
   const [editOpen, setEditOpen] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -149,8 +163,24 @@ function PartyStatementPage() {
   // whatever format the original tap chose isn't carried across tabs.
   useAutoPrintFromUrl(party ? pdfName() : null, !!party);
 
+  /** The offscreen copy that every PDF is made from. */
+  const pdfRef = useRef<HTMLDivElement>(null);
+
+  /**
+   * Which element a PDF is built from.
+   *
+   * Not the screen any more. Downloading one party's ledger rendered the
+   * live table, while selecting several on the Parties page rendered
+   * PrintablePartyStatement — two components, so the two downloads drifted
+   * apart and the shop got a visibly different document depending on which
+   * button it pressed. Both go through the printable now, so "same to same"
+   * is structural rather than a thing to keep re-checking.
+   *
+   * Browser Print still uses the on-screen table, which carries its own
+   * print stylesheet and now shows the same layout anyway.
+   */
   const activePrintEl = () =>
-    ledgerFormat === "simple" ? simpleLedgerRef.current : printRef.current;
+    ledgerFormat === "simple" ? simpleLedgerRef.current : pdfRef.current;
 
   const { shareReady, share, resetShare } = useShareablePdf("Statement");
 
@@ -188,14 +218,22 @@ function PartyStatementPage() {
     setPdfBusy("whatsapp");
     try {
       const company = CompanyRepo.get();
-      await sendElementViaWhatsApp({
+      const outcome = await sendElementViaWhatsApp({
         el,
         phone: party.phone,
         message: `Hi ${party.name}, here's your account statement${company ? ` from ${company.name}` : ""}.`,
         fileName: pdfName(),
+        label: `${party.name} statement`,
         orientation: "landscape",
       });
-      toast.success("Statement sent on WhatsApp");
+      if (outcome.status === "sent") {
+        // See the note on the invoice page: "sent" is reserved for a message
+        // WhatsApp has confirmed receiving.
+        if (outcome.deduped) toast.success("That statement had already been sent");
+        else if (outcome.acknowledged) toast.success("Statement sent on WhatsApp");
+        else toast.info("Statement handed to WhatsApp — not confirmed delivered yet");
+      } else if (outcome.kind === "offline") toast.info(outcome.message, { duration: 8000 });
+      else toast.warning(outcome.message, { duration: 10000 });
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Could not send via WhatsApp");
     } finally {
@@ -252,6 +290,16 @@ function PartyStatementPage() {
   }
 
   const balance = rows.length ? rows[rows.length - 1].balance : party.openingBalance || 0;
+  /* Said in words, because "Dr" and "Cr" mean nothing to the person this
+     statement is for — and a number with no direction is worse than no
+     number. The wording is from their side of the counter: the shop reads
+     this out to a customer, or hands it over. */
+  const closingMeaning =
+    balance > 0
+      ? "Total amount they owe you"
+      : balance < 0
+        ? "Total amount you owe them"
+        : "Nothing outstanding — fully settled";
   const totalReceived = rows.reduce((s, e) => s + (e.total > 0 ? e.receivedOrPaid : 0), 0);
   const totalBilled = rows.reduce((s, e) => s + e.total, 0);
 
@@ -335,6 +383,26 @@ function PartyStatementPage() {
               balance cards for vertical space. Pure layout move — none of
               the handlers below changed. */}
           <div className="flex items-center gap-1.5 shrink-0">
+            {editAllowed && (
+              <>
+                <button
+                  onClick={() => setPayDialog("in")}
+                  className="h-8 px-2.5 shrink-0 rounded-md border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 flex items-center gap-1.5 text-xs font-semibold transition"
+                  title="Receive payment from this party"
+                >
+                  <ArrowDownCircle className="h-4 w-4" />
+                  <span className="hidden sm:inline">Receive</span>
+                </button>
+                <button
+                  onClick={() => setPayDialog("out")}
+                  className="h-8 px-2.5 shrink-0 rounded-md border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700 flex items-center gap-1.5 text-xs font-semibold transition"
+                  title="Pay this party"
+                >
+                  <ArrowUpCircle className="h-4 w-4" />
+                  <span className="hidden sm:inline">Pay</span>
+                </button>
+              </>
+            )}
             <button
               onClick={downloadExcel}
               className="h-8 w-8 shrink-0 rounded-md border border-gray-200 bg-white hover:bg-gray-50 text-gray-600 flex items-center justify-center transition"
@@ -443,13 +511,17 @@ function PartyStatementPage() {
             <div className="no-print flex items-center gap-1.5 h-9 pl-3 pr-2.5 rounded-lg border border-gray-200 bg-gray-50/60 w-full sm:w-auto sm:shrink-0">
               <Calendar className="h-3.5 w-3.5 text-gray-400 shrink-0" />
               {/* iOS Safari renders an empty type="date" input as literally
-                  blank — no "dd/mm/yyyy"-style hint the way desktop browsers
-                  show one — so a cleared/unset date here just looks broken.
-                  This label sits on top (pointer-events-none, so the tap
-                  still opens the real native picker underneath) only while
-                  the value is empty. */}
+                  blank — no "dd-mm-yyyy" hint the way desktop browsers show
+                  one — so a cleared date there just looks broken. This label
+                  covers that, sitting on top with pointer-events-none so the
+                  tap still reaches the real picker underneath.
+
+                  Only on the browsers that need it. Unconditional, it landed
+                  straight on top of the built-in hint everywhere else and the
+                  field read as two overlapping strings — which is what the
+                  shop saw the moment date ranges started opening empty. */}
               <div className="relative flex-1 sm:flex-none sm:w-[104px] min-w-0">
-                {!dateFrom && (
+                {NEEDS_DATE_HINT && !dateFrom && (
                   <span className="absolute inset-0 flex items-center text-xs text-gray-400 pointer-events-none">
                     From
                   </span>
@@ -463,7 +535,7 @@ function PartyStatementPage() {
               </div>
               <span className="text-gray-300 text-xs">–</span>
               <div className="relative flex-1 sm:flex-none sm:w-[104px] min-w-0">
-                {!dateTo && (
+                {NEEDS_DATE_HINT && !dateTo && (
                   <span className="absolute inset-0 flex items-center text-xs text-gray-400 pointer-events-none">
                     To
                   </span>
@@ -537,20 +609,22 @@ function PartyStatementPage() {
             <table className="w-full text-[12px] border-collapse min-w-[980px]">
               <thead>
                 <tr className="bg-gray-50">
+                  {/* Eight columns that name themselves, not nine that need
+                      an accountant. "Txn Balance", "Receivable Balance" and
+                      "Payable Balance" asked the reader to hold three running
+                      figures at once and work out which applied; they are one
+                      Balance column now, and what it MEANS is said in words at
+                      the bottom rather than as Dr/Cr. */}
                   {[
-                    "Date",
-                    "Txn Type",
-                    "Ref No.",
-                    "Payment Status",
-                    "Total",
-                    "Received/Paid",
-                    "Txn Balance",
-                    "Receivable Balance",
-                    "Payable Balance",
-                  ].map((h, i) => (
+                    ["Date", "left"],
+                    ["Particulars", "left"],
+                    ["You Gave", "right"],
+                    ["You Got", "right"],
+                    ["Balance", "right"],
+                  ].map(([h, align]) => (
                     <th
                       key={h}
-                      className={`px-3 py-2.5 text-[10px] font-semibold uppercase tracking-wider text-gray-500 border-b border-gray-200 whitespace-nowrap ${i >= 4 ? "text-right" : "text-left"}`}
+                      className={`px-4 py-2.5 text-[10px] font-semibold uppercase tracking-wider text-gray-500 border-b border-gray-200 whitespace-nowrap ${align === "right" ? "text-right" : "text-left"}`}
                     >
                       {h}
                     </th>
@@ -560,30 +634,59 @@ function PartyStatementPage() {
               <tbody>
                 {rows.length === 0 ? (
                   <tr>
-                    <td colSpan={9} className="text-center py-14 text-gray-400">
+                    <td colSpan={5} className="text-center py-14 text-gray-400">
                       No transactions with this party yet
                     </td>
                   </tr>
                 ) : (
                   rows.map((e, i) => (
-                    <PartyStatementRowBlock key={i} row={e} onOpen={() => openRow(e)} />
+                    <PartyStatementRowBlock
+                      key={i}
+                      row={e}
+                      // Which way the balance moved is the clearest thing a
+                      // ledger can show, and it is only knowable against the
+                      // row before — so it is passed rather than guessed from
+                      // the transaction's name.
+                      prev={i === 0 ? undefined : rows[i - 1]}
+                      onOpen={() => openRow(e)}
+                    />
                   ))
                 )}
               </tbody>
               {rows.length > 0 && (
-                <tfoot>
-                  <tr className="bg-gray-50 border-t-2 border-gray-200 font-bold">
-                    <td colSpan={7} className="px-3 py-3 text-xs uppercase text-gray-500">
-                      Closing Balance
+                <tbody>
+                  {/* One figure, and a sentence saying whose money it is.
+                      Two columns of "Receivable / Payable" with a dash in one
+                      of them made the reader do that work themselves — and
+                      "Dr" meant nothing at all to the person this is for. */}
+                  {/* Never alone on a fresh page. A browser reprints the
+                      column headers whenever a table breaks, so a closing
+                      balance pushed over on its own arrived under a full set
+                      of headings with nothing above it — a page that looks
+                      like a second, empty statement. Refusing a break before
+                      it drags the last transaction over with it, so the final
+                      page always shows what it is closing. */}
+                  <tr
+                    className="border-t-2 border-gray-300 bg-gray-50"
+                    style={{ breakBefore: "avoid", breakInside: "avoid" }}
+                  >
+                    <td colSpan={3} className="px-4 py-3">
+                      <div className="flex items-center gap-2">
+                        <Wallet className="h-4 w-4 shrink-0 text-gray-400" />
+                        <span className="text-[12px] font-bold uppercase tracking-wider text-gray-600">
+                          Closing Balance
+                        </span>
+                        <span className="text-[11px] text-gray-500">· {closingMeaning}</span>
+                      </div>
                     </td>
-                    <td className="px-3 py-3 text-right tabular-nums text-rose-600">
-                      {balance > 0 ? fmtMoney(balance) : "—"}
-                    </td>
-                    <td className="px-3 py-3 text-right tabular-nums text-amber-600">
-                      {balance < 0 ? fmtMoney(-balance) : "—"}
+                    <td
+                      colSpan={2}
+                      className={`px-4 py-3 text-right text-[15px] font-bold tabular-nums ${balance < 0 ? "text-amber-700" : balance > 0 ? "text-rose-600" : "text-gray-600"}`}
+                    >
+                      {fmtMoney(Math.abs(balance)).replace("₹", "")}
                     </td>
                   </tr>
-                </tfoot>
+                </tbody>
               )}
             </table>
           </div>
@@ -657,14 +760,23 @@ function PartyStatementPage() {
               <td />
             </tr>
           </tbody>
-          <tfoot>
-            <tr className="border-t-2 border-black font-bold">
+          {/* A totals row, not a page furniture row: in a tfoot the browser
+              reprints it at the foot of EVERY printed page, so a two-page
+              ledger ended with two different bottom lines. */}
+          <tbody>
+            {/* Same rule as the statement: a totals line alone on a fresh
+                page, under a reprinted set of headings, reads as an empty
+                second ledger. */}
+            <tr
+              className="border-t-2 border-black font-bold"
+              style={{ breakBefore: "avoid", breakInside: "avoid" }}
+            >
               <td colSpan={3} />
               <td className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(simpleCreditTotal)}</td>
               <td className="px-2 py-1.5 text-right tabular-nums">{fmtMoney(simpleDebitTotal)}</td>
               <td />
             </tr>
-          </tfoot>
+          </tbody>
         </table>
       </div>
 
@@ -709,11 +821,56 @@ function PartyStatementPage() {
         </DialogContent>
       </Dialog>
 
+      {/* What every PDF is actually made from: the same component the bulk
+          export uses, kept off-screen. Rendered here rather than built on
+          demand so the download path has nothing to set up and nothing to
+          tear down. */}
+      <div
+        aria-hidden
+        className="pointer-events-none fixed left-[-10000px] top-0 w-[1240px] no-print"
+      >
+        {/* print-visible, and it is load-bearing rather than cosmetic.
+            buildPrintableHtml takes this element's outerHTML ONLY — no
+            ancestors — and ships the app stylesheet with it, and that
+            stylesheet hides everything in print except .print-area and
+            .print-visible. Without the class the rendered PDF came out
+            completely blank: two white pages, no error anywhere. */}
+        <div ref={pdfRef} data-pdf-source className="print-visible">
+          <PrintablePartyStatement
+            party={party}
+            rows={rows}
+            company={CompanyRepo.get()}
+            periodLabel={
+              !dateFrom && !dateTo
+                ? "All transactions"
+                : `${dateFrom ? fmtDate(dateFrom) : "Beginning"} — ${dateTo ? fmtDate(dateTo) : "Today"}`
+            }
+            format="full"
+          />
+        </div>
+      </div>
+
       <PartyDialog
         open={editOpen}
         onOpenChange={setEditOpen}
         party={party}
         onSaved={() => setRefreshKey((k) => k + 1)}
+      />
+
+      {/* The same dialog the Payments page uses, opened on a party that is
+          already known. Reused rather than rebuilt: allocation against open
+          bills, split payments and the write-off all live in there, and a
+          second copy of that would drift apart from it within a month. */}
+      <ReceivePaymentDialog
+        open={payDialog !== null}
+        onOpenChange={(v) => !v && setPayDialog(null)}
+        type={payDialog ?? "in"}
+        editing={null}
+        presetParty={party ? { id: party.id, name: party.name } : null}
+        onSaved={() => {
+          setPayDialog(null);
+          setRefreshKey((k) => k + 1);
+        }}
       />
     </div>
   );
@@ -757,129 +914,197 @@ function StatementCard({
   );
 }
 
+/** Bill numbers, kept to a width a column can hold. A payment applied to
+ *  seven invoices is real and common; printing all seven in a cell is what
+ *  pushed the amount and the payment mode out of view. */
+function shortRef(ref: string): string {
+  if (!ref) return "";
+  const parts = ref
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (parts.length <= 2) return ref;
+  return parts.slice(0, 2).join(", ") + " +" + (parts.length - 2) + " more";
+}
+
+/** An account's own name beats the word "Bank": a shop with three accounts
+ *  learns nothing from being told the money went to "Bank". */
+const bankName = (id: string) => BankRepo.get(id)?.name;
+
+/**
+ * How the money moved on this row, or nothing when none did.
+ *
+ * The question a ledger is asked a day later is rarely "how much" — it is
+ * "where is it", in the drawer or in which account. The statement carried the
+ * answer all along and simply never showed it.
+ *
+ * Returns undefined rather than a dash so a caller can leave the space empty:
+ * an unpaid bill and a write-off moved no money, and labelling either with the
+ * highlighted pill would claim a payment that never happened.
+ */
+function modeOf(e: PartyStatementRow): string | undefined {
+  if (!e.settledBy) return undefined;
+  const d = describePayment(e.settledBy, bankName);
+  return d && d !== "—" && d !== "Unpaid" ? d : undefined;
+}
+
 /** One transaction's summary row, plus — for Sale/Purchase/Returns — a
  * nested item breakdown underneath, matching what the client's reference
  * statement (Vyapar) shows: not just a ledger line, but what was actually
  * in the bill. */
 export function PartyStatementRowBlock({
   row: e,
+  prev,
   onOpen,
 }: {
   row: PartyStatementRow;
+  /** The row above: the running direction, and whether the side has flipped. */
+  prev?: PartyStatementRow;
   onOpen: () => void;
 }) {
-  const itemSubtotal = e.items?.reduce((s, it) => s + it.amount, 0) ?? 0;
+  const isOpening = e.type === "Beginning Balance" || e.type === "Balance b/f";
+  const delta = e.balance - (prev?.balance ?? 0);
+  const [open, setOpen] = useState(false);
+
+  const items = e.items ?? [];
+  const charges = e.charges ?? [];
+  const hasDetail = items.length > 1 || charges.length > 0;
+  const oneItem = items.length === 1 ? items[0] : null;
+
+  const detail = isOpening
+    ? ""
+    : oneItem
+      ? `${oneItem.name} · ${oneItem.qty} × ${fmtMoney(oneItem.price)}`
+      : items.length > 1
+        ? `${items.length} items`
+        : (modeOf(e) ?? "");
+
+  /* Which side the balance sits on is said only when it CHANGES. Printing
+     "they owe" under all forty lines is noise that stops being read by the
+     third row; printing it the once it flips is information. */
+  const side = e.balance > 0 ? "they owe" : e.balance < 0 ? "you owe" : "settled";
+  const prevSide = !prev
+    ? ""
+    : prev.balance > 0
+      ? "they owe"
+      : prev.balance < 0
+        ? "you owe"
+        : "settled";
+  const showSide = isOpening || side !== prevSide;
+
+  const money = (n: number) => <span className="tabular-nums">{fmtMoney(n).replace("₹", "")}</span>;
+
+  /* Both movements on a bill, not just the net. A sale settled at the
+     counter shifts the balance by nothing, and showing only the shift left
+     the whole amount off the page. */
+  const cols = isOpening ? { gave: 0, got: 0 } : ledgerColumns(e, delta);
+
   return (
     <>
-      <tr
-        onClick={onOpen}
-        title={e.docId ? "Open this bill" : undefined}
-        className={`border-b border-gray-100 hover:bg-gray-50/60 ${e.docId ? "cursor-pointer" : ""} ${e.type === "Beginning Balance" || e.type === "Balance b/f" ? "bg-gray-50/40 font-semibold" : ""}`}
-        style={{
-          breakInside: "avoid",
-          breakAfter: e.items?.length ? "avoid" : undefined,
-        }}
-      >
-        <td className="px-3 py-2.5 text-gray-600 whitespace-nowrap">
-          {e.date ? fmtDate(e.date) : ""}
-        </td>
-        <td className="px-3 py-2.5 font-medium text-gray-800 whitespace-nowrap">{e.type}</td>
-        <td className="px-3 py-2.5 font-mono text-xs text-blue-600 whitespace-nowrap">{e.ref}</td>
-        <td className="px-3 py-2.5 whitespace-nowrap">
-          {e.status && (
-            <span
-              className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
-                e.status === "Paid"
-                  ? "bg-emerald-50 text-emerald-700 border-emerald-200"
-                  : e.status === "Partial"
-                    ? "bg-amber-50 text-amber-700 border-amber-200"
-                    : "bg-rose-50 text-rose-700 border-rose-200"
-              }`}
-            >
-              {e.status}
-            </span>
-          )}
-        </td>
-        <td className="px-3 py-2.5 text-right tabular-nums whitespace-nowrap">
-          {e.total ? fmtMoney(e.total) : "—"}
-        </td>
-        <td className="px-3 py-2.5 text-right tabular-nums text-emerald-600 whitespace-nowrap">
-          {e.receivedOrPaid ? fmtMoney(e.receivedOrPaid) : "—"}
-        </td>
-        <td className="px-3 py-2.5 text-right tabular-nums text-rose-600 whitespace-nowrap">
-          {e.txnBalance ? fmtMoney(e.txnBalance) : "—"}
-        </td>
-        <td className="px-3 py-2.5 text-right tabular-nums font-semibold text-rose-600 whitespace-nowrap">
-          {e.balance > 0 ? fmtMoney(e.balance) : "—"}
-        </td>
-        <td className="px-3 py-2.5 text-right tabular-nums font-semibold text-amber-600 whitespace-nowrap">
-          {e.balance < 0 ? fmtMoney(-e.balance) : "—"}
-        </td>
-      </tr>
-      {!!e.items?.length && (
+      {hasDetail && (
         <tr
-          className="border-b border-gray-100 bg-gray-50/30"
-          style={{ breakInside: "avoid", breakBefore: "avoid" }}
+          className={`bg-gray-50/70 ${open ? "" : "hidden print:table-row"}`}
+          style={{ breakInside: "avoid" }}
         >
-          <td colSpan={9} className="px-3 pb-3 pt-1">
-            <table className="w-full text-[11.5px] border-collapse bg-white border rounded-md overflow-hidden">
-              <thead>
-                <tr className="bg-gray-100">
-                  <th className="text-left px-2.5 py-1.5 text-[10px] font-semibold uppercase text-gray-500 w-8">
-                    #
-                  </th>
-                  <th className="text-left px-2.5 py-1.5 text-[10px] font-semibold uppercase text-gray-500">
-                    Item name
-                  </th>
-                  <th className="text-right px-2.5 py-1.5 text-[10px] font-semibold uppercase text-gray-500 w-20">
-                    Quantity
-                  </th>
-                  <th className="text-right px-2.5 py-1.5 text-[10px] font-semibold uppercase text-gray-500 w-24">
-                    Price/Unit
-                  </th>
-                  <th className="text-right px-2.5 py-1.5 text-[10px] font-semibold uppercase text-gray-500 w-24">
-                    Amount
-                  </th>
-                </tr>
-              </thead>
+          <td />
+          <td colSpan={4} className="px-4 pt-2.5 pb-1">
+            <table className="w-full text-[11.5px]">
               <tbody>
-                {e.items.map((it, i) => (
-                  <tr key={i} className="border-t border-gray-100">
-                    <td className="px-2.5 py-1.5 text-gray-400">{i + 1}</td>
-                    <td className="px-2.5 py-1.5 text-gray-800">{it.name}</td>
-                    <td className="px-2.5 py-1.5 text-right tabular-nums">{it.qty}</td>
-                    <td className="px-2.5 py-1.5 text-right tabular-nums">{fmtMoney(it.price)}</td>
-                    <td className="px-2.5 py-1.5 text-right tabular-nums">{fmtMoney(it.amount)}</td>
+                {items.map((it, i) => (
+                  <tr key={i}>
+                    <td className="py-0.5 pr-3 text-gray-600">{it.name}</td>
+                    <td className="py-0.5 px-3 text-right tabular-nums text-gray-400 whitespace-nowrap">
+                      {it.qty} × {fmtMoney(it.price).replace("₹", "")}
+                    </td>
+                    <td className="py-0.5 pl-3 text-right tabular-nums text-gray-700 whitespace-nowrap">
+                      {fmtMoney(it.amount).replace("₹", "")}
+                    </td>
+                  </tr>
+                ))}
+                {charges.map((c, i) => (
+                  <tr key={"c" + i}>
+                    <td className="py-0.5 pr-3 text-gray-500">{c.label}</td>
+                    <td />
+                    <td className="py-0.5 pl-3 text-right tabular-nums text-gray-600 whitespace-nowrap">
+                      {c.amount < 0
+                        ? `−${fmtMoney(-c.amount).replace("₹", "")}`
+                        : fmtMoney(c.amount).replace("₹", "")}
+                    </td>
                   </tr>
                 ))}
               </tbody>
-              <tfoot>
-                <tr className="border-t border-gray-200 font-semibold bg-gray-50">
-                  <td
-                    colSpan={4}
-                    className="px-2.5 py-1.5 text-right text-gray-500 uppercase text-[10px]"
-                  >
-                    Sub Total
-                  </td>
-                  <td className="px-2.5 py-1.5 text-right tabular-nums">
-                    {fmtMoney(itemSubtotal)}
-                  </td>
-                </tr>
-                {(e.charges ?? []).map((c, i) => (
-                  <tr key={i} className="border-t border-gray-100 text-gray-500">
-                    <td colSpan={4} className="px-2.5 py-1 text-right uppercase text-[10px]">
-                      {c.label}
-                    </td>
-                    <td className="px-2.5 py-1 text-right tabular-nums">
-                      {c.amount < 0 ? `−${fmtMoney(-c.amount)}` : fmtMoney(c.amount)}
-                    </td>
-                  </tr>
-                ))}
-              </tfoot>
             </table>
           </td>
         </tr>
       )}
+
+      <tr
+        onClick={onOpen}
+        title={e.docId ? "Open this bill" : undefined}
+        className={`border-b border-gray-100 ${e.docId ? "cursor-pointer hover:bg-primary-soft/40" : ""} ${isOpening ? "bg-gray-50" : ""}`}
+        style={{ breakInside: "avoid", breakBefore: hasDetail ? "avoid" : undefined }}
+      >
+        <td className="px-4 py-2.5 align-top whitespace-nowrap text-[11.5px] text-gray-500">
+          {isOpening ? "" : fmtDate(e.date)}
+        </td>
+
+        <td className="px-4 py-2.5 align-top">
+          {isOpening ? (
+            <span className="font-semibold text-gray-700">Opening Balance</span>
+          ) : (
+            <div className="flex flex-wrap items-baseline gap-x-2">
+              <span
+                className={`text-[12.5px] font-semibold ${delta >= 0 ? "text-gray-800" : "text-gray-800"}`}
+              >
+                {e.type}
+              </span>
+              {e.ref && e.ref !== "—" && (
+                <span className="font-mono text-[11px] text-blue-600" title={e.ref}>
+                  {shortRef(e.ref)}
+                </span>
+              )}
+              {detail && <span className="text-[11.5px] text-gray-500">· {detail}</span>}
+              {cols.got > 0 && modeOf(e) && (
+                <span className="text-[11.5px] font-medium text-emerald-700">· {modeOf(e)}</span>
+              )}
+              {hasDetail && (
+                <button
+                  type="button"
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    setOpen((v) => !v);
+                  }}
+                  className="text-[11px] font-medium text-primary/70 hover:text-primary print:hidden"
+                >
+                  {open ? "hide" : "details"}
+                </button>
+              )}
+            </div>
+          )}
+        </td>
+
+        {/* Blank, not a dash. An empty cell already says "nothing here", and
+            forty dashes down a column is forty things to read past. */}
+        <td className="px-4 py-2.5 align-top text-right whitespace-nowrap text-[12.5px]">
+          {cols.gave > 0 && <span className="font-semibold text-rose-600">{money(cols.gave)}</span>}
+        </td>
+        <td className="px-4 py-2.5 align-top text-right whitespace-nowrap text-[12.5px]">
+          {cols.got > 0 && (
+            <span className="font-semibold text-emerald-600">{money(cols.got)}</span>
+          )}
+        </td>
+
+        <td className="px-4 py-2.5 align-top text-right whitespace-nowrap">
+          <span className="text-[13px] font-bold text-gray-900">{money(Math.abs(e.balance))}</span>
+          {showSide && (
+            <span
+              className={`ml-1.5 text-[10px] ${e.balance > 0 ? "text-rose-500" : e.balance < 0 ? "text-amber-600" : "text-gray-400"}`}
+            >
+              {side}
+            </span>
+          )}
+        </td>
+      </tr>
     </>
   );
 }
@@ -921,7 +1146,11 @@ export function PartyStatementCardBlock({
     );
   }
 
-  const meta = [e.date ? fmtDate(e.date) : null, e.ref && e.ref !== "—" ? `#${e.ref}` : null]
+  const meta = [
+    e.date ? fmtDate(e.date) : null,
+    e.ref && e.ref !== "—" ? `#${e.ref}` : null,
+    modeOf(e),
+  ]
     .filter(Boolean)
     .join("  ·  ");
 

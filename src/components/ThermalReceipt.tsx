@@ -1,8 +1,14 @@
 import type { Invoice, Company } from "@/types";
 import { fmtMoney, fmtDate } from "@/lib/format";
+import { describePayment } from "@/lib/paymentSplit";
 import { fmtMode } from "@/lib/paymentMode";
 import { serialTextIndex } from "@/lib/serials";
 import { PrintedSerials } from "@/components/PrintedSerials";
+
+import { BankRepo } from "@/repositories";
+/** An account's name for display. The word "Bank" three times over is
+ *  exactly what a split is meant to stop being ambiguous. */
+const bankName = (id: string) => BankRepo.get(id)?.name;
 
 const r2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -138,7 +144,7 @@ export function ThermalReceipt({
       </div>
       {row("Paid", fmtMoney(inv.paid))}
       {balance > 0.009 && row("Balance Due", fmtMoney(balance), true)}
-      {row("Mode", fmtMode(inv.paymentMode))}
+      {row("Mode", describePayment(inv, bankName))}
 
       <div style={dashed} />
       <div style={{ textAlign: "center" }}>

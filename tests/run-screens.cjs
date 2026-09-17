@@ -418,6 +418,20 @@ run().then((r) => { (window as any).__RESULT__ = r; })
     args: ["--no-sandbox", "--allow-file-access-from-files"],
   });
   const page = await browser.newPage();
+  /* The window these tests run in.
+   *
+   * It defaulted to Chromium's 800x600 and nothing could change it, which
+   * quietly put two whole classes of layout out of reach: anything gated at
+   * Tailwind's lg: breakpoint (1024px) never applied, and the phone layout
+   * the shop actually bills on was never rendered at all. Both have now
+   * shipped bugs that no assertion here could have seen.
+   *
+   * SCREENS_VIEWPORT=390x844 runs the suite as a phone. */
+  const vp = String(process.env.SCREENS_VIEWPORT || "").match(/^([0-9]+)x([0-9]+)$/);
+  if (vp) {
+    await page.setViewport({ width: Number(vp[1]), height: Number(vp[2]) });
+    console.log(`  viewport: ${vp[1]}x${vp[2]}`);
+  }
   const pageErrors = [];
   // A native confirm()/alert() BLOCKS the page until something answers it, so
   // one stray prompt hangs the entire suite and prints nothing at all — which

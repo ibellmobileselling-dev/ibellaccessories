@@ -5,7 +5,19 @@ import { MODE_LABELS } from "@/lib/paymentMode";
  * Theme-styled payment mode selector — pill buttons instead of the native
  * <select>, whose dropdown list can't be themed and looks foreign to the app.
  *
- * Keyboard: the group is ONE Tab stop, not three.
+ * Keyboard, in two states, because the counter wants different things
+ * before and after it has decided:
+ *
+ *   nothing chosen yet — every pill is a Tab stop, so Tab walks Cash, Bank,
+ *   Credit and Enter or Space picks the one you stopped on
+ *
+ *   chosen — the group collapses to ONE Tab stop (the chosen pill), so Tab
+ *   leaves for the amount instead of walking past decisions already made.
+ *   Arrow keys still move within it.
+ *
+ * Those are two requests that looked contradictory — "stop Tab walking the
+ * pills" and "why does Tab skip Cash and Bank" — and are the same rule seen
+ * from either side of making the choice.
  *
  * Every pill used to carry tabIndex 0, so Tab from Cash landed on the Bank
  * pill and then the Credit pill before reaching anything that takes a number.
@@ -24,7 +36,8 @@ export function ModePills({
   onChange,
   modes,
 }: {
-  value: PaymentMode;
+  /** undefined = nothing chosen yet, which is how a new bill starts. */
+  value: PaymentMode | undefined;
   onChange: (m: PaymentMode) => void;
   modes: PaymentMode[];
 }) {
@@ -53,7 +66,8 @@ export function ModePills({
           role="radio"
           data-mode={m}
           aria-checked={value === m}
-          tabIndex={value === m ? 0 : -1}
+          /* Every pill until one is picked; only the picked one afterwards. */
+          tabIndex={value === undefined || value === m ? 0 : -1}
           onClick={() => onChange(m)}
           onKeyDown={(e) => {
             if (e.key === "ArrowRight" || e.key === "ArrowDown") {

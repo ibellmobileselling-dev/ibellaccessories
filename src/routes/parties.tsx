@@ -378,14 +378,14 @@ function PartiesPage() {
     {
       key: "sel",
       label: "",
-      width: "32px",
+      width: "44px",
       render: (r) => (
         <input
           type="checkbox"
           checked={selectedIds.has(r.id)}
           onChange={() => toggleOne(r.id)}
           onClick={(e) => e.stopPropagation()}
-          className="accent-primary"
+          className="accent-primary h-[18px] w-[18px] cursor-pointer align-middle"
           aria-label={`Select ${r.name}`}
         />
       ),
@@ -588,7 +588,7 @@ function PartiesPage() {
               type="checkbox"
               checked={allFilteredSelected}
               onChange={toggleAllFiltered}
-              className="accent-primary"
+              className="accent-primary h-[18px] w-[18px] cursor-pointer"
             />
             Select all {filtered.length}
           </label>
@@ -649,7 +649,7 @@ function PartiesPage() {
                         type="checkbox"
                         checked={selectedIds.has(r.id)}
                         onChange={() => toggleOne(r.id)}
-                        className="accent-primary h-4 w-4 align-middle"
+                        className="accent-primary h-[18px] w-[18px] align-middle"
                         aria-label={`Select ${r.name}`}
                       />
                     </label>

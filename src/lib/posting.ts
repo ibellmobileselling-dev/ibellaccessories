@@ -62,6 +62,7 @@ import { bankAccountId, expenseAccountId } from "@/lib/accounts";
 import { paidViaPayments } from "@/lib/ledger";
 import { transferLegsFor } from "@/lib/transferLegs";
 import { serialCostIndex, lineCostBasis } from "@/lib/serialCost";
+import { splitsOf, cashPart, bankParts } from "@/lib/paymentSplit";
 
 const r2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -177,6 +178,46 @@ function settlementAccount(mode: PaymentMode | undefined, bankId?: string): stri
   }
 }
 
+/**
+ * Where the settled money went — one line per account it actually reached.
+ *
+ * A document is no longer settled one way. ₹300 taken at the counter and the
+ * rest into HDFC is two movements, and posting the whole amount to whichever
+ * account `bankId` happened to name leaves the drawer permanently wrong in the
+ * ledger while the app counts it correctly. Not a rounding argument: it is the
+ * reconciliation failing outright — Cash in Hand, ledger 46,400 against the
+ * app's 46,700.
+ *
+ * `splitsOf` is the one seam that says how a document was attributed, and its
+ * whole job is to report exactly what the app's own readers compute — so the
+ * ledger asks it rather than deciding a second time and drifting.
+ *
+ * Whatever the rows do NOT attribute keeps the answer this always gave, so a
+ * document with no stored splits posts precisely as it did before, and the
+ * entry balances either way because the residual is simply what is left.
+ */
+function settlementLines(
+  doc: Parameters<typeof splitsOf>[0],
+  total: number,
+  settledElsewhere: number,
+  mode: PaymentMode | undefined,
+  bankId: string | undefined,
+): Array<[account: string, amount: number]> {
+  const amount = r2(total);
+  if (amount <= 0) return [];
+
+  const parts: Array<[string, number]> = [];
+  const cash = cashPart(doc, settledElsewhere);
+  if (cash > 0) parts.push(["cash", cash]);
+  for (const [id, part] of bankParts(doc, settledElsewhere)) {
+    if (part > 0) parts.push([bankAccountId(id), part]);
+  }
+
+  const residual = r2(amount - parts.reduce((n, [, a]) => n + a, 0));
+  if (Math.abs(residual) >= 0.005) parts.push([settlementAccount(mode, bankId), residual]);
+  return parts;
+}
+
 /** The tax on a document, by the same rule `valueExTax` uses — a non-GST bill
  *  carries none, whatever its taxAmount field happens to hold. */
 const taxOf = (d: { taxAmount?: number; gstEnabled?: boolean }) =>
@@ -238,6 +279,11 @@ function postSale(
   costs: Map<string, number>,
   serialCosts: Map<string, number>,
 ): JournalEntry {
+  /* What later payments settled on this bill, by subtraction: `direct` is
+     already paid-less-applied, so this recovers the other half without
+     changing a signature — and splitsOf needs it to know how much of `paid`
+     belongs to the bill itself. */
+  const settledElsewhere = r2((inv.paid || 0) - direct);
   const tax = taxOf(inv);
   const shipping = r2(inv.shippingCharge || 0);
   const roundOff = r2(inv.roundOff || 0);
@@ -262,8 +308,11 @@ function postSale(
       ...cr("output-gst", tax),
       ...cr("freight-income", shipping),
       ...cr("round-off", roundOff),
-      // Money taken at the counter, against the receivable just created.
-      ...dr(settlementAccount(inv.paymentMode, inv.bankId), direct),
+      // Money taken at the counter, against the receivable just created —
+      // split across every account it actually landed in.
+      ...settlementLines(inv, direct, settledElsewhere, inv.paymentMode, inv.bankId).flatMap(
+        ([account, amount]) => dr(account, amount),
+      ),
       ...cr("ar", direct, inv.partyId),
       // The goods themselves leave stock at cost.
       ...dr("cogs", cogs),
@@ -281,6 +330,11 @@ function postSale(
  * consistent.
  */
 function postPurchase(inv: Invoice, direct: number): JournalEntry {
+  /* What later payments settled on this bill, by subtraction: `direct` is
+     already paid-less-applied, so this recovers the other half without
+     changing a signature — and splitsOf needs it to know how much of `paid`
+     belongs to the bill itself. */
+  const settledElsewhere = r2((inv.paid || 0) - direct);
   const tax = taxOf(inv);
   const total = r2(inv.total || 0);
   const goods = r2(total - tax);
@@ -298,9 +352,12 @@ function postPurchase(inv: Invoice, direct: number): JournalEntry {
       ...dr("inventory", goods),
       ...dr("input-gst", tax),
       ...cr("ap", total, inv.partyId),
-      // Paid at the counter, against the payable just created.
+      // Paid at the counter, against the payable just created — split across
+      // every account it actually came out of.
       ...dr("ap", direct, inv.partyId),
-      ...cr(settlementAccount(inv.paymentMode, inv.bankId), direct),
+      ...settlementLines(inv, direct, settledElsewhere, inv.paymentMode, inv.bankId).flatMap(
+        ([account, amount]) => cr(account, amount),
+      ),
     ],
   };
 }
@@ -368,7 +425,9 @@ function postPurchaseReturn(ret: Return): JournalEntry {
 function postPayment(p: Payment): JournalEntry {
   const amount = r2(p.amount || 0);
   const discount = r2((p.allocations ?? []).reduce((s, a) => s + (a.discount ?? 0), 0));
-  const account = settlementAccount(p.mode, p.bankId);
+  // A receipt can be taken part in cash and part into an account, same as a
+  // bill; one line per account it reached.
+  const where = settlementLines(p, amount, 0, p.mode, p.bankId);
   const isIn = p.type === "in";
 
   return {
@@ -382,13 +441,13 @@ function postPayment(p: Payment): JournalEntry {
     periodKey: periodOf(p.date),
     lines: isIn
       ? [
-          ...dr(account, amount),
+          ...where.flatMap(([account, part]) => dr(account, part)),
           ...cr("ar", amount, p.partyId),
           ...dr("discount-allowed", discount),
           ...cr("ar", discount, p.partyId),
         ]
       : [
-          ...cr(account, amount),
+          ...where.flatMap(([account, part]) => cr(account, part)),
           ...dr("ap", amount, p.partyId),
           ...dr("ap", discount, p.partyId),
           ...cr("discount-received", discount),
@@ -408,7 +467,9 @@ function postExpense(e: Expense): JournalEntry {
     periodKey: periodOf(e.date),
     lines: [
       ...dr(expenseAccountId(e.category), amount),
-      ...cr(settlementAccount(e.paymentMode, e.bankId), amount),
+      ...settlementLines(e, amount, 0, e.paymentMode, e.bankId).flatMap(([account, part]) =>
+        cr(account, part),
+      ),
     ],
   };
 }

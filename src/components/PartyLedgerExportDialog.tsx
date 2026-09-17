@@ -146,11 +146,22 @@ export function PartyLedgerExportDialog({
       // statement screen prints on; the simple ledger is six narrow columns
       // and belongs on portrait.
       const orientation: "portrait" | "landscape" = format === "simple" ? "portrait" : "landscape";
+      /* The party travels WITH its document.
+
+         These were two parallel arrays — docs to render, parties to name the
+         files — walked with one index. Any party whose markup failed to
+         mount was skipped from docs only, and from that point every
+         remaining PDF was saved under the previous party's name. The shop
+         reads that as "some downloaded in full detail and some simple";
+         what it actually is, is one customer's ledger in a file named after
+         another. Pairing them makes the mismatch unrepresentable. */
       const docs: {
+        party: Party;
         el: HTMLElement;
         orientation: "portrait" | "landscape";
         opts: { selfContained: true };
       }[] = [];
+      const missed: string[] = [];
       for (const p of parties) {
         const slot = document.createElement("div");
         holder.appendChild(slot);
@@ -168,25 +179,38 @@ export function PartyLedgerExportDialog({
           );
         });
         const el = slot.firstElementChild as HTMLElement | null;
-        if (el) docs.push({ el, orientation, opts: { selfContained: true } });
+        if (el) docs.push({ party: p, el, orientation, opts: { selfContained: true } });
+        else missed.push(p.name);
       }
 
-      const blobs = await elementsToPdfBlobs(docs, (done) =>
-        setBusy({ kind: "pdf", done: Math.min(done, parties.length) }),
+      const blobs = await elementsToPdfBlobs(
+        docs.map(({ el, orientation, opts }) => ({ el, orientation, opts })),
+        (done) => setBusy({ kind: "pdf", done: Math.min(done, docs.length) }),
       );
 
       for (let i = 0; i < blobs.length; i++) {
         downloadFile(
-          new File([blobs[i]], `Statement-${safeName(parties[i].name)}-${fileSuffix}.pdf`, {
+          new File([blobs[i]], `Statement-${safeName(docs[i].party.name)}-${fileSuffix}.pdf`, {
             type: "application/pdf",
           }),
         );
         if (i < blobs.length - 1) await pause(DOWNLOAD_GAP_MS);
       }
 
+      /* Said out loud rather than folded into a success count. A shop that
+         asked for twelve ledgers and quietly received eleven has no way of
+         knowing which customer it is missing. */
+      if (missed.length) {
+        toast.warning(
+          `Could not build ${missed.length} of ${parties.length}: ${missed.slice(0, 3).join(", ")}${
+            missed.length > 3 ? "…" : ""
+          }`,
+          { duration: 10000 },
+        );
+      }
       toast.success(
-        parties.length === 1
-          ? `Ledger PDF downloaded for ${parties[0].name}`
+        blobs.length === 1
+          ? `Ledger PDF downloaded for ${docs[0]?.party.name ?? ""}`
           : `${blobs.length} ledger PDFs downloaded`,
       );
       onOpenChange(false);

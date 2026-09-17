@@ -25,6 +25,7 @@ import {
   SlidersHorizontal,
 } from "lucide-react";
 import { toast } from "sonner";
+import { bankParts, describePayment } from "@/lib/paymentSplit";
 import { PaginationBar } from "@/components/Pagination";
 import { usePagination } from "@/hooks/usePagination";
 import { usePeriodLock } from "@/hooks/usePeriodLock";
@@ -37,6 +38,10 @@ import { VoidDialog, VoidedBadge } from "@/components/VoidDialog";
 import { canDeleteOutright, isVoided, removalWord } from "@/lib/voiding";
 import { SerialRepo } from "@/repositories";
 import { undoSerialsOf, soldSerialsOf } from "@/lib/serialMoves";
+
+/** An account's name for display. The word "Bank" three times over is
+ *  exactly what a split is meant to stop being ambiguous. */
+const bankName = (id: string) => BankRepo.get(id)?.name;
 
 export const Route = createFileRoute("/purchase/")({ component: PurchasePage });
 
@@ -64,14 +69,23 @@ function PurchasePage() {
   const deleteAllowed = isOwner || canDelete("purchaseExpenses");
   const [rows, setRows] = useState<Invoice[]>([]);
   const [parties, setParties] = useState<{ id: string; name: string }[]>([]);
-  const [dateFrom, setDateFrom] = useState(() => filterCache?.dateFrom ?? monthStart());
-  const [dateTo, setDateTo] = useState(() => filterCache?.dateTo ?? today());
+  /* Opens on everything, not on this month.
+   *
+   * A list that silently hides last month's bills is a list that answers the
+   * wrong question: the shop looks for an invoice, does not find it, and has
+   * no reason to suspect a filter it never set. An empty range means no
+   * filter at all, and a date typed in is then a deliberate act.
+   *
+   * The saved filter still wins when there is one — a range somebody chose
+   * survives navigating away and back. */
+  const [dateFrom, setDateFrom] = useState(() => filterCache?.dateFrom ?? "");
+  const [dateTo, setDateTo] = useState(() => filterCache?.dateTo ?? "");
   const [partyId, setPartyId] = useState(() => filterCache?.partyId ?? "all");
   const [status, setStatus] = useState<Status>(() => filterCache?.status ?? "all");
   const [search, setSearch] = useState(() => filterCache?.search ?? "");
   const [showPartyDrop, setShowPartyDrop] = useState(false);
   const [partyDropQ, setPartyDropQ] = useState("");
-  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
+  const [filtersOpen, setFiltersOpen] = useState(false);
 
   const [showVoided, setShowVoided] = useState(false);
   const [voiding, setVoiding] = useState<Invoice | null>(null);
@@ -242,8 +256,13 @@ function PurchasePage() {
         });
       }
     }
-    if (live.paymentMode === "bank" && live.bankId && (live.bankPaidAmount ?? 0) > 0) {
-      BankRepo.adjustFieldBatched(batch, live.bankId, "balance", live.bankPaidAmount!);
+    // Undo whatever this bill moved out of a specific bank account at
+    // billing time, or that account's balance stays permanently wrong
+    // after delete.
+    // Every account it touched, not just one: a split purchase can name two,
+    // and leaving either behind makes that balance permanently wrong.
+    for (const [bankId, amount] of bankParts(live)) {
+      BankRepo.adjustFieldBatched(batch, bankId, "balance", amount);
     }
   };
 
@@ -277,7 +296,7 @@ function PurchasePage() {
         iconClassName="text-warning"
         mobileAction={
           <button
-            onClick={() => setMobileFiltersOpen(true)}
+            onClick={() => setFiltersOpen(true)}
             className="relative h-9 w-9 flex items-center justify-center rounded-lg border border-gray-200 bg-gray-50/60 text-gray-600"
             title="Filters"
           >
@@ -289,89 +308,20 @@ function PurchasePage() {
         }
         actions={
           <>
-            {/* Date range — its own filter sheet on mobile (see Filters
-                button above); this inline row is desktop only, since it
-                doesn't fit next to Supplier/Status/Search on a phone. */}
-            <div className="hidden sm:flex items-center gap-1.5 h-9 pl-3 pr-2.5 rounded-lg border border-gray-200 bg-gray-50/60">
-              <input
-                type="date"
-                value={dateFrom}
-                onChange={(e) => setDateFrom(e.target.value)}
-                className="bg-transparent text-xs text-gray-700 focus:outline-none w-[104px]"
-              />
-              <span className="text-gray-300 text-xs">–</span>
-              <input
-                type="date"
-                value={dateTo}
-                onChange={(e) => setDateTo(e.target.value)}
-                className="bg-transparent text-xs text-gray-700 focus:outline-none w-[104px]"
-              />
-            </div>
-
-            {/* Party filter — desktop only, see Filters sheet on mobile */}
-            <div className="hidden sm:block relative">
-              <button
-                onClick={() => setShowPartyDrop((v) => !v)}
-                className="flex items-center gap-2 h-9 border border-gray-200 rounded-lg text-xs px-3 text-gray-700 bg-gray-50/60 hover:bg-gray-100 transition min-w-[140px]"
-              >
-                <span className="flex-1 text-left truncate">
-                  {selectedParty ? selectedParty.name : "All Suppliers"}
-                </span>
-                <ChevronDown className="h-3.5 w-3.5 text-gray-400 flex-shrink-0" />
-              </button>
-              {showPartyDrop && (
-                <div className="absolute top-full right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-lg z-30 w-56 max-h-64 overflow-auto">
-                  <div className="p-2 border-b">
-                    <input
-                      autoFocus
-                      placeholder="Search supplier..."
-                      value={partyDropQ}
-                      className="w-full text-xs px-2 py-1.5 border border-gray-200 rounded focus:outline-none"
-                      onChange={(e) => setPartyDropQ(e.target.value)}
-                    />
-                  </div>
-                  <button
-                    onClick={() => {
-                      setPartyId("all");
-                      setShowPartyDrop(false);
-                      setPartyDropQ("");
-                    }}
-                    className={`w-full text-left px-3 py-2 text-xs hover:bg-blue-50 ${partyId === "all" ? "text-blue-600 font-semibold bg-blue-50" : "text-gray-700"}`}
-                  >
-                    All Suppliers
-                  </button>
-                  {filteredDropdownParties.map((p) => (
-                    <button
-                      key={p.id}
-                      onClick={() => {
-                        setPartyId(p.id);
-                        setShowPartyDrop(false);
-                        setPartyDropQ("");
-                      }}
-                      className={`w-full text-left px-3 py-2 text-xs hover:bg-blue-50 truncate ${partyId === p.id ? "text-blue-600 font-semibold bg-blue-50" : "text-gray-700"}`}
-                    >
-                      {p.name}
-                    </button>
-                  ))}
-                  {filteredDropdownParties.length === 0 && (
-                    <p className="text-xs text-gray-400 text-center py-3">No suppliers found</p>
-                  )}
-                </div>
-              )}
-            </div>
-
-            {/* Status filter — desktop only, see Filters sheet on mobile */}
-            <div className="hidden sm:flex items-center gap-0.5 h-9 border border-gray-200 rounded-lg p-0.5 bg-gray-50/60">
-              {STATUSES.map((s) => (
-                <button
-                  key={s.value}
-                  onClick={() => setStatus(s.value)}
-                  className={`px-2.5 h-7 rounded-md text-xs transition outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${status === s.value ? "bg-primary text-primary-foreground font-semibold" : "text-gray-500 hover:bg-gray-100"}`}
-                >
-                  {s.label}
-                </button>
-              ))}
-            </div>
+            {/* One button, one panel. The date range, the party picker
+                and the status pills used to sit across this toolbar —
+                first thing to wrap on a laptop, and already duplicated
+                inside the filter dialog. They live in the dialog only
+                now, on every screen size. */}
+            <button
+              onClick={() => setFiltersOpen(true)}
+              className="hidden sm:flex relative items-center gap-1.5 h-9 px-3 rounded-lg border border-gray-200 bg-gray-50/60 text-[13px] text-gray-700 hover:bg-gray-100 transition"
+              title="Filters"
+            >
+              <SlidersHorizontal className="h-4 w-4 text-gray-500" />
+              Filters
+              {filtersActive && <span className="ml-0.5 h-2 w-2 rounded-full bg-primary" />}
+            </button>
 
             <button
               onClick={() => setShowVoided((v) => !v)}
@@ -396,15 +346,6 @@ function PurchasePage() {
               />
             </div>
 
-            {filtersActive && (
-              <button
-                onClick={clearFilters}
-                className="hidden sm:flex text-xs text-gray-400 hover:text-gray-600 transition items-center gap-1"
-              >
-                <X className="h-3 w-3" /> Clear
-              </button>
-            )}
-
             {editAllowed && (
               <button
                 onClick={() => navigate({ to: "/purchase/new" })}
@@ -420,7 +361,7 @@ function PurchasePage() {
       {/* Mobile filter sheet — Date Range/Supplier/Status don't fit inline
           next to Search on a phone, so they live here behind the header's
           Filters button instead, same state as the desktop inline controls. */}
-      <Dialog open={mobileFiltersOpen} onOpenChange={setMobileFiltersOpen}>
+      <Dialog open={filtersOpen} onOpenChange={setFiltersOpen}>
         <DialogContent className="max-w-sm">
           <DialogHeader>
             <DialogTitle>Filters</DialogTitle>
@@ -523,7 +464,7 @@ function PurchasePage() {
                 <span />
               )}
               <button
-                onClick={() => setMobileFiltersOpen(false)}
+                onClick={() => setFiltersOpen(false)}
                 className="h-8 px-4 bg-primary text-primary-foreground rounded-md text-sm font-semibold hover:opacity-90 transition"
               >
                 Done
@@ -572,7 +513,7 @@ function PurchasePage() {
                     <div className="flex items-center justify-between gap-2 mt-1">
                       <p className="text-[11px] text-gray-400 font-mono truncate">
                         <span className={isVoided(r) ? "line-through" : ""}>{r.number}</span> ·{" "}
-                        {fmtDate(r.date)} · {fmtMode(r.paymentMode)}
+                        {fmtDate(r.date)} · {describePayment(r, bankName)}
                         {isVoided(r) && (
                           <>
                             {" "}
@@ -709,7 +650,7 @@ function PurchasePage() {
             {
               key: "mode",
               label: "Mode",
-              render: (r) => fmtMode(r.paymentMode),
+              render: (r) => describePayment(r, bankName),
             },
             {
               key: "action",

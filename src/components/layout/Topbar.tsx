@@ -7,6 +7,7 @@ import { useRepoMemo } from "@/hooks/useRepoData";
 import { signOut } from "firebase/auth";
 import { auth, isBrowser } from "@/lib/firebase";
 import { toast } from "sonner";
+import { WhatsAppStatusButton } from "@/components/WhatsAppLink";
 
 export function Topbar() {
   const { setGlobalSearch, toggleMobileNav } = useWorkspace();
@@ -64,6 +65,7 @@ export function Topbar() {
           now the one and only "Add Sale" entry point on mobile, so a second
           Sale button up here was redundant clutter. */}
         <div className="md:hidden flex items-center gap-1.5 justify-self-end">
+          <WhatsAppStatusButton />
           <button
             onClick={() => setGlobalSearch(true)}
             className="h-8 w-8 rounded-md hover:bg-accent flex items-center justify-center text-muted-foreground shrink-0"
@@ -90,6 +92,10 @@ export function Topbar() {
         >
           <Plus className="h-4 w-4" /> Add Purchase
         </button>
+
+        <div className="hidden md:block">
+          <WhatsAppStatusButton />
+        </div>
 
         <div className="hidden lg:block h-6 w-px bg-border mx-1" />
         <span className="hidden lg:inline text-[11px] text-muted-foreground tabular-nums">
